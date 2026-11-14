@@ -32,7 +32,16 @@ DEFAULTS: dict = {
         "results_to_fetch": 5,
     },
     "auto_collect": {"enabled": False, "interval_min": 60},
-    "pc_training": {
+    # 소형 AI 모델(처음부터 학습하는 글자 단위 GPT). PC와 휴대폰(온보드) 공용. preset 또는 직접 지정한 크기.
+    "tiny_training": {
+        "preset": "auto",  # auto | nano | mini | small | base | large | custom
+        "d_model": 0, "n_layer": 0, "n_head": 0, "seq_len": 0, "vocab_size": 0,  # 0이면 preset 값 사용
+        "steps": 1500,
+        "batch_size": 32,
+        "lr": 3e-3,
+    },
+    # 공개 소형 언어모델에 LoRA 추가 학습 (PC)
+    "lora_training": {
         "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
         "max_steps": 200,
         "lr": 2e-4,
@@ -40,18 +49,44 @@ DEFAULTS: dict = {
         "batch_size": 2,
         "grad_accum": 4,
         "lora_r": 8,
+        "lora_alpha": 16,
+        "use_qa": True,
     },
-    "mobile_training": {
-        "preset": "small",  # tiny | small
-        "steps": 2000,
-        "batch_size": 32,
-        "lr": 3e-3,
-        "vocab_size": 3000,
+    # 온라인 모델 (Claude API). 검색된 자료 일부가 Anthropic API로 전송된다.
+    "online": {
+        "enabled": True,
+        "model": "claude-opus-5-5",
+        "api_key": "",  # 비우면 ANTHROPIC_API_KEY 환경변수 / ant auth 프로필 사용
+        "effort": "medium",  # low | medium | high | xhigh | max
+        "max_context_chunks": 8,
+        "fallbacks": True,  # 거절 시 서버 측 대체 모델로 자동 재시도
+    },
+    # 의미 검색(임베딩). transformers가 있으면 사용.
+    "embeddings": {"enabled": True, "model": "intfloat/multilingual-e5-small", "batch_size": 32},
+    # 파일 가져오기
+    "ingest": {"max_file_mb": 50, "max_docs_per_file": 5000},
+    # 자율 학습: 허용 시간대에 스스로 수집하고 주기적으로 학습한다.
+    "autolearn": {
+        "targets": {"tiny": True, "lora": False, "embeddings": True, "qa": False},
+        "collect_interval_min": 10,
+        "pages_per_cycle": 5,
+        "max_pages_per_hour": 60,
+        "discover_topics": True,
+        "max_discovered_topics": 50,
+        "train_min_new_chars": 20000,
+        "train_interval_min": 60,
+        "steps_per_cycle": 300,
+        "train_outside_window": False,
+        "threads": 0,  # 0이면 자동 (PC 코어 수 - 1)
+        "final_train": True,
+        "formats": ["jsonl", "csv", "md", "txt"],
+        "results_export_target": "",  # 지정하면 학습 종료 시 이 외장 저장장치에도 복사
     },
     "auth": {"salt": "", "user_pin_hash": "", "admin_pin_hash": ""},
 }
 
-SECRET_KEYS = [("auth",), ("search", "brave_api_key")]
+SECRET_KEYS = [("auth",), ("search", "brave_api_key"), ("online", "api_key")]
+MASK = "********"
 
 
 def _merge(base: dict, override: dict) -> dict:
@@ -110,6 +145,10 @@ class Config:
     def update(self, changes: dict) -> None:
         """사용자 입력으로 설정 변경. 인증 정보는 이 경로로 바꿀 수 없다."""
         changes = {k: v for k, v in changes.items() if k in DEFAULTS and k != "auth"}
+        for path in SECRET_KEYS[1:]:  # 화면에 가려 보낸 값(********)이 돌아오면 기존 값 유지
+            sec, key = path
+            if isinstance(changes.get(sec), dict) and changes[sec].get(key) == MASK:
+                changes[sec].pop(key)
         self.data = _merge(self.data, changes)
         self.save()
 
@@ -117,8 +156,9 @@ class Config:
         """비밀값을 가린 사본 (UI 표시, 외장 저장장치 내보내기용)."""
         d = copy.deepcopy(self.data)
         d.pop("auth", None)
-        if d.get("search", {}).get("brave_api_key"):
-            d["search"]["brave_api_key"] = "********"
+        for sec, key in SECRET_KEYS[1:]:
+            if d.get(sec, {}).get(key):
+                d[sec][key] = MASK
         return d
 
     # 인증
