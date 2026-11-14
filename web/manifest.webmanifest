@@ -1,0 +1,11 @@
+{
+  "name": "LearnBox",
+  "short_name": "LearnBox",
+  "description": "수집 · 검색 · 학습 (PC와 휴대폰 공용)",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f7f5",
+  "theme_color": "#1f6f5c",
+  "lang": "ko",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

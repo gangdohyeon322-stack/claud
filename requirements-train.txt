@@ -1,0 +1,8 @@
+# 학습 기능용 (PC 모델 LoRA 학습, 휴대폰용 모델 학습과 ONNX 변환)
+# NVIDIA GPU가 있으면 먼저 https://pytorch.org 의 안내대로 CUDA용 torch를 설치한 뒤 이 파일을 설치하세요.
+-r requirements.txt
+torch>=2.2
+transformers>=4.45
+peft>=0.13
+onnx>=1.16
+onnxscript>=0.1

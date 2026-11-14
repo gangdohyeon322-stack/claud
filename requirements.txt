@@ -1,0 +1,3 @@
+# 수집 · 검색 · 웹 화면 · 내보내기는 Python 표준 라이브러리만 사용합니다 (Python 3.10 이상).
+# Windows에는 시간대 데이터가 없어서 tzdata가 필요합니다.
+tzdata; sys_platform == "win32"

@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1f6f5c">
+<title>LearnBox</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><img src="/icon.svg" alt="" width="24" height="24"> LearnBox</div>
+  <div class="top-right">
+    <span id="net" class="pill"></span>
+    <span id="who" class="pill"></span>
+    <button id="logout" class="ghost small" hidden>로그아웃</button>
+  </div>
+</header>
+
+<section id="login" class="card narrow" hidden>
+  <h2>로그인</h2>
+  <p class="muted">PC와 휴대폰 모두 같은 PIN으로 로그인합니다. 관리자 PIN으로 로그인하면 학습, 내보내기, 설정을 쓸 수 있습니다.</p>
+  <form id="login-form">
+    <input id="pin" type="password" inputmode="numeric" autocomplete="current-password" placeholder="PIN" required>
+    <button type="submit">로그인</button>
+  </form>
+  <p id="login-msg" class="error"></p>
+  <button id="offline-enter" class="ghost" hidden>오프라인으로 사용 (이 기기에 저장된 자료)</button>
+</section>
+
+<nav id="tabs" class="tabs" hidden>
+  <button data-tab="search" class="active">검색</button>
+  <button data-tab="collect">수집</button>
+  <button data-tab="train">학습</button>
+  <button data-tab="models">모델</button>
+  <button data-tab="jobs">작업</button>
+  <button data-tab="admin" class="admin-only">관리</button>
+</nav>
+
+<main id="main" hidden>
+  <!-- 검색 / 질문 -->
+  <section id="tab-search" class="tab">
+    <div class="card">
+      <form id="search-form" class="row">
+        <input id="q" type="search" placeholder="검색어 또는 질문" required>
+        <button type="submit">검색</button>
+      </form>
+      <div class="row wrap gap">
+        <label class="inline">답변 모델
+          <select id="ask-model"><option value="">없음 (검색만)</option></select>
+        </label>
+        <button id="ask-btn" class="secondary">질문하기</button>
+      </div>
+      <p class="muted small" id="search-mode"></p>
+    </div>
+    <div id="answer" class="card" hidden></div>
+    <div id="results"></div>
+    <div class="card">
+      <h3>이 기기에 저장 (오프라인 검색)</h3>
+      <p class="muted small">수집 자료의 사본을 이 기기에 저장해 인터넷 없이 검색합니다.</p>
+      <div class="row wrap gap">
+        <button id="snap-btn" class="secondary">사본 받기 / 갱신</button>
+        <span id="snap-info" class="muted small"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 수집 -->
+  <section id="tab-collect" class="tab" hidden>
+    <div id="gate" class="banner"></div>
+    <div class="card">
+      <h3>지정 링크 학습</h3>
+      <p class="muted small">한 줄에 하나씩 입력합니다. robots.txt를 따르고, 허용 시간대에만 수집합니다.</p>
+      <textarea id="links" rows="4" placeholder="https://example.com/article"></textarea>
+      <div class="row wrap gap">
+        <label class="inline">링크 따라가기
+          <select id="depth"><option value="0">안 함</option><option value="1">1단계</option><option value="2">2단계</option></select>
+        </label>
+        <button id="links-btn">수집 시작</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>실시간 검색 후 수집</h3>
+      <p class="muted small" id="provider-info"></p>
+      <form id="websearch-form" class="row">
+        <input id="wq" type="search" placeholder="예: 기계 학습" required>
+        <button type="submit">검색 · 수집</button>
+      </form>
+    </div>
+    <div class="card">
+      <h3>예약 수집 목록 (조금씩 자동 수집)</h3>
+      <p class="muted small" id="auto-info"></p>
+      <form id="watch-form" class="row wrap gap">
+        <select id="watch-kind"><option value="search">검색어</option><option value="link">링크</option></select>
+        <input id="watch-value" placeholder="검색어 또는 https:// 링크" required>
+        <button type="submit" class="secondary">추가</button>
+      </form>
+      <ul id="watch-list" class="list"></ul>
+    </div>
+    <div class="card">
+      <h3>수집한 자료 <span id="doc-count" class="muted small"></span></h3>
+      <ul id="docs" class="list"></ul>
+      <button id="docs-more" class="ghost small" hidden>더 보기</button>
+    </div>
+  </section>
+
+  <!-- 학습 -->
+  <section id="tab-train" class="tab" hidden>
+    <div class="card">
+      <h3>이 PC의 학습 환경</h3>
+      <p id="caps" class="muted"></p>
+      <p class="muted small admin-hint">학습은 관리자만 시작할 수 있습니다. 진행 상황은 누구나 [작업] 탭에서 볼 수 있습니다.</p>
+    </div>
+    <div class="card admin-only">
+      <h3>PC용 모델 학습 (LoRA)</h3>
+      <p class="muted small">공개 소형 모델에 수집 자료를 추가 학습합니다. GPU가 있으면 자동으로 사용합니다. CPU만 있으면 매우 느립니다.</p>
+      <label>기반 모델 <input id="pc-base" placeholder="Qwen/Qwen2.5-0.5B-Instruct"></label>
+      <label>학습 단계 수 <input id="pc-steps" type="number" min="1" placeholder="200"></label>
+      <button id="pc-train">PC 모델 학습 시작</button>
+    </div>
+    <div class="card admin-only">
+      <h3>휴대폰용 초소형 모델 학습 (저사양)</h3>
+      <p class="muted small">CPU로 학습 가능한 수백만 파라미터 모델입니다. 휴대폰 브라우저에서 직접 실행됩니다. 문장 흉내 수준이며 사실 답변용은 아닙니다.</p>
+      <label>크기
+        <select id="mb-preset"><option value="tiny">tiny (약 0.5M + 어휘)</option><option value="small" selected>small (약 3M + 어휘)</option></select>
+      </label>
+      <label>학습 단계 수 <input id="mb-steps" type="number" min="10" placeholder="2000"></label>
+      <button id="mb-train">휴대폰용 모델 학습 시작</button>
+    </div>
+  </section>
+
+  <!-- 모델 -->
+  <section id="tab-models" class="tab" hidden>
+    <div id="models"></div>
+    <div class="card">
+      <h3>이 기기에서 실행 (온디바이스)</h3>
+      <p class="muted small" id="local-model-info">받은 모델이 없습니다.</p>
+      <form id="local-gen-form" class="row">
+        <input id="local-prompt" placeholder="시작 문장" required>
+        <button type="submit" class="secondary">생성</button>
+      </form>
+      <pre id="local-out" class="out" hidden></pre>
+    </div>
+  </section>
+
+  <!-- 작업 -->
+  <section id="tab-jobs" class="tab" hidden>
+    <div id="jobs"></div>
+  </section>
+
+  <!-- 관리 -->
+  <section id="tab-admin" class="tab" hidden>
+    <div class="card">
+      <h3>외장 저장장치로 내보내기</h3>
+      <p class="muted small">PC에 연결된 USB, 외장 SSD 또는 HDD에 저장합니다. 파일별 체크섬(manifest.json)이 함께 저장됩니다.</p>
+      <div id="drives" class="row wrap gap"></div>
+      <label>저장 위치 <input id="target" placeholder="예: E:\  /Volumes/MySSD  /media/user/USB"></label>
+      <div class="row wrap gap">
+        <label class="inline"><input type="checkbox" class="inc" value="database" checked> 자료·인덱스</label>
+        <label class="inline"><input type="checkbox" class="inc" value="models" checked> 모델</label>
+        <label class="inline"><input type="checkbox" class="inc" value="datasets" checked> 학습 말뭉치</label>
+      </div>
+      <button id="export-btn">내보내기</button>
+    </div>
+    <div class="card">
+      <h3>설정</h3>
+      <h4>수집 허용 시간대</h4>
+      <div id="windows"></div>
+      <button id="add-window" class="ghost small">+ 시간대 추가</button>
+      <label>시간대 <input id="s-tz"></label>
+      <label>허용 도메인 (비우면 전체, 한 줄에 하나) <textarea id="s-allowed" rows="3"></textarea></label>
+      <label>차단 도메인 <textarea id="s-blocked" rows="2"></textarea></label>
+      <div class="grid2">
+        <label>요청 간격(초) <input id="s-interval" type="number" min="1" step="0.5"></label>
+        <label>작업당 최대 페이지 <input id="s-maxpages" type="number" min="1"></label>
+      </div>
+      <h4>실시간 검색</h4>
+      <label>검색 제공자
+        <select id="s-provider">
+          <option value="wikipedia">위키백과 (키 불필요)</option>
+          <option value="searxng">SearXNG (직접 운영하는 메타검색)</option>
+          <option value="brave">Brave Search API (키 필요)</option>
+          <option value="none">사용 안 함</option>
+        </select>
+      </label>
+      <div class="grid2">
+        <label>위키백과 언어 <input id="s-wikilang"></label>
+        <label>결과 수집 개수 <input id="s-results" type="number" min="1" max="20"></label>
+      </div>
+      <label>SearXNG 주소 <input id="s-searx" placeholder="https://searx.example.org"></label>
+      <label>Brave API 키 <input id="s-brave" type="password" autocomplete="off"></label>
+      <h4>자동 수집</h4>
+      <div class="grid2">
+        <label class="inline"><input id="s-auto" type="checkbox"> 예약 목록 자동 수집</label>
+        <label>간격(분) <input id="s-autoint" type="number" min="5"></label>
+      </div>
+      <button id="save-settings">설정 저장</button>
+      <p id="settings-msg" class="muted small"></p>
+    </div>
+    <div class="card">
+      <h3>감사 기록</h3>
+      <ul id="audit" class="list small"></ul>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>
