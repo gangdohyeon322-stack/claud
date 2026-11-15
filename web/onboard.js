@@ -949,6 +949,767 @@
   }
 
   // ------------------------------------------------------------------------------------------------
+  // .lbw (LearnBox Weights) 읽기/쓰기 — SPEC §2.
+  // little-endian: "LBWEIGHT"(8) | u32 버전 | u32 헤더 길이 | JSON 헤더 | float32 텐서들(header.tensors 순서, 행우선)
+  // ------------------------------------------------------------------------------------------------
+  const LBW_MAGIC = "LBWEIGHT";
+  const LBW_VERSION = 1;
+  function shapeSize(shape) { let n = 1; for (const s of shape) n *= s; return n; }
+  const lbw = {
+    parse(buf) {
+      const ab = toArrayBuffer(buf);
+      if (!ab || ab.byteLength < 16) throw new Error("가중치 파일(.lbw)이 너무 작거나 비어 있습니다.");
+      const dv = new DataView(ab);
+      let magic = "";
+      for (let i = 0; i < 8; i++) magic += String.fromCharCode(dv.getUint8(i));
+      if (magic !== LBW_MAGIC) throw new Error("LearnBox 가중치 파일(.lbw)이 아닙니다.");
+      const ver = dv.getUint32(8, true);
+      if (ver !== LBW_VERSION) throw new Error("지원하지 않는 가중치 파일 버전입니다 (v" + ver + ").");
+      const hl = dv.getUint32(12, true);
+      if (hl <= 0 || 16 + hl > ab.byteLength) throw new Error("가중치 파일의 헤더 길이가 올바르지 않습니다.");
+      let header;
+      try { header = JSON.parse(new TextDecoder("utf-8").decode(new Uint8Array(ab, 16, hl))); }
+      catch (e) { throw new Error("가중치 파일의 헤더(JSON)를 읽을 수 없습니다."); }
+      if (!header || !Array.isArray(header.tensors)) throw new Error("가중치 파일 헤더에 텐서 목록이 없습니다.");
+      let need = 0;
+      for (const t of header.tensors) {
+        if (!t || typeof t.name !== "string" || !Array.isArray(t.shape)) throw new Error("가중치 파일 헤더의 텐서 정보가 올바르지 않습니다.");
+        need += shapeSize(t.shape) * 4;
+      }
+      const have = ab.byteLength - 16 - hl;
+      if (have !== need) {
+        throw new Error("가중치 파일의 크기가 맞지 않습니다 (필요 " + need + "바이트, 실제 " + have + "바이트). 파일이 잘렸거나 손상되었습니다.");
+      }
+      const tensors = {};
+      let off = 16 + hl;
+      for (const t of header.tensors) {
+        const n = shapeSize(t.shape);
+        tensors[t.name] = new Float32Array(ab.slice(off, off + n * 4)); // 복사본 (바이트 정렬 걱정 없음)
+        off += n * 4;
+      }
+      return { header, tensors };
+    },
+    build(header, tensors) {
+      header = Object.assign({}, header);
+      tensors = tensors || {};
+      let list = header.tensors;
+      if (!Array.isArray(list)) list = Object.keys(tensors).map((k) => ({ name: k, shape: [tensors[k].length] }));
+      let total = 0;
+      for (const t of list) {
+        const a = tensors[t.name];
+        if (!a) throw new Error("가중치에 '" + t.name + "' 텐서가 없습니다.");
+        if (a.length !== shapeSize(t.shape)) throw new Error("'" + t.name + "' 텐서 크기가 shape와 맞지 않습니다.");
+        total += a.length;
+      }
+      header.format = "lbw";
+      header.tensors = list.map((t) => ({ name: t.name, shape: t.shape.slice() }));
+      const hb = new TextEncoder().encode(JSON.stringify(header));
+      const out = new ArrayBuffer(16 + hb.length + total * 4);
+      const dv = new DataView(out);
+      for (let i = 0; i < 8; i++) dv.setUint8(i, LBW_MAGIC.charCodeAt(i));
+      dv.setUint32(8, LBW_VERSION, true);
+      dv.setUint32(12, hb.length, true);
+      new Uint8Array(out, 16, hb.length).set(hb);
+      let off = 16 + hb.length;
+      const bytes = new Uint8Array(out);
+      for (const t of list) {
+        const a = tensors[t.name];
+        bytes.set(new Uint8Array(a.buffer, a.byteOffset, a.length * 4), off); // little-endian 호스트 가정 (모든 실사용 기기)
+        off += a.length * 4;
+      }
+      return out;
+    },
+  };
+
+  // ------------------------------------------------------------------------------------------------
+  // 온디바이스 학습 (SPEC §4.2). 계산은 Web Worker(/trainer.js)가 하고, 여기서는 자료 준비·세션·보호 장치를 맡는다.
+  // ------------------------------------------------------------------------------------------------
+  const K_SESSION = "train_session";
+  const K_SESSION_META = "train_session_meta"; // 체크포인트(수 MB)를 매번 읽지 않도록 작은 요약
+  const K_RESULT = "train_result";
+  const K_MODEL_WEIGHTS = "model_weights";
+  const K_MODEL_WEIGHTS_META = "model_weights_meta";
+  const SPECIAL_TOKENS = ["<pad>", "<unk>", "<bos>", "<eos>"];
+  const GRADE_LABEL = { good: "적합", slow: "느림", bad: "권장하지 않음" };
+  const MAX_PARAMS = 2000000;
+
+  function tensorSpecs(arch) {
+    const d = arch.d_model, L = arch.n_layer, V = arch.vocab_size, Tn = arch.seq_len;
+    const out = [{ name: "tok.weight", shape: [V, d] }, { name: "pos.weight", shape: [Tn, d] }];
+    for (let i = 0; i < L; i++) {
+      const p = "blocks." + i + ".";
+      out.push({ name: p + "ln1.weight", shape: [d] }, { name: p + "ln1.bias", shape: [d] },
+        { name: p + "qkv.weight", shape: [3 * d, d] }, { name: p + "qkv.bias", shape: [3 * d] },
+        { name: p + "proj.weight", shape: [d, d] }, { name: p + "proj.bias", shape: [d] },
+        { name: p + "ln2.weight", shape: [d] }, { name: p + "ln2.bias", shape: [d] },
+        { name: p + "mlp.0.weight", shape: [4 * d, d] }, { name: p + "mlp.0.bias", shape: [4 * d] },
+        { name: p + "mlp.2.weight", shape: [d, 4 * d] }, { name: p + "mlp.2.bias", shape: [d] });
+    }
+    out.push({ name: "ln.weight", shape: [d] }, { name: "ln.bias", shape: [d] });
+    return out;
+  }
+  function paramCount(a) {
+    return a.vocab_size * a.d_model + a.seq_len * a.d_model + a.n_layer * (12 * a.d_model * a.d_model + 13 * a.d_model) + 2 * a.d_model;
+  }
+  function normArch(a) {
+    const o = {};
+    for (const k of ["d_model", "n_layer", "n_head", "seq_len", "vocab_size"]) {
+      const v = parseInt(a && a[k], 10);
+      if (!(v >= 1)) throw new Error("모델 구조 값(" + k + ")이 올바르지 않습니다.");
+      o[k] = v;
+    }
+    if (o.d_model % o.n_head) throw new Error("d_model은 n_head로 나누어떨어져야 합니다.");
+    return o;
+  }
+  function gradeOf(msPerStep) { return msPerStep <= 1000 ? "good" : msPerStep <= 5000 ? "slow" : "bad"; }
+  function perfNow() { return root && root.performance && typeof root.performance.now === "function" ? root.performance.now() : Date.now(); }
+  function meanOf(a) { let s = 0; for (const x of a) s += x; return a.length ? s / a.length : 0; }
+
+  let workerFactory = null;
+  function trainerUrl() {
+    const loc = root && root.location;
+    const origin = loc && loc.origin && loc.origin !== "null" ? loc.origin : "";
+    return origin + "/trainer.js";
+  }
+  function makeWorker() {
+    if (workerFactory) return workerFactory();
+    const W = root && root.Worker;
+    if (typeof W !== "function") throw new Error("이 브라우저는 백그라운드 학습(Web Worker)을 지원하지 않습니다.");
+    return new W(trainerUrl());
+  }
+  // Worker 한 개를 감싼다: call(메시지, 기다릴 응답 type), handlers[type] 로 스트림 메시지를 받는다.
+  function makeLink(w) {
+    const waiters = [];
+    const link = {
+      w, dead: false, handlers: {},
+      post(msg, transfer) { w.postMessage(msg, transfer || []); },
+      wait(type) { return new Promise((resolve, reject) => waiters.push({ type, resolve, reject })); },
+      call(msg, type, transfer) { const p = link.wait(type); link.post(msg, transfer); return p; },
+      fail(err) {
+        const list = waiters.splice(0);
+        for (const x of list) x.reject(err);
+        if (link.handlers.error) { try { link.handlers.error({ type: "error", message: err.message }); } catch (e) { /* 무시 */ } }
+      },
+      kill(err) {
+        if (link.dead) return;
+        link.dead = true;
+        try { if (typeof w.terminate === "function") w.terminate(); } catch (e) { /* 무시 */ }
+        const list = waiters.splice(0);
+        for (const x of list) x.reject(err || new Error("학습 엔진을 종료했습니다."));
+      },
+    };
+    w.onmessage = (ev) => {
+      if (link.dead) return;
+      const m = ev && ev.data !== undefined ? ev.data : ev;
+      if (!m || !m.type) return;
+      if (m.type === "error") { link.fail(new Error(m.message || "학습 엔진 오류")); return; }
+      const i = waiters.findIndex((x) => x.type === m.type);
+      if (i >= 0) { const x = waiters.splice(i, 1)[0]; x.resolve(m); }
+      const h = link.handlers[m.type];
+      if (h) { try { h(m); } catch (e) { /* 핸들러 오류는 학습을 멈추지 않는다 */ } }
+    };
+    w.onerror = (e) => {
+      if (e && typeof e.preventDefault === "function") e.preventDefault();
+      link.fail(new Error("학습 엔진(trainer.js)을 실행하지 못했습니다" + (e && e.message ? ": " + e.message : ".")));
+    };
+    return link;
+  }
+
+  // 자료 -> 글자 id. 조각마다 [BOS, ...글자, EOS]. 평가용으로 조각의 5%를 따로 둔다(조각 순서 기준, 항상 같은 결과).
+  async function snapshotRows() {
+    const snap = await kv.get(K_SNAPSHOT);
+    if (!snap) return [];
+    if (Array.isArray(snap.chunks)) return snap.chunks;
+    if (Array.isArray(snap.documents)) return legacyChunks(snap.documents);
+    return [];
+  }
+  function buildCorpus(rows, opts) {
+    opts = opts || {};
+    const holdout = opts.holdout == null ? 0.05 : Math.max(0, Math.min(0.5, Number(opts.holdout)));
+    const maxChars = opts.maxChars > 0 ? opts.maxChars : 4000000;
+    const texts = [];
+    let total = 0;
+    for (const r of rows || []) {
+      const x = stripMarks(r && r.x != null ? r.x : r && r.content != null ? r.content : "");
+      if (!x) continue;
+      texts.push(x);
+      total += x.length;
+      if (total >= maxChars) break;
+    }
+    const n = texts.length;
+    const period = holdout > 0 ? Math.max(2, Math.round(1 / holdout)) : 0;
+    const isEval = new Array(n).fill(false);
+    if (period && n >= 2) {
+      if (n >= period) for (let i = period - 1; i < n; i += period) isEval[i] = true;
+      else isEval[n - 1] = true; // 조각이 아주 적으면 마지막 하나만
+    }
+    let itos = Array.isArray(opts.itos) && opts.itos.length > N_SPECIAL ? opts.itos.slice() : null;
+    if (!itos) { // 처음부터: 글자 빈도순 어휘 (특수 4개 선두)
+      const freq = new Map();
+      for (const t of texts) for (const ch of t) freq.set(ch, (freq.get(ch) || 0) + 1);
+      const chars = Array.from(freq.keys()).sort((a, b) => (freq.get(b) - freq.get(a)) || (a < b ? -1 : a > b ? 1 : 0));
+      const cap = opts.vocabSize > N_SPECIAL ? Math.floor(opts.vocabSize) - N_SPECIAL : chars.length;
+      itos = SPECIAL_TOKENS.concat(chars.slice(0, Math.max(1, cap)));
+    }
+    const stoi = new Map();
+    for (let i = N_SPECIAL; i < itos.length; i++) if (!stoi.has(itos[i])) stoi.set(itos[i], i);
+    const trainIds = [], evalIds = [];
+    let chars = 0, unk = 0;
+    for (let i = 0; i < n; i++) {
+      const out = isEval[i] ? evalIds : trainIds;
+      out.push(BOS);
+      for (const ch of texts[i]) {
+        const id = stoi.get(ch);
+        if (id === undefined) { out.push(UNK); unk++; } else out.push(id);
+        chars++;
+      }
+      out.push(EOS);
+    }
+    return { itos, train: Int32Array.from(trainIds), eval: Int32Array.from(evalIds), chars, unkRate: chars ? unk / chars : 0,
+      chunks: n, evalChunks: isEval.filter(Boolean).length };
+  }
+
+  // 학습 상태 (한 번에 하나)
+  const TS = {
+    active: false, phase: "idle", step: 0, totalSteps: 0, loss: null, msPerStep: null, etaSec: null,
+    evalBefore: null, evalAfter: null, startedAt: null, message: "", canResume: false,
+    wakeLock: null, batteryApi: null, trainLoss: null, coolUntil: null, result: null,
+    run: null, onProgress: null, onState: null, doneP: null, doneResolve: null, coolMs: 60000,
+  };
+  function tsStatus() {
+    return { active: TS.active, phase: TS.phase, step: TS.step, totalSteps: TS.totalSteps, loss: TS.loss,
+      msPerStep: TS.msPerStep, etaSec: TS.etaSec, evalBefore: TS.evalBefore, evalAfter: TS.evalAfter,
+      startedAt: TS.startedAt, message: TS.message, canResume: TS.canResume,
+      wakeLock: TS.wakeLock, batteryApi: TS.batteryApi, trainLoss: TS.trainLoss, coolUntil: TS.coolUntil };
+  }
+  function tsEmit() { if (TS.onState) { try { TS.onState(tsStatus()); } catch (e) { /* 무시 */ } } }
+  function tsSetPhase(phase, message) {
+    TS.phase = phase;
+    if (message !== undefined) TS.message = message;
+    tsEmit();
+  }
+  function tsReset() {
+    Object.assign(TS, { step: 0, totalSteps: 0, loss: null, msPerStep: null, etaSec: null, evalBefore: null, evalAfter: null,
+      message: "", trainLoss: null, coolUntil: null });
+  }
+  function tsFinish(phase, message) {
+    const run = TS.run;
+    TS.active = false;
+    TS.phase = phase;
+    if (message !== undefined) TS.message = message;
+    TS.coolUntil = null;
+    if (run) runCleanup(run);
+    TS.run = null;
+    tsEmit();
+    if (TS.doneResolve) { const r = TS.doneResolve; TS.doneResolve = null; r(tsStatus()); }
+  }
+  function runCleanup(run) {
+    if (run.coolTimer) { clearTimeout(run.coolTimer); run.coolTimer = null; }
+    if (run.visHandler && root && root.document) { try { root.document.removeEventListener("visibilitychange", run.visHandler); } catch (e) { /* 무시 */ } }
+    run.visHandler = null;
+    if (run.wake) { try { const p = run.wake.release && run.wake.release(); if (p && p.catch) p.catch(() => {}); } catch (e) { /* 무시 */ } run.wake = null; }
+    if (run.link) run.link.kill();
+  }
+
+  async function batteryState() {
+    const n = nav();
+    if (!n || typeof n.getBattery !== "function") { TS.batteryApi = false; return null; }
+    try {
+      const b = await n.getBattery();
+      TS.batteryApi = true;
+      return { charging: !!b.charging, level: typeof b.level === "number" ? b.level : 1 };
+    } catch (e) { TS.batteryApi = false; return null; }
+  }
+  // 위반이면 한국어 사유, 아니면 null
+  async function batteryViolation(cfg) {
+    if (!cfg.chargingOnly && !(cfg.minBattery > 0)) return null;
+    const b = await batteryState();
+    if (!b) return null;
+    if (cfg.chargingOnly && !b.charging) return "충전기가 연결되어 있지 않아 학습을 멈췄습니다.";
+    if (cfg.minBattery > 0 && !b.charging && Math.round(b.level * 100) <= cfg.minBattery) return "배터리가 " + cfg.minBattery + "% 이하라 학습을 멈췄습니다.";
+    return null;
+  }
+  async function acquireWake(run) {
+    if (!run.cfg.wakeLock) return;
+    const n = nav();
+    try {
+      if (!n || !n.wakeLock || typeof n.wakeLock.request !== "function") throw new Error("unsupported");
+      const s = await n.wakeLock.request("screen");
+      if (TS.run !== run) { try { s.release(); } catch (e) { /* 무시 */ } return; }
+      run.wake = s;
+      TS.wakeLock = true;
+    } catch (e) {
+      TS.wakeLock = false;
+      TS.message = "화면 꺼짐 방지를 켤 수 없습니다. 학습 중에는 화면을 켜 둔 채 두세요.";
+      tsEmit();
+    }
+  }
+
+  function normConfig(o) {
+    const num = (v, d, lo, hi) => { v = Number(v); if (!Number.isFinite(v)) v = d; return Math.max(lo, Math.min(hi, v)); };
+    return {
+      steps: Math.round(num(o.steps, 100, 1, 1000000)), batch: Math.round(num(o.batch, 8, 1, 256)),
+      seqLen: Math.round(num(o.seqLen, 64, 2, 4096)), lr: num(o.lr, 3e-3, 1e-6, 1),
+      thermalPause: o.thermalPause !== false, chargingOnly: !!o.chargingOnly,
+      minBattery: Math.round(num(o.minBattery, 0, 0, 99)), maxMinutes: num(o.maxMinutes, 0, 0, 100000),
+      wakeLock: o.wakeLock !== false, autoPauseHidden: o.autoPauseHidden !== false,
+      checkpointEvery: Math.round(num(o.checkpointEvery, 20, 1, 100000)), seed: Math.round(num(o.seed, (Date.now() & 0x3fffffff) || 1, 1, 0x7fffffff)),
+      maxParams: Math.round(num(o.maxParams, MAX_PARAMS, 1000, 1e9)),
+    };
+  }
+  function srcMeta(source, hdr) {
+    if (!source && !hdr) return null;
+    return { modelId: source && source.modelId != null ? source.modelId : null, name: (source && source.name) || null,
+      totalSteps: (hdr && (hdr.total_steps != null ? hdr.total_steps : hdr.steps)) || 0 };
+  }
+
+  async function saveCheckpoint(run, step, state) {
+    let bytes = 0;
+    const add = (o) => { if (o) for (const k in o) bytes += o[k].byteLength; };
+    add(state.weights); if (state.opt) { add(state.opt.m); add(state.opt.v); }
+    try {
+      const n = nav();
+      if (n && n.storage && typeof n.storage.estimate === "function") {
+        const est = await n.storage.estimate();
+        if (est && typeof est.quota === "number" && typeof est.usage === "number" && est.quota - est.usage < bytes * 1.5) {
+          TS.message = "기기 저장 공간이 부족해 체크포인트를 저장하지 못했습니다 (필요 약 " + Math.ceil(bytes / 1048576) + "MB). 저장 공간을 비우세요.";
+          tsEmit();
+          return false;
+        }
+      }
+    } catch (e) { /* 추정 불가면 그냥 저장 시도 */ }
+    const rec = {
+      config: run.cfg, mode: run.mode, arch: run.arch, itos: run.itos, step, totalSteps: run.total, state,
+      evalBefore: TS.evalBefore, startedAt: TS.startedAt, savedAt: nowIso(),
+      trainLoss: TS.trainLoss, trainSeconds: run.secondsBase + run.trainSeconds, source: run.source,
+      corpus: run.corpusInfo, seed: run.cfg.seed,
+    };
+    try {
+      await kv.setMany({ [K_SESSION]: rec, [K_SESSION_META]: { step, totalSteps: run.total, arch: run.arch, mode: run.mode, savedAt: rec.savedAt } });
+      TS.canResume = true;
+      return true;
+    } catch (e) {
+      TS.message = (e && e.message) || "체크포인트를 저장하지 못했습니다.";
+      tsEmit();
+      return false;
+    }
+  }
+
+  function requestStop(run, reason, finalize, msg) {
+    if (run.stopReason) return;
+    run.stopReason = reason;
+    run.finalizeOnStop = !!finalize;
+    run.stopMsg = msg || "";
+    if (run.coolTimer) { clearTimeout(run.coolTimer); run.coolTimer = null; }
+    run.link.post({ type: "stop" });
+  }
+  function pauseRun(run, auto) {
+    if (run.coolTimer) { clearTimeout(run.coolTimer); run.coolTimer = null; TS.coolUntil = null; }
+    run.link.post({ type: "pause" });
+    run.lastTs = null;
+    tsSetPhase("paused", auto ? "화면이 가려져 자동으로 일시정지했습니다. 화면으로 돌아오면 이어서 합니다." : "일시정지");
+  }
+  function resumeRun(run) {
+    if (run.coolTimer) { clearTimeout(run.coolTimer); run.coolTimer = null; TS.coolUntil = null; }
+    run.link.post({ type: "resume" });
+    run.lastTs = null;
+    run.win = [];
+    tsSetPhase("training", "");
+    if (!run.wake) acquireWake(run);
+  }
+  function startCooling(run) {
+    run.link.post({ type: "pause" });
+    run.coolings++;
+    run.win = []; run.lastTs = null;
+    const secs = Math.round(TS.coolMs / 1000);
+    TS.coolUntil = Date.now() + TS.coolMs;
+    tsSetPhase("cooling", "기기가 뜨거워진 것 같아 " + secs + "초 쉬는 중입니다.");
+    run.coolTimer = setTimeout(() => {
+      run.coolTimer = null;
+      if (TS.run !== run || TS.phase !== "cooling") return;
+      TS.coolUntil = null;
+      run.link.post({ type: "resume" });
+      run.lastTs = null;
+      tsSetPhase("training", "");
+    }, TS.coolMs);
+  }
+
+  function onProgress(run, m) {
+    const now = perfNow();
+    const dt = run.lastTs == null ? null : now - run.lastTs;
+    run.lastTs = now;
+    run.trainSeconds += (dt == null ? (m.msPerStep || 0) : dt) / 1000;
+    TS.step = m.step; TS.loss = m.loss; TS.msPerStep = m.msPerStep; TS.etaSec = m.eta;
+    run.lossHist.push(m.loss); if (run.lossHist.length > 50) run.lossHist.shift();
+    TS.trainLoss = meanOf(run.lossHist);
+    let changed = false;
+    if (TS.phase === "checkpoint") { TS.phase = "training"; changed = true; }
+    if (dt != null && run.cfg.thermalPause && !run.stopReason) { // 발열 추정: 최근 10단계가 처음 10단계의 2배를 넘으면 휴식
+      if (run.baseline == null) {
+        run.base.push(dt);
+        if (run.base.length >= 10) run.baseline = meanOf(run.base);
+      } else {
+        run.win.push(dt); if (run.win.length > 10) run.win.shift();
+        if (run.win.length >= 10 && meanOf(run.win) > 2 * run.baseline && m.step < run.end) {
+          if (run.coolings >= 3) run.baseline = meanOf(run.win); // 계속 느리면 이 속도를 새 기준으로 받아들인다
+          else { startCooling(run); return; }
+        }
+      }
+    }
+    if (run.cfg.maxMinutes > 0 && !run.stopReason && (Date.now() - run.runStart) > run.cfg.maxMinutes * 60000) {
+      requestStop(run, "time", true, "최대 시간(" + run.cfg.maxMinutes + "분)에 도달해 지금까지의 결과로 마무리합니다.");
+    }
+    if (changed) tsEmit();
+    if (TS.onProgress) { try { TS.onProgress(tsStatus()); } catch (e) { /* 무시 */ } }
+  }
+  async function onCheckpoint(run, m) {
+    if (run.ckptBusy || TS.run !== run) return;
+    run.ckptBusy = true;
+    const prev = TS.phase;
+    if (prev === "training") tsSetPhase("checkpoint", "체크포인트를 저장하는 중");
+    try {
+      await saveCheckpoint(run, m.step, m.state);
+      const why = await batteryViolation(run.cfg);
+      if (why && TS.run === run) requestStop(run, "battery", false, why);
+    } finally {
+      run.ckptBusy = false;
+      if (TS.run === run && TS.phase === "checkpoint") tsSetPhase("training", "");
+    }
+  }
+  async function onStopped(run, m) {
+    if (TS.run !== run) return;
+    if (run.finalizeOnStop) { await finalizeRun(run, m.state, m.step); return; }
+    let saved = false;
+    if (m.step > 0 && m.state) saved = await saveCheckpoint(run, m.step, m.state);
+    const reason = run.stopMsg || (saved ? "중지했습니다. 저장된 체크포인트에서 이어서 학습할 수 있습니다." : "중지했습니다.");
+    TS.step = m.step;
+    tsFinish("idle", reason);
+  }
+  async function finalizeRun(run, state, step) {
+    tsSetPhase("finishing", "결과를 정리하는 중");
+    try {
+      const link = run.link, T0 = run.cfg.seqLen;
+      let weights = state && state.weights;
+      if (!weights) weights = (await link.call({ type: "export" }, "weights")).weights;
+      let evalAfter = null;
+      try { evalAfter = (await link.call({ type: "eval", batches: 8, batch: 16, seqLen: T0 }, "eval")).loss; } catch (e) { evalAfter = null; }
+      TS.evalAfter = evalAfter;
+      let sample = "";
+      try {
+        const g = await link.call({ type: "generate", prompt: Int32Array.of(BOS), maxNew: 80, temperature: 0.8, topK: 20, seed: 7 }, "generated");
+        for (const id of g.ids || []) if (id >= N_SPECIAL && id < run.itos.length) sample += run.itos[id];
+      } catch (e) { sample = ""; }
+      const dev = await Onboard.detectDevice().catch(() => null);
+      const seconds = run.secondsBase + run.trainSeconds;
+      const trainLoss = TS.trainLoss;
+      const r4 = (x) => (x == null || !Number.isFinite(x) ? null : Math.round(x * 10000) / 10000);
+      const header = {
+        format: "lbw", arch: run.arch, itos: run.itos, tensors: tensorSpecs(run.arch),
+        parent: run.source ? run.source.name : null, parent_model_id: run.source ? run.source.modelId : null,
+        total_steps: ((run.source && run.source.totalSteps) || 0) + step, steps: step,
+        trained_on: "device",
+        device: { label: dev ? dev.label : "알 수 없는 기기", ua: String((nav() && nav().userAgent) || "").slice(0, 300) },
+        train_loss: r4(trainLoss), eval_loss_before: r4(TS.evalBefore), eval_loss_after: r4(evalAfter),
+        train_chars: run.corpusInfo ? run.corpusInfo.chars : 0, seconds: Math.round(seconds * 10) / 10,
+        train_seq_len: run.cfg.seqLen, created_at: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+      };
+      const result = { header, tensors: weights, sample, evalBefore: TS.evalBefore, evalAfter, trainLoss, seconds };
+      await kv.setMany({ [K_RESULT]: result, [K_SESSION]: undefined, [K_SESSION_META]: undefined });
+      TS.result = result;
+      TS.canResume = false;
+      TS.step = step;
+      tsFinish("done", "학습이 끝났습니다.");
+    } catch (e) {
+      tsFinish("error", (e && e.message) || "결과를 정리하지 못했습니다.");
+    }
+  }
+
+  // 공통 실행 경로: start / continueSaved 가 같이 쓴다.
+  async function launchRun(p) {
+    const cfg = p.cfg;
+    const run = {
+      cfg, mode: p.mode, arch: null, itos: null, link: null, source: p.source || null, total: p.total,
+      end: p.total, startStep: p.startStep || 0, secondsBase: p.secondsBase || 0, trainSeconds: 0, lastTs: null,
+      base: [], baseline: null, win: [], coolings: 0, coolTimer: null, lossHist: [], runStart: Date.now(),
+      stopReason: null, finalizeOnStop: false, stopMsg: "", ckptBusy: false, wake: null, visHandler: null, corpusInfo: null,
+    };
+    TS.run = run;
+    try {
+      tsSetPhase("preparing", "학습 자료를 준비하는 중");
+      const why = await batteryViolation(cfg);
+      if (why) throw new Error(why.replace("학습을 멈췄습니다", "학습을 시작할 수 없습니다"));
+      const corp = await Onboard.training.prepareCorpus({ itos: p.itos, vocabSize: p.vocabSize, holdout: 0.05 });
+      let arch = p.arch;
+      if (!arch) arch = Object.assign({}, p.archIn, { vocab_size: corp.itos.length });
+      arch = normArch(arch);
+      if (arch.vocab_size !== corp.itos.length) throw new Error("모델 글자 수(vocab)가 어휘 목록과 맞지 않습니다.");
+      if (cfg.seqLen > arch.seq_len) throw new Error("문맥 길이(" + cfg.seqLen + ")는 모델의 seq_len(" + arch.seq_len + ") 이하여야 합니다.");
+      const params = paramCount(arch);
+      if (params > cfg.maxParams) throw new Error("파라미터가 너무 많습니다 (" + params.toLocaleString("en-US") + "개 > " + cfg.maxParams.toLocaleString("en-US") + "개). 더 작은 모델을 고르세요.");
+      if (corp.train.length < cfg.seqLen + 2) throw new Error("학습 자료가 너무 짧습니다. 먼저 [검색] 탭에서 '이 기기에 저장'으로 자료 사본을 받으세요.");
+      run.arch = arch; run.itos = corp.itos;
+      run.corpusInfo = { chars: corp.chars, unkRate: corp.unkRate };
+      const evalIds = corp.eval.length >= cfg.seqLen + 2 ? corp.eval : corp.train;
+      run.link = makeLink(makeWorker());
+      run.link.handlers.error = (m) => {
+        if (TS.run !== run || TS.phase === "idle") return;
+        tsFinish("error", m.message || "학습 중 오류가 발생했습니다.");
+      };
+      run.link.handlers.progress = (m) => onProgress(run, m);
+      run.link.handlers.checkpoint = (m) => { onCheckpoint(run, m); };
+      run.link.handlers.stopped = (m) => { onStopped(run, m); };
+      run.link.handlers.done = (m) => { finalizeRun(run, null, m.step); };
+      const init = { type: "init", arch, weights: p.weights || null, itos: corp.itos, corpus: corp.train, evalIds, seed: cfg.seed };
+      if (p.opt) init.opt = p.opt;
+      if (p.rng != null) init.rng = p.rng;
+      await run.link.call(init, "ready");
+      if (TS.run !== run) return;
+      if (p.evalBefore == null) {
+        tsSetPhase("evaluating", "학습 전 평가 중");
+        TS.evalBefore = (await run.link.call({ type: "eval", batches: 8, batch: 16, seqLen: cfg.seqLen }, "eval")).loss;
+      } else TS.evalBefore = p.evalBefore;
+      if (TS.run !== run) return;
+      TS.step = run.startStep; TS.totalSteps = run.total;
+      if (cfg.autoPauseHidden && root && root.document && typeof root.document.addEventListener === "function") {
+        run.visHandler = () => {
+          if (TS.run !== run || run.stopReason) return;
+          const hidden = root.document.visibilityState === "hidden";
+          if (hidden && ["training", "checkpoint", "cooling"].includes(TS.phase)) { run.autoPaused = true; pauseRun(run, true); }
+          else if (!hidden && run.autoPaused) { run.autoPaused = false; if (TS.phase === "paused") resumeRun(run); }
+        };
+        root.document.addEventListener("visibilitychange", run.visHandler);
+      }
+      await acquireWake(run);
+      if (TS.run !== run) return;
+      run.runStart = Date.now();
+      tsSetPhase("training", "");
+      run.link.post({ type: "train", steps: run.total - run.startStep, batch: cfg.batch, seqLen: cfg.seqLen, lr: cfg.lr,
+        startStep: run.startStep, totalPlanned: run.total, checkpointEvery: cfg.checkpointEvery });
+    } catch (e) {
+      if (TS.run === run) tsFinish("error", (e && e.message) || String(e));
+      throw e;
+    }
+  }
+  function beginSession(opts) {
+    if (TS.active) throw new Error("이미 학습이 진행 중입니다.");
+    tsReset();
+    TS.active = true;
+    TS.result = null;
+    TS.onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
+    TS.onState = typeof opts.onState === "function" ? opts.onState : null;
+    TS.doneP = new Promise((r) => { TS.doneResolve = r; });
+  }
+
+  const training = {
+    prepareCorpus: async function (opts) {
+      opts = opts || {};
+      const rows = await snapshotRows();
+      if (!rows.length) throw new Error("이 기기에 저장된 자료가 없습니다. 먼저 [검색] 탭에서 '이 기기에 저장'으로 자료를 받으세요.");
+      return buildCorpus(rows, { itos: opts.itos, vocabSize: opts.vocabSize, holdout: opts.holdout, maxChars: opts.maxChars });
+    },
+
+    async benchmark(opts) {
+      opts = opts || {};
+      if (TS.active) throw new Error("학습 중에는 측정할 수 없습니다.");
+      const arch = normArch(opts.arch);
+      const batch = Math.max(1, parseInt(opts.batch, 10) || 8);
+      const seqLen = Math.max(2, Math.min(parseInt(opts.seqLen, 10) || 64, arch.seq_len));
+      const steps = Math.max(1, parseInt(opts.steps, 10) || 10);
+      const prog = typeof opts.onProgress === "function" ? (p, msg) => { try { opts.onProgress(p, msg); } catch (e) { /* 무시 */ } } : () => {};
+      const link = makeLink(makeWorker());
+      let timer = null;
+      try {
+        prog(0.05, "학습 엔진을 시작하는 중");
+        const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("측정이 너무 오래 걸려 중단했습니다. 이 기기에는 이 크기가 너무 큽니다.")), opts.timeoutMs || 300000); });
+        const job = (async () => {
+          await link.call({ type: "init", arch, weights: opts.weights || null, itos: opts.itos || null, corpus: null, evalIds: null, seed: 1 }, "ready");
+          prog(0.2, "단계 속도를 재는 중");
+          const b = await link.call({ type: "bench", steps, batch, seqLen }, "bench");
+          return b;
+        })();
+        const b = await Promise.race([job, timeout]);
+        const ms = b.msPerStep;
+        const grade = gradeOf(ms);
+        prog(1, "완료");
+        return { msPerStep: ms, tokensPerSec: b.tokensPerSec, est100Sec: ms * 100 / 1000, est300Sec: ms * 300 / 1000,
+          grade, label: GRADE_LABEL[grade], params: paramCount(arch), batch, seqLen, steps };
+      } finally { clearTimeout(timer); link.kill(); }
+    },
+
+    // opts.source: {modelId, name, lbw: {header, tensors}} (이어서 학습일 때 필수 — Onboard.lbw.parse 결과)
+    async start(opts) {
+      opts = opts || {};
+      beginSession(opts);
+      let p;
+      try {
+        const cfg = normConfig(opts);
+        const mode = opts.mode === "resume" ? "resume" : "scratch";
+        TS.startedAt = nowIso();
+        TS.totalSteps = cfg.steps;
+        if (mode === "resume") {
+          const l = opts.source && opts.source.lbw;
+          if (!l || !l.header || !l.tensors) throw new Error("이어서 학습할 모델의 가중치(.lbw)를 먼저 받아야 합니다.");
+          const hdr = l.header;
+          p = { cfg, mode, arch: normArch(hdr.arch), itos: hdr.itos, weights: l.tensors, total: cfg.steps,
+            source: srcMeta(opts.source, hdr) };
+        } else {
+          const a = opts.arch || {};
+          p = { cfg, mode, arch: null, archIn: a, vocabSize: parseInt(a.vocab_size, 10) || 2000, itos: null, weights: null, total: cfg.steps,
+            source: opts.source ? srcMeta(opts.source, null) : null };
+          normArch(Object.assign({}, a, { vocab_size: 5 })); // 구조 값 검증만
+        }
+      } catch (e) { tsFinish("error", e.message); throw e; }
+      await launchRun(p);
+      return tsStatus();
+    },
+
+    async continueSaved() {
+      if (TS.active) throw new Error("이미 학습이 진행 중입니다.");
+      const rec = await kv.get(K_SESSION);
+      if (!rec || !rec.state) throw new Error("이어서 할 수 있는 학습이 없습니다.");
+      beginSession({ onProgress: TS.onProgress, onState: TS.onState });
+      TS.startedAt = rec.startedAt || nowIso();
+      TS.totalSteps = rec.totalSteps;
+      TS.trainLoss = rec.trainLoss == null ? null : rec.trainLoss;
+      const cfg = Object.assign(normConfig(rec.config || {}), rec.config || {});
+      await launchRun({ cfg, mode: rec.mode, arch: rec.arch, itos: rec.itos, weights: rec.state.weights, opt: rec.state.opt,
+        rng: rec.state.rng, startStep: rec.step, total: rec.totalSteps, secondsBase: rec.trainSeconds || 0,
+        evalBefore: rec.evalBefore, source: rec.source || null });
+      return tsStatus();
+    },
+
+    // 외부(UI)가 콜백을 바꾸고 싶을 때 (새로고침 뒤 이어서 하기 등)
+    setCallbacks(cb) { cb = cb || {}; TS.onProgress = cb.onProgress || null; TS.onState = cb.onState || null; },
+    whenDone() { return TS.doneP || Promise.resolve(tsStatus()); },
+
+    pause() { const run = TS.run; if (TS.active && run && ["training", "checkpoint", "cooling"].includes(TS.phase)) { run.autoPaused = false; pauseRun(run, false); } },
+    resume() {
+      const run = TS.run;
+      if (TS.active && run) { if (TS.phase === "paused") { run.autoPaused = false; resumeRun(run); } return undefined; }
+      if (!TS.active && TS.canResume) return training.continueSaved();
+      return undefined;
+    },
+    // 중지: 체크포인트를 남기고 멈춘다 (이어서 하기 가능)
+    stop() {
+      const run = TS.run;
+      if (!TS.active || !run) return;
+      if (["training", "paused", "cooling", "checkpoint"].includes(TS.phase)) requestStop(run, "user", false, "");
+    },
+    // 지금까지 학습한 것으로 결과를 만든다 (학습 중이면 중단 후 정리, 아니면 저장된 체크포인트로 정리)
+    async finalizeNow() {
+      const run = TS.run;
+      if (TS.active && run) { requestStop(run, "user", true, ""); return training.whenDone(); }
+      const rec = await kv.get(K_SESSION);
+      if (!rec || !rec.state) throw new Error("정리할 학습이 없습니다.");
+      await training.continueSaved();
+      const r2 = TS.run;
+      if (r2) requestStop(r2, "user", true, "");
+      return training.whenDone();
+    },
+    status() { return tsStatus(); },
+    async hasResumable() {
+      try {
+        let m = await kv.get(K_SESSION_META);
+        if (!m) {
+          const rec = await kv.get(K_SESSION);
+          if (!rec || !rec.state) { TS.canResume = false; return null; }
+          m = { step: rec.step, totalSteps: rec.totalSteps, arch: rec.arch, mode: rec.mode, savedAt: rec.savedAt };
+        }
+        TS.canResume = true;
+        return { step: m.step, totalSteps: m.totalSteps, arch: m.arch, mode: m.mode, savedAt: m.savedAt };
+      } catch (e) { return null; }
+    },
+    async discard() {
+      const run = TS.run;
+      if (TS.active && run) { run.stopReason = "discard"; tsFinish("idle", "학습을 취소했습니다."); }
+      TS.canResume = false;
+      await kv.setMany({ [K_SESSION]: undefined, [K_SESSION_META]: undefined });
+    },
+    result() { return TS.result; },
+    async loadResult() {
+      if (TS.result) return TS.result;
+      try { const r = await kv.get(K_RESULT); if (r && r.header && r.tensors) { TS.result = r; return r; } } catch (e) { /* 무시 */ }
+      return null;
+    },
+    async clearResult() { TS.result = null; await kv.del(K_RESULT); },
+    async exportLbw() {
+      const r = await training.loadResult();
+      if (!r) throw new Error("저장할 학습 결과가 없습니다.");
+      return lbw.build(r.header, r.tensors);
+    },
+    async adoptAsLocalModel() {
+      const r = await training.loadResult();
+      if (!r) throw new Error("사용할 학습 결과가 없습니다.");
+      const h = r.header;
+      let bytes = 0;
+      for (const k in r.tensors) bytes += r.tensors[k].byteLength;
+      const name = "기기 학습 모델" + (h.parent ? " (" + h.parent + " 이어서)" : "") + " · " + (h.total_steps || h.steps) + "단계";
+      const meta = { id: null, name, variant: "fp32", bytes, saved_at: nowIso(), source: "device",
+        info: { source: "device", trained_on: "device", arch: h.arch, seq_len: h.arch.seq_len, train_seq_len: h.train_seq_len,
+          steps: h.steps, total_steps: h.total_steps, parent: h.parent, eval_loss_before: h.eval_loss_before, eval_loss_after: h.eval_loss_after } };
+      await kv.setMany({ [K_MODEL_WEIGHTS]: { meta, arch: h.arch, itos: h.itos, tensors: r.tensors }, [K_MODEL_WEIGHTS_META]: meta });
+      killGen();
+      return meta;
+    },
+
+    // 테스트용
+    _grade: gradeOf,
+    _buildCorpus: buildCorpus,
+    _setWorkerFactory(f) { workerFactory = f || null; },
+    _setCoolMs(ms) { TS.coolMs = ms; },
+    _reset() { const run = TS.run; if (run) runCleanup(run); TS.run = null; TS.active = false; TS.phase = "idle"; TS.result = null; TS.canResume = false; tsReset(); TS.onProgress = null; TS.onState = null; killGen(); },
+    _tensorSpecs: tensorSpecs,
+  };
+
+  // 기기에서 학습한 가중치로 글자 생성 (ONNX 없이 Worker). 한 번 만든 Worker는 모델이 바뀔 때까지 재사용한다.
+  let gen = null; // {key, link, itos}
+  function killGen() { if (gen) { gen.link.kill(); gen = null; } }
+  async function deviceModelMeta() {
+    try { return (await kv.get(K_MODEL_WEIGHTS_META)) || null; } catch (e) { return null; }
+  }
+  async function getGenWorker(meta) {
+    const key = String(meta.saved_at) + ":" + meta.name;
+    if (gen && gen.key === key && !gen.link.dead) return gen;
+    killGen();
+    const rec = await kv.get(K_MODEL_WEIGHTS);
+    if (!rec || !rec.tensors) throw new Error("기기 학습 모델을 읽을 수 없습니다. 다시 학습하거나 모델을 받아 주세요.");
+    const link = makeLink(makeWorker());
+    try {
+      await link.call({ type: "init", arch: rec.arch, weights: rec.tensors, itos: rec.itos, corpus: null, evalIds: null, seed: 1 }, "ready");
+    } catch (e) { link.kill(); throw e; }
+    gen = { key, link, itos: rec.itos };
+    return gen;
+  }
+  async function deviceGenerate(meta, prompt, opts) {
+    const dev = await Onboard.detectDevice();
+    const g = await getGenWorker(meta);
+    const maxNew = Math.max(1, Math.min(2000, parseInt(opts.maxNew, 10) || dev.limits.maxNewTokens));
+    const temperature = opts.temperature == null ? 0.8 : Number(opts.temperature);
+    const topK = opts.topK == null ? 20 : parseInt(opts.topK, 10);
+    const onToken = typeof opts.onToken === "function" ? opts.onToken : null;
+    let text = "";
+    g.link.handlers.token = (m) => {
+      if (!(m.id >= N_SPECIAL && m.id < g.itos.length)) return;
+      const piece = g.itos[m.id];
+      text += piece;
+      if (onToken) { try { onToken(piece, text); } catch (e) { /* 무시 */ } }
+    };
+    const onAbort = () => { if (gen === g) killGen(); };
+    if (opts.signal) { if (opts.signal.aborted) return ""; opts.signal.addEventListener("abort", onAbort); }
+    try {
+      await g.link.call({ type: "generate", prompt: Int32Array.from(encodePrompt(prompt, g.itos)), maxNew, temperature, topK,
+        seed: opts.seed == null ? (Date.now() & 0x7fffffff) : opts.seed }, "generated");
+    } catch (e) {
+      if (opts.signal && opts.signal.aborted) return text;
+      throw e;
+    } finally {
+      g.link.handlers.token = null;
+      if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
+    }
+    return text;
+  }
+
+  // ------------------------------------------------------------------------------------------------
   // 공개 API
   // ------------------------------------------------------------------------------------------------
   let devicePromise = null;
@@ -958,6 +1719,8 @@
     ORT_VERSION, ORT_URL, ORT_DIST,
     TIER_LIMITS,
     db: kv,
+    lbw,
+    training,
 
     detectDevice(opts) {
       if (!devicePromise || (opts && opts.refresh)) devicePromise = detect();
@@ -1041,13 +1804,17 @@
       const warning = mb > dev.limits.maxModelMB
         ? "이 기기(" + TIER_NAMES[dev.tier] + ")에 비해 큰 모델입니다 (" + mb.toFixed(1) + "MB > 권장 " + dev.limits.maxModelMB + "MB). 느리거나 메모리가 부족할 수 있습니다."
         : null;
-      await kv.setMany({ [K_MODEL]: { meta: m, onnx: buf, itos: vocab }, [K_MODEL_META]: m });
+      // 로컬 모델은 하나: ONNX 모델을 받으면 기기 학습 모델 자리는 비운다 (generate 가 기기 학습 모델을 우선하므로)
+      await kv.setMany({ [K_MODEL]: { meta: m, onnx: buf, itos: vocab }, [K_MODEL_META]: m, [K_MODEL_WEIGHTS]: undefined, [K_MODEL_WEIGHTS_META]: undefined });
+      killGen();
       if (rt) { try { if (rt.session && rt.session.release) await rt.session.release(); } catch (e) { /* 무시 */ } rt = null; }
       return Object.assign({}, m, { warning });
     },
 
     async modelInfo() {
       try {
+        const dm = await kv.get(K_MODEL_WEIGHTS_META);
+        if (dm) return { id: dm.id, name: dm.name, variant: dm.variant || "fp32", bytes: dm.bytes, info: dm.info, saved_at: dm.saved_at, source: "device" };
         const m = await kv.get(K_MODEL_META);
         if (m) return { id: m.id, name: m.name, variant: m.variant, bytes: m.bytes, info: m.info, saved_at: m.saved_at };
         const old = await kv.get(K_LEGACY_MODEL);
@@ -1063,12 +1830,16 @@
 
     async deleteModel() {
       if (rt) { try { if (rt.session && rt.session.release) await rt.session.release(); } catch (e) { /* 무시 */ } rt = null; }
-      await kv.setMany({ [K_MODEL]: undefined, [K_MODEL_META]: undefined, [K_LEGACY_MODEL]: undefined });
+      killGen();
+      await kv.setMany({ [K_MODEL]: undefined, [K_MODEL_META]: undefined, [K_LEGACY_MODEL]: undefined,
+        [K_MODEL_WEIGHTS]: undefined, [K_MODEL_WEIGHTS_META]: undefined });
     },
 
     async generate(prompt, opts) {
       opts = opts || {};
       const run = async () => {
+        const dm = await deviceModelMeta(); // 기기에서 학습한 모델이 있으면 ONNX 대신 Worker 로 생성
+        if (dm) return deviceGenerate(dm, prompt, opts);
         const dev = await Onboard.detectDevice();
         const r = await getRuntime(dev);
         const ort = root.ort;
@@ -1165,7 +1936,7 @@
     _sampleTopK: sampleTopK,
     _encodePrompt: encodePrompt,
     _modelCtx: modelCtx,
-    _reset() { snapGen++; snapCache = null; snapLoading = null; rt = null; devicePromise = null; ortPromise = null; ensureOrt._configured = false; },
+    _reset() { killGen(); snapGen++; snapCache = null; snapLoading = null; rt = null; devicePromise = null; ortPromise = null; ensureOrt._configured = false; },
   };
 
   if (root) root.Onboard = Onboard;

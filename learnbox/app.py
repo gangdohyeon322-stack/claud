@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 import importlib.util
 import shutil
 import threading
@@ -25,6 +26,15 @@ TINY_KINDS = ("tiny", "mobile")   # 'mobile'은 예전 이름 (DB가 시작할 �
 LORA_KINDS = ("lora", "pc")
 NO_MODEL_MSG = {"tiny": "학습한 소형 AI 모델이 없습니다. [학습] 탭에서 소형 AI 모델을 학습하세요.",
                 "lora": "학습한 LoRA 모델이 없습니다. [학습] 탭에서 LoRA 모델을 학습하세요."}
+
+
+class LbwInvalid(ValueError):
+    """업로드한 .lbw가 검증을 통과하지 못함. errors: 한국어 사유 목록."""
+
+    def __init__(self, errors: list[str]):
+        self.errors = list(errors)
+        super().__init__("가중치 파일이 올바르지 않습니다: " + "; ".join(self.errors[:3])
+                         + (f" 외 {len(self.errors) - 3}건" if len(self.errors) > 3 else ""))
 
 
 def _mod(name: str):
@@ -241,6 +251,100 @@ class App:
                 continue
             return name, path
         raise RuntimeError("모델 폴더 이름을 만들 수 없습니다.")
+
+    # ---------- 휴대폰 온디바이스 학습 (.lbw) ----------
+    def ensure_lbw(self, model_row: dict) -> Path:
+        """tiny 모델 폴더의 model.lbw를 돌려준다. 없으면 model.pt에서 만들어 폴더에 캐시한다."""
+        d = Path(model_row["path"])
+        out = d / "model.lbw"
+        if out.is_file() and out.stat().st_mtime >= (d / "model.pt").stat().st_mtime:
+            return out
+        lbw = _mod("lbw")
+        info = model_row.get("info") or {}
+        meta = {"parent": model_row.get("name"), "parent_model_id": model_row.get("id"),
+                "total_steps": info.get("total_steps"), "train_seq_len": info.get("train_seq_len")}
+        data = lbw.lbw_from_model_dir(d, {k: v for k, v in meta.items() if v is not None})
+        tmp = out.with_name("model.lbw.tmp")
+        tmp.write_bytes(data)
+        tmp.replace(out)
+        return out
+
+    def register_device_model(self, data: bytes, name_hint: str | None, actor: str) -> dict:
+        """기기에서 학습한 .lbw를 검증해 PC 모델로 등록한다 (ONNX 재생성 포함). 실패하면 폴더를 지운다."""
+        import json as _json
+        import time as _time
+        from datetime import timezone
+
+        lbw, tinylm = _mod("lbw"), _mod("tinylm")
+        mt = self.cfg["mobile_training"] or {}
+        try:
+            header, tensors = lbw.read_lbw(data)
+        except ValueError as e:
+            raise LbwInvalid([str(e)])
+        errs = lbw.validate_lbw(header, tensors, int(mt.get("max_params", 2_000_000)))
+        if errs:
+            raise LbwInvalid(errs)
+        import torch   # 없으면 ImportError -> 서버가 pip 안내와 함께 400
+
+        arch = header["arch"]
+        V, T = int(arch["vocab_size"]), int(arch["seq_len"])
+        name, out = self._new_model_dir("tiny")
+        name2 = name + "-device"
+        n = 1
+        while out.with_name(name2).exists():
+            n += 1
+            name2 = f"{name}-{n}-device"
+        try:
+            out2 = out.with_name(name2)
+            out.rename(out2)
+            out, name = out2, name2
+            model = lbw.load_torch_model(header, tensors)
+            train_seq = int(header.get("train_seq_len") or T)
+            cfg = {"vocab_size": V, "d_model": arch["d_model"], "n_layer": arch["n_layer"],
+                   "n_head": arch["n_head"], "seq_len": T, "train_seq_len": train_seq}
+            torch.save({"config": cfg, "state_dict": model.state_dict()}, out / "model.pt")
+            (out / "vocab.json").write_text(_json.dumps({"itos": header["itos"]}, ensure_ascii=False), encoding="utf-8")
+            (out / "model.lbw").write_bytes(data)
+            threads = self._threads({})
+            onnx_res = tinylm.export_onnx_files(model, out, T, V, int8=True, threads=threads)
+            files = {n: (out / n).stat().st_size for n in ("model.onnx", "model.int8.onnx", "model.pt", "vocab.json",
+                                                            "model.lbw") if (out / n).exists()}
+            params = tinylm.count_params(arch["d_model"], arch["n_layer"], T, V)
+            full = {"preset": tinylm._preset_name(arch), **{k: int(arch[k]) for k in ARCH_KEYS}}
+            ev_after = header.get("eval_loss_after")
+            try:
+                ppl = round(math.exp(min(float(ev_after), 50.0)), 3) if ev_after is not None else None
+            except (TypeError, ValueError):
+                ppl = None
+            dev = header.get("device")
+            info = {
+                "kind": "tiny", "name": name, "preset": full["preset"], "arch": full, "params": int(params),
+                "steps": header.get("steps"), "total_steps": header.get("total_steps", header.get("steps")),
+                "parent": header.get("parent"), "parent_model_id": header.get("parent_model_id"),
+                "trained_on": "device", "device": dev,
+                "train_loss": header.get("train_loss"), "eval_loss_before": header.get("eval_loss_before"),
+                "eval_loss_after": ev_after, "perplexity_after": ppl,
+                "train_chars": header.get("train_chars"), "seconds": header.get("seconds"),
+                "vocab_size": V, "seq_len": T, "train_seq_len": train_seq,
+                "created_at": header.get("created_at") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "uploaded_by": actor, **onnx_res, "files": files,
+            }
+            if name_hint:
+                clean = "".join(c for c in name_hint if c.isprintable())[:60].strip()
+                if clean:
+                    info["display_name"] = clean
+            (out / "info.json").write_text(_json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+            mid = self.db.add_model("tiny", name, str(out), info)
+        except BaseException:
+            shutil.rmtree(out, ignore_errors=True)
+            raise
+        info["model_id"] = mid
+        self.db.notify("success", "휴대폰에서 학습한 모델을 등록했습니다",
+                       f"{name} · {info.get('steps')}단계 · 평가 loss {_fmt(info.get('eval_loss_before'))} → "
+                       f"{_fmt(ev_after)}", {"kind": "model_upload", "model_id": mid})
+        self.db.audit(actor, "model_upload", {"model_id": mid, "name": name, "bytes": len(data),
+                                              "steps": info.get("steps")})
+        return {"model_id": mid, "name": name, "info": info}
 
     def _resume_model(self, model_id, kinds: tuple[str, ...], label: str) -> dict | None:
         if model_id in (None, "", 0, "0"):

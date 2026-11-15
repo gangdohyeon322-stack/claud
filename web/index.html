@@ -228,7 +228,121 @@
     <div class="card">
       <h3>학습 기기</h3>
       <div id="device-card" class="device-grid"><p class="muted small">확인 중…</p></div>
-      <p class="muted small admin-hint">학습은 관리자만 시작할 수 있습니다. 진행 상황은 누구나 볼 수 있습니다.</p>
+      <p class="muted small admin-hint">PC 학습은 관리자만 시작할 수 있습니다. 진행 상황은 누구나 볼 수 있습니다. 아래 '이 기기에서 학습'은 누구나 쓸 수 있습니다.</p>
+    </div>
+
+    <div class="card" id="od-card">
+      <div class="row wrap gap between">
+        <h3>이 기기에서 학습 (온디바이스)</h3>
+        <span id="od-phase" class="status"></span>
+      </div>
+      <p class="muted small">PC 없이 이 기기(브라우저) 안에서 아주 작은 글자 단위 모델을 직접 학습합니다. 느리지만 인터넷 없이도 되고, 결과는 이 기기에서 바로 쓰거나 PC로 올릴 수 있습니다. 학습하는 동안에는 화면을 켜 둔 채로 두세요.</p>
+      <p id="od-device" class="small"></p>
+
+      <div id="od-resume" class="banner warn" hidden>
+        <div id="od-resume-text"></div>
+        <div class="row wrap gap">
+          <button type="button" id="od-resume-go" class="small">이어서 학습</button>
+          <button type="button" id="od-resume-fin" class="secondary small">지금까지로 마무리</button>
+          <button type="button" id="od-resume-del" class="ghost small">버리기</button>
+        </div>
+      </div>
+
+      <div id="od-nosnap" class="banner warn" hidden>
+        <div>학습 자료가 아직 이 기기에 없습니다. 먼저 [검색] 탭에서 <b>이 기기에 저장</b>으로 자료 사본을 받으세요. 그 사본의 글자로 학습합니다.</div>
+        <div class="row"><button type="button" id="od-goto-snap" class="small">저장하러 가기</button></div>
+      </div>
+
+      <form id="od-form" autocomplete="off">
+        <fieldset class="plain">
+          <legend>방식</legend>
+          <div class="checks">
+            <label class="inline"><input type="radio" name="od-mode" value="resume" checked> 이어서 학습 (PC 모델)</label>
+            <label class="inline"><input type="radio" name="od-mode" value="scratch"> 처음부터 학습</label>
+          </div>
+        </fieldset>
+        <div id="od-resume-box">
+          <label for="od-model">이어서 학습할 모델 (PC의 소형 AI 모델)
+            <select id="od-model"></select>
+          </label>
+          <p id="od-model-hint" class="muted small"></p>
+        </div>
+        <div id="od-scratch-box" hidden>
+          <label for="od-preset">크기
+            <select id="od-preset"></select>
+          </label>
+          <div id="od-custom" class="grid-fields" hidden></div>
+          <p class="muted small">처음부터 학습하면 이 기기에 저장된 자료의 글자로 새 글자 목록을 만듭니다. 자료가 적으면 결과가 거칠 수 있습니다.</p>
+        </div>
+        <div class="grid2">
+          <label for="od-steps">학습 단계 <input id="od-steps" type="number" min="1" step="1" value="100" inputmode="numeric"></label>
+          <label for="od-batch">배치 크기 <input id="od-batch" type="number" min="1" max="64" step="1" value="8" inputmode="numeric"></label>
+          <label for="od-seq">문맥 길이 <input id="od-seq" type="number" min="2" step="1" value="64" inputmode="numeric"></label>
+          <label for="od-lr">학습률 <input id="od-lr" type="number" min="0.00001" max="1" step="any" value="0.003" inputmode="decimal"></label>
+        </div>
+        <details id="od-opts">
+          <summary>옵션 (화면 꺼짐 방지 · 발열 · 배터리)</summary>
+          <div class="checks">
+            <label class="inline"><input type="checkbox" id="od-wake" checked> 화면 꺼짐 방지</label>
+            <label class="inline"><input type="checkbox" id="od-hidden" checked> 백그라운드 자동 일시정지</label>
+            <label class="inline"><input type="checkbox" id="od-thermal" checked> 발열 시 휴식</label>
+            <label class="inline"><input type="checkbox" id="od-charge"> 충전 중에만</label>
+          </div>
+          <div class="grid2">
+            <label for="od-minbat">배터리 % 이하 중지 (0=끔) <input id="od-minbat" type="number" min="0" max="99" step="1" value="0" inputmode="numeric"></label>
+            <label for="od-maxmin">최대 시간(분, 0=제한 없음) <input id="od-maxmin" type="number" min="0" step="1" value="0" inputmode="numeric"></label>
+          </div>
+          <p id="od-battery-note" class="muted small" hidden>이 브라우저는 배터리 정보를 알려 주지 않아 충전·배터리 조건은 적용되지 않습니다.</p>
+        </details>
+        <div id="od-estimate" class="estimate" aria-live="polite"></div>
+        <div class="row wrap gap">
+          <button type="button" id="od-bench" class="secondary">이 기기에서 측정</button>
+          <button type="submit" id="od-start">학습 시작</button>
+        </div>
+      </form>
+      <div id="od-bench-out" class="estimate" aria-live="polite"></div>
+
+      <div id="od-progress" hidden>
+        <h4>진행 상황</h4>
+        <div class="bar" aria-hidden="true"><div id="od-bar"></div></div>
+        <div class="stats">
+          <div class="stat"><b id="od-st-step">-</b><span>단계</span></div>
+          <div class="stat"><b id="od-st-loss">-</b><span>학습 손실</span></div>
+          <div class="stat"><b id="od-st-ms">-</b><span>단계당 시간</span></div>
+          <div class="stat"><b id="od-st-eta">-</b><span>남은 시간</span></div>
+        </div>
+        <p id="od-msg" class="small" aria-live="polite"></p>
+        <div class="row wrap gap">
+          <button type="button" id="od-pause" class="secondary">일시정지</button>
+          <button type="button" id="od-resume-btn" class="secondary">재개</button>
+          <button type="button" id="od-stop" class="stop">중지</button>
+        </div>
+      </div>
+
+      <div id="od-result" class="result-card" hidden>
+        <h4>학습 결과</h4>
+        <dl class="kv" id="od-result-kv"></dl>
+        <div id="od-result-warn" class="banner warn" hidden></div>
+        <p class="small muted">샘플 생성</p>
+        <pre id="od-sample" class="out"></pre>
+        <fieldset class="plain">
+          <legend>이 결과를</legend>
+          <div class="checks">
+            <label class="inline"><input type="radio" name="od-choice" value="use"> 사용</label>
+            <label class="inline"><input type="radio" name="od-choice" value="keep"> 이전 모델 유지</label>
+          </div>
+        </fieldset>
+        <div class="row wrap gap">
+          <button type="button" id="od-adopt">이 기기 모델로 사용</button>
+          <button type="button" id="od-save" class="secondary">.lbw 파일로 저장</button>
+          <button type="button" id="od-upload" class="secondary admin-only">PC로 올리기</button>
+          <button type="button" id="od-clear" class="ghost small">결과 지우기</button>
+        </div>
+        <label for="od-upname" class="admin-only">PC에 등록할 이름 (선택)
+          <input id="od-upname" maxlength="60" placeholder="예: 폰에서 학습한 모델">
+        </label>
+        <p class="muted small admin-hint">PC로 올리기는 관리자만 할 수 있습니다. 파일로 저장해 관리자에게 전달하세요.</p>
+      </div>
     </div>
 
     <div class="card" id="auto-card">

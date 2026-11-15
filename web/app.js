@@ -1123,6 +1123,7 @@ $("#watch-form").addEventListener("submit", async (e) => {
 async function loadTrain(quiet) {
   loadAutolearn();
   if (quiet) return;
+  odRefresh();
   loadDevice();
   loadModelsList().then(fillResumeSelects);
   refreshStatus().then(renderIndexInfo);
@@ -1642,6 +1643,440 @@ $("#auto-stop").addEventListener("click", async () => {
   catch (err) { toast(err.message, 7000); btn.disabled = false; }
 });
 
+// ---------------- 이 기기에서 학습 (온디바이스) ----------------
+const OD_MAX_PARAMS = 2000000;
+const OD_PHASE = {
+  idle: "대기", preparing: "자료 준비 중", evaluating: "학습 전 평가 중", training: "학습 중", paused: "일시정지",
+  cooling: "발열 휴식", checkpoint: "체크포인트 저장 중", finishing: "결과 정리 중", done: "완료", error: "오류",
+};
+const OD_GRADE_CLASS = { good: "yes", slow: "na", bad: "no" };
+const OD = { built: false, est: 0, lastRender: 0, resumable: null, result: null, starting: false, params: null, estOk: true, arch: null };
+const odParamCount = (a) => a.vocab_size * a.d_model + a.seq_len * a.d_model + a.n_layer * (12 * a.d_model * a.d_model + 13 * a.d_model) + 2 * a.d_model;
+function odMaxParams() {
+  const m = S.settings && S.settings.mobile_training && Number(S.settings.mobile_training.max_params);
+  return m > 0 ? m : OD_MAX_PARAMS;
+}
+function odMode() { const r = $('input[name="od-mode"]:checked'); return r ? r.value : "resume"; }
+function odBuild() {
+  if (OD.built) return;
+  OD.built = true;
+  const presets = presetsOf();
+  const names = ["nano", "mini"].filter((n) => presets[n]);
+  $("#od-preset").innerHTML = names.map((n) => `<option value="${esc(n)}">${esc(presetLabel(n))}</option>`).join("")
+    + '<option value="custom">직접 설정</option>';
+  $("#od-custom").innerHTML = ARCH_KEYS.map((k) => `<label for="od-a-${k}">${esc(ARCH_LABEL[k])}<input id="od-a-${k}" type="number" step="1" inputmode="numeric"></label>`).join("");
+  const nano = presets.nano || FALLBACK_PRESETS.nano;
+  ARCH_KEYS.forEach((k) => ($(`#od-a-${k}`).value = nano[k]));
+  // 지난 옵션 복원
+  try {
+    const o = JSON.parse(store("lb_od_opts") || "{}");
+    if (o && typeof o === "object") {
+      for (const [id, key] of [["od-steps", "steps"], ["od-batch", "batch"], ["od-seq", "seq"], ["od-lr", "lr"], ["od-minbat", "minBat"], ["od-maxmin", "maxMin"]]) if (o[key] != null) $("#" + id).value = o[key];
+      for (const [id, key] of [["od-wake", "wake"], ["od-hidden", "hidden"], ["od-thermal", "thermal"], ["od-charge", "charge"]]) if (typeof o[key] === "boolean") $("#" + id).checked = o[key];
+    }
+  } catch (e) { /* 저장값이 깨졌으면 기본값 */ }
+  const batteryApi = typeof navigator !== "undefined" && typeof navigator.getBattery === "function";
+  $("#od-battery-note").hidden = batteryApi;
+  $$('input[name="od-mode"]').forEach((r) => r.addEventListener("change", () => { OD.modeTouched = true; odModeUI(); odEstimate(); }));
+  $("#od-model").addEventListener("change", () => { odClampSeq(); odEstimate(); });
+  $("#od-preset").addEventListener("change", () => { odCustomUI(); odClampSeq(); odEstimate(); });
+  $$("#od-custom input, #od-steps, #od-batch, #od-seq, #od-lr").forEach((el) => el.addEventListener("input", () => { odClampSeq(true); odEstimate(); }));
+  $$("#od-opts input").forEach((el) => el.addEventListener("change", odSaveOpts));
+  $("#od-steps").addEventListener("change", odSaveOpts);
+  [$("#od-batch"), $("#od-seq"), $("#od-lr"), $("#od-minbat"), $("#od-maxmin")].forEach((el) => el.addEventListener("change", odSaveOpts));
+  $("#od-goto-snap").addEventListener("click", () => { switchTab("search"); setTimeout(() => { const c = $("#snap-card"); if (c && c.scrollIntoView) c.scrollIntoView({ block: "center" }); }, 60); });
+  $("#od-form").addEventListener("submit", (e) => { e.preventDefault(); odStart(); });
+  $("#od-bench").addEventListener("click", odBench);
+  $("#od-pause").addEventListener("click", () => { const ob = OB(); if (ob) ob.training.pause(); });
+  $("#od-resume-btn").addEventListener("click", () => { const ob = OB(); if (ob) { const p = ob.training.resume(); if (p && p.catch) p.catch((e) => toast(e.message, 6000)); } });
+  $("#od-stop").addEventListener("click", () => {
+    const ob = OB();
+    if (ob && confirm("학습을 중지할까요? 지금까지의 체크포인트는 남겨 두어 나중에 이어서 할 수 있습니다.")) ob.training.stop();
+  });
+  $("#od-resume-go").addEventListener("click", odContinue);
+  $("#od-resume-fin").addEventListener("click", odFinalizeSaved);
+  $("#od-resume-del").addEventListener("click", odDiscard);
+  $("#od-adopt").addEventListener("click", odAdopt);
+  $("#od-save").addEventListener("click", odSaveFile);
+  $("#od-upload").addEventListener("click", odUpload);
+  $("#od-clear").addEventListener("click", odClearResult);
+  $$('input[name="od-choice"]').forEach((r) => r.addEventListener("change", odChoiceUI));
+  odModeUI();
+  odCustomUI();
+}
+function odSaveOpts() {
+  store("lb_od_opts", JSON.stringify({
+    steps: $("#od-steps").value, batch: $("#od-batch").value, seq: $("#od-seq").value, lr: $("#od-lr").value,
+    minBat: $("#od-minbat").value, maxMin: $("#od-maxmin").value,
+    wake: $("#od-wake").checked, hidden: $("#od-hidden").checked, thermal: $("#od-thermal").checked, charge: $("#od-charge").checked,
+  }));
+}
+function odModeUI() {
+  const resume = odMode() === "resume";
+  $("#od-resume-box").hidden = !resume;
+  $("#od-scratch-box").hidden = resume;
+}
+function odCustomUI() { $("#od-custom").hidden = $("#od-preset").value !== "custom"; }
+// 지금 고른 모델/크기의 구조 (이어서: 모델 정보, 처음부터: 프리셋/직접 설정)
+function odArch() {
+  if (odMode() === "resume") {
+    const m = S.models.find((x) => String(x.id) === $("#od-model").value);
+    return m ? archOf(m) : null;
+  }
+  const v = $("#od-preset").value;
+  if (v === "custom") {
+    const a = {};
+    for (const k of ARCH_KEYS) a[k] = Number($(`#od-a-${k}`).value);
+    return ARCH_KEYS.every((k) => Number.isInteger(a[k]) && a[k] > 0) ? a : null;
+  }
+  const p = presetsOf()[v];
+  return p ? Object.fromEntries(ARCH_KEYS.map((k) => [k, p[k]])) : null;
+}
+function odClampSeq(soft) {
+  const a = odArch();
+  const el = $("#od-seq");
+  if (!a || soft) return;
+  if (Number(el.value) > a.seq_len) el.value = a.seq_len;
+}
+function odSetBusy(busy) {
+  $$("#od-form input, #od-form select, #od-form button").forEach((el) => (el.disabled = busy));
+  if (!busy) odEstimateApply();
+}
+function odEstimateApply() {
+  const bad = OD.params != null && OD.params > odMaxParams();
+  $("#od-start").disabled = bad || OD.starting || !!(OB() && OB().training.status().active);
+  $("#od-bench").disabled = !OD.arch || !!(OB() && OB().training.status().active);
+}
+const odEstimateDebounced = debounce(() => odDoEstimate(), 350);
+function odEstimate() { odEstimateDebounced(); }
+async function odDoEstimate() {
+  const box = $("#od-estimate");
+  const a = odArch();
+  OD.arch = a; OD.params = null;
+  if (!a) { box.innerHTML = odMode() === "resume" ? '<p class="muted small">이어서 학습할 모델을 고르세요.</p>' : '<p class="error">모델 크기 값을 확인하세요.</p>'; odEstimateApply(); return; }
+  if (a.d_model % a.n_head) { box.innerHTML = '<p class="error">차원(d_model)은 헤드 수(n_head)로 나누어떨어져야 합니다.</p>'; OD.params = Infinity; odEstimateApply(); return; }
+  if (a.seq_len < Number($("#od-seq").value)) { box.innerHTML = `<p class="error">문맥 길이는 모델의 문맥(${esc(a.seq_len)}) 이하여야 합니다.</p>`; OD.params = Infinity; odEstimateApply(); return; }
+  const local = odParamCount(a);
+  const seq = ++OD.est;
+  let r = null;
+  if (!S.offline) {
+    const body = { kind: "tiny", preset: "custom", batch_size: intVal("#od-batch") || 8 };
+    for (const k of ARCH_KEYS) body[k] = a[k];
+    try { r = await post("/api/estimate", body); } catch (e) { r = null; }
+    if (seq !== OD.est) return;
+  }
+  const e = r && (r.estimate || r);
+  const params = e && Number.isFinite(Number(e.params)) ? Number(e.params) : local;
+  OD.params = params;
+  let h = `<div>파라미터 <b>${fmtNum(params)}</b>개 (${fmtCount(params)})`
+    + (e ? ` · 파일 ${fmtMB(e.fp32_mb)} · 학습 메모리 약 ${fmtMB(e.train_ram_mb)}` : ` · 학습 메모리 약 ${fmtMB(params * 16 / 1048576)}`) + "</div>";
+  if (odMode() === "scratch" && a.vocab_size > 0) h += '<div class="small muted">글자 수는 자료에 있는 글자에 맞춰 줄어들 수 있습니다.</div>';
+  if (params > odMaxParams()) h += `<p class="error">이 크기(${esc(fmtNum(params))}개)는 기기 학습 상한(${esc(fmtNum(odMaxParams()))}개)을 넘어 시작할 수 없습니다. 더 작은 크기를 고르세요.</p>`;
+  else if (params > odMaxParams() * 0.6) h += '<p class="warn-text small">큰 편입니다. 먼저 [이 기기에서 측정]으로 속도를 확인하세요.</p>';
+  box.innerHTML = h;
+  odEstimateApply();
+}
+
+async function odRefresh() {
+  odBuild();
+  const ob = OB();
+  if (!ob || !ob.training) {
+    $("#od-device").textContent = "온보드 엔진(onboard.js)을 불러오지 못해 이 기능을 쓸 수 없습니다.";
+    $$("#od-form button, #od-form input, #od-form select").forEach((el) => (el.disabled = true));
+    return;
+  }
+  try {
+    const dev = S.myDevice || await ob.detectDevice();
+    S.myDevice = dev;
+    $("#od-device").textContent = `이 기기: ${dev.label}`;
+  } catch (e) { /* 무시 */ }
+  try { S.snapInfo = await ob.snapshotInfo(); } catch (e) { S.snapInfo = null; }
+  $("#od-nosnap").hidden = !!S.snapInfo;
+  await loadModelsList();
+  odFillModels();
+  try { OD.resumable = await ob.training.hasResumable(); } catch (e) { OD.resumable = null; }
+  odRenderResumable();
+  try { OD.result = await ob.training.loadResult(); } catch (e) { OD.result = null; }
+  odRenderResult();
+  odRender(ob.training.status(), true);
+  odDoEstimate();
+}
+function odFillModels() {
+  const sel = $("#od-model");
+  const cur = sel.value;
+  const list = S.models.filter((m) => modelKind(m) === "tiny" && archOf(m));
+  sel.innerHTML = list.length
+    ? list.map((m) => {
+      const a = archOf(m);
+      const p = odParamCount(a);
+      const big = p > odMaxParams();
+      const steps = (m.info && m.info.total_steps) || (m.info && m.info.steps);
+      return `<option value="${num(m.id)}"${big ? " disabled" : ""}>${esc(m.name)} · ${esc(fmtCount(p))}${steps ? ` · ${esc(fmtNum(steps))}단계` : ""}${big ? " (기기 학습엔 너무 큼)" : ""}</option>`;
+    }).join("")
+    : '<option value="">PC에서 학습한 소형 AI 모델이 없습니다</option>';
+  if (cur && list.some((m) => String(m.id) === cur)) sel.value = cur;
+  else {
+    const first = list.find((m) => odParamCount(archOf(m)) <= odMaxParams());
+    if (first) sel.value = String(first.id);
+  }
+  $("#od-model-hint").textContent = list.length
+    ? "고른 모델의 가중치(.lbw)를 PC에서 받아 이 기기에서 이어서 학습합니다."
+    : "이어서 학습하려면 PC에서 소형 AI 모델을 먼저 학습하거나, 오른쪽 '처음부터 학습'을 고르세요.";
+  if (!list.length && odMode() === "resume" && S.models.length === 0) {
+    const r = $('input[name="od-mode"][value="scratch"]');
+    if (r && !OD.modeTouched) { r.checked = true; odModeUI(); }
+  }
+}
+function odRenderResumable() {
+  const r = OD.resumable;
+  const st = OB() ? OB().training.status() : { active: false };
+  $("#od-resume").hidden = !r || st.active;
+  if (r) $("#od-resume-text").innerHTML = `<b>이어서 할 수 있는 학습이 있습니다</b> (${esc(fmtNum(r.step))}/${esc(fmtNum(r.totalSteps))}단계${r.savedAt ? " · " + esc(fmtTime(r.savedAt)) : ""}).`;
+}
+
+function odConfig() {
+  const cfg = {
+    steps: intVal("#od-steps") || 100, batch: intVal("#od-batch") || 8, seqLen: intVal("#od-seq") || 64,
+    lr: intVal("#od-lr") || 0.003, wakeLock: $("#od-wake").checked, autoPauseHidden: $("#od-hidden").checked,
+    thermalPause: $("#od-thermal").checked, chargingOnly: $("#od-charge").checked,
+    minBattery: intVal("#od-minbat") || 0, maxMinutes: intVal("#od-maxmin") || 0, maxParams: odMaxParams(),
+    onProgress: (st) => odRender(st), onState: (st) => odRender(st, true),
+  };
+  return cfg;
+}
+async function odStart() {
+  const ob = OB();
+  if (!ob || OD.starting) return;
+  if (!S.snapInfo) { $("#od-nosnap").hidden = false; toast("먼저 [검색] 탭에서 '이 기기에 저장'으로 자료를 받으세요.", 5000); return; }
+  const a = odArch();
+  if (!a) return toast("모델을 고르거나 크기를 확인하세요.");
+  const cfg = odConfig();
+  if (cfg.seqLen > a.seq_len) return toast(`문맥 길이는 ${a.seq_len} 이하여야 합니다.`);
+  odSaveOpts();
+  OD.starting = true;
+  const btn = $("#od-start");
+  const label = btn.textContent;
+  odSetBusy(true);
+  $("#od-progress").hidden = false;
+  $("#od-result").hidden = true;
+  $("#od-msg").textContent = "준비 중…";
+  try {
+    if (odMode() === "resume") {
+      const id = Number($("#od-model").value);
+      const m = S.models.find((x) => x.id === id);
+      if (!m) throw new Error("이어서 학습할 모델을 고르세요.");
+      btn.textContent = "모델 받는 중…";
+      const buf = await fetchBuffer(`/api/models/${id}/files/model.lbw`, (p) => (btn.textContent = `모델 받는 중… ${Math.round(p * 100)}%`));
+      const lbw = ob.lbw.parse(buf);
+      await ob.training.start({ ...cfg, mode: "resume", source: { modelId: id, name: m.name, lbw } });
+    } else {
+      await ob.training.start({ ...cfg, mode: "scratch", arch: a, source: null });
+    }
+    ob.training.setCallbacks({ onProgress: cfg.onProgress, onState: cfg.onState });
+  } catch (e) {
+    toast(e.message, 7000);
+    $("#od-msg").innerHTML = `<span class="error">${esc(e.message)}</span>`;
+  } finally {
+    OD.starting = false;
+    btn.textContent = label;
+    odRender(ob.training.status(), true);
+  }
+}
+async function odContinue() {
+  const ob = OB();
+  if (!ob) return;
+  $("#od-progress").hidden = false;
+  $("#od-result").hidden = true;
+  odSetBusy(true);
+  try {
+    ob.training.setCallbacks({ onProgress: (st) => odRender(st), onState: (st) => odRender(st, true) });
+    await ob.training.continueSaved();
+  } catch (e) { toast(e.message, 7000); }
+  odRender(ob.training.status(), true);
+}
+async function odFinalizeSaved() {
+  const ob = OB();
+  if (!ob) return;
+  if (!confirm("지금까지 학습한 것으로 결과를 만들까요? 더 학습하려면 '이어서 학습'을 누르세요.")) return;
+  $("#od-progress").hidden = false;
+  odSetBusy(true);
+  try {
+    ob.training.setCallbacks({ onProgress: (st) => odRender(st), onState: (st) => odRender(st, true) });
+    await ob.training.finalizeNow();
+  } catch (e) { toast(e.message, 7000); }
+  odRender(ob.training.status(), true);
+}
+async function odDiscard() {
+  const ob = OB();
+  if (!ob || !confirm("저장된 학습 진행을 버릴까요? 되돌릴 수 없습니다.")) return;
+  try { await ob.training.discard(); OD.resumable = null; odRenderResumable(); toast("저장된 학습을 버렸습니다."); } catch (e) { toast(e.message); }
+}
+
+function odRender(st, force) {
+  if (!st) return;
+  const now = Date.now();
+  if (!force && now - OD.lastRender < 120) return; // 단계마다 화면을 다시 그리지 않는다
+  OD.lastRender = now;
+  const ob = OB();
+  const prevActive = OD.active;
+  OD.active = st.active;
+  const label = OD_PHASE[st.phase] || st.phase;
+  const ph = $("#od-phase");
+  ph.textContent = st.phase === "idle" && !st.active ? "" : label;
+  ph.className = "status " + cls(st.phase === "training" || st.phase === "checkpoint" || st.phase === "cooling" ? "training" : st.phase === "error" ? "failed" : st.phase);
+  const showProg = st.active || st.phase === "error" || (st.phase === "idle" && st.message) || st.phase === "done";
+  $("#od-progress").hidden = !showProg;
+  const total = st.totalSteps || 0;
+  setBar($("#od-bar"), total ? st.step / total : 0);
+  $("#od-st-step").textContent = total ? `${fmtNum(st.step)} / ${fmtNum(total)}` : "-";
+  $("#od-st-loss").textContent = st.loss == null ? "-" : fmtLoss(st.loss);
+  $("#od-st-ms").textContent = st.msPerStep ? `${Math.round(st.msPerStep).toLocaleString("ko-KR")}ms` : "-";
+  $("#od-st-eta").textContent = st.active && st.etaSec != null && st.phase !== "preparing" ? fmtDur(st.etaSec) : "-";
+  let msg = st.message || "";
+  if (st.phase === "cooling" && st.coolUntil) msg = `기기가 뜨거워진 것 같아 쉬는 중입니다 (${Math.max(0, Math.ceil((st.coolUntil - now) / 1000))}초 남음).`;
+  if (st.phase === "error") msg = "오류: " + msg;
+  if (st.wakeLock === false && st.active) msg += (msg ? " " : "") + "화면 꺼짐 방지를 쓸 수 없습니다. 화면을 켜 둔 채 두세요.";
+  $("#od-msg").textContent = msg;
+  const running = ["training", "checkpoint", "cooling"].includes(st.phase);
+  $("#od-pause").hidden = !running;
+  $("#od-resume-btn").hidden = st.phase !== "paused";
+  $("#od-stop").hidden = !st.active || ["preparing", "evaluating", "finishing"].includes(st.phase);
+  if (prevActive !== st.active || force) {
+    odSetBusy(st.active || OD.starting);
+    if (!st.active && ob) ob.training.hasResumable().then((r) => { OD.resumable = r; odRenderResumable(); }).catch(() => {});
+  }
+  if (prevActive && !st.active) {
+    if (st.phase === "done") { toast("학습이 끝났습니다. 결과를 확인하세요.", 5000); odLoadResult(); }
+    else if (st.phase === "error") toast(st.message || "학습 중 오류가 발생했습니다.", 7000);
+    else if (st.message) toast(st.message, 6000);
+  }
+}
+async function odLoadResult() {
+  const ob = OB();
+  if (!ob) return;
+  try { OD.result = await ob.training.loadResult(); } catch (e) { OD.result = null; }
+  odRenderResult();
+}
+function odRenderResult() {
+  const r = OD.result;
+  $("#od-result").hidden = !r;
+  if (!r) return;
+  const h = r.header || {};
+  const worse = r.evalBefore != null && r.evalAfter != null && !(r.evalAfter < r.evalBefore);
+  const rows = [
+    ["평가 손실 (전 → 후)", `${fmtLoss(r.evalBefore)} → ${fmtLoss(r.evalAfter)}`],
+    ["학습 손실", fmtLoss(r.trainLoss)],
+    ["학습 단계", `${fmtNum(h.steps)}${h.total_steps && h.total_steps !== h.steps ? ` (누적 ${fmtNum(h.total_steps)})` : ""}`],
+    ["걸린 시간", fmtDur(r.seconds)],
+    ["이어 학습한 모델", h.parent || null],
+    ["글자 수", h.arch ? fmtNum(h.arch.vocab_size) : null],
+  ];
+  $("#od-result-kv").innerHTML = rows.filter((x) => x[1] != null && x[1] !== "").map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
+  const w = $("#od-result-warn");
+  w.hidden = !worse;
+  w.textContent = worse ? "평가 손실이 줄지 않았습니다. 학습이 더 필요하거나 자료가 부족할 수 있어, 이전 모델을 유지하는 것을 권장합니다." : "";
+  $("#od-sample").textContent = r.sample ? r.sample : "(샘플을 만들지 못했습니다)";
+  const target = worse ? "keep" : "use";
+  const radio = $(`input[name="od-choice"][value="${target}"]`);
+  if (radio) radio.checked = true;
+  odChoiceUI();
+}
+function odChoiceUI() {
+  const c = $('input[name="od-choice"]:checked');
+  const use = !c || c.value === "use";
+  $("#od-adopt").disabled = !use;
+  $("#od-upload").disabled = !use || S.role !== "admin";
+}
+async function odAdopt() {
+  const ob = OB();
+  if (!ob) return;
+  const btn = $("#od-adopt");
+  btn.disabled = true;
+  try {
+    const meta = await ob.training.adoptAsLocalModel();
+    toast(`이 기기 모델로 등록했습니다: ${meta.name}. [모델] 탭에서 바로 생성해 볼 수 있습니다.`, 6000);
+    refreshLocalModelInfo();
+    applyEngineUI();
+  } catch (e) { toast(e.message, 7000); }
+  finally { odChoiceUI(); }
+}
+function odFileName() {
+  const r = OD.result;
+  const h = (r && r.header) || {};
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "").replace("T", "-");
+  const base = h.parent ? String(h.parent).replace(/[^\w.-]+/g, "_") : "scratch";
+  return `learnbox-${base}-${stamp}.lbw`;
+}
+async function odSaveFile() {
+  const ob = OB();
+  if (!ob) return;
+  try {
+    const buf = await ob.training.exportLbw();
+    const url = URL.createObjectURL(new Blob([buf], { type: "application/octet-stream" }));
+    const a = document.createElement("a");
+    a.href = url; a.download = odFileName(); a.rel = "noopener"; a.hidden = true;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    toast(`.lbw 파일로 저장했습니다 (${fmtBytes(buf.byteLength)}).`);
+  } catch (e) { toast(e.message, 6000); }
+}
+async function odUpload() {
+  const ob = OB();
+  if (!ob || S.role !== "admin") return;
+  const btn = $("#od-upload");
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "올리는 중…";
+  try {
+    const buf = await ob.training.exportLbw();
+    const name = $("#od-upname").value.trim();
+    const headers = { "Content-Type": "application/octet-stream" };
+    if (name) headers["X-Model-Name"] = encodeURIComponent(name);
+    const r = await api("/api/models/upload", { method: "POST", headers, body: buf });
+    toast(`PC에 모델을 등록했습니다: ${r.name || ""}. [모델] 탭에서 '기기 학습' 표시를 확인하세요.`, 7000);
+    await loadModelsList();
+    odFillModels();
+    if (S.tab === "models") loadModels();
+  } catch (e) { toast(e.message, 8000); }
+  finally { btn.textContent = label; odChoiceUI(); }
+}
+async function odClearResult() {
+  const ob = OB();
+  if (!ob || !confirm("학습 결과를 지울까요? 이 기기 모델로 이미 등록한 것은 그대로 남습니다.")) return;
+  try { await ob.training.clearResult(); OD.result = null; odRenderResult(); } catch (e) { toast(e.message); }
+}
+
+async function odBench() {
+  const ob = OB();
+  const a = odArch();
+  if (!ob || !a) return toast("모델 크기를 먼저 고르세요.");
+  if (a.d_model % a.n_head || odParamCount(a) > odMaxParams()) return toast("이 크기는 측정할 수 없습니다. 크기를 확인하세요.");
+  const out = $("#od-bench-out");
+  const btn = $("#od-bench");
+  btn.disabled = true;
+  out.innerHTML = '<span class="muted small"><span class="spinner" aria-hidden="true"></span>이 기기에서 10단계를 돌려 속도를 재는 중…</span>';
+  try {
+    const batch = intVal("#od-batch") || 8, seqLen = Math.min(intVal("#od-seq") || 64, a.seq_len);
+    const r = await ob.training.benchmark({
+      arch: a, batch, seqLen, steps: 10,
+      onProgress: (p, msg) => { out.innerHTML = `<span class="muted small"><span class="spinner" aria-hidden="true"></span>${esc(msg || "측정 중")} (${Math.round(p * 100)}%)</span>`; },
+    });
+    const steps = intVal("#od-steps") || 100;
+    out.innerHTML = `<div class="row wrap gap"><span class="fit ${OD_GRADE_CLASS[r.grade] || "na"}"><span aria-hidden="true">${r.grade === "good" ? "✓" : r.grade === "bad" ? "×" : "△"}</span> ${esc(r.label)}</span>
+      <span>단계당 <b>${esc(Math.round(r.msPerStep).toLocaleString("ko-KR"))}ms</b></span></div>
+      <div class="small">100단계 약 ${esc(fmtDur(r.est100Sec))} · 300단계 약 ${esc(fmtDur(r.est300Sec))} · 지금 설정(${esc(fmtNum(steps))}단계) 약 ${esc(fmtDur(r.msPerStep * steps / 1000))}</div>
+      ${r.grade === "bad" ? '<p class="warn-text small">이 기기에는 이 크기가 너무 무겁습니다. 더 작은 크기나 배치/문맥 길이를 줄여 보세요.</p>' : ""}`;
+    if (!S.offline) { // 서버 통계용 보고. 실패해도 무시한다.
+      const dev = S.myDevice || {};
+      post("/api/mobile-training/report", {
+        device: { label: dev.label, tier: dev.tier, mobile: dev.mobile, memory_gb: dev.memoryGB, cores: dev.cores, webgpu: dev.webgpu, ua: String(navigator.userAgent || "").slice(0, 200) },
+        arch: a, batch_size: batch, seq_len: seqLen, ms_per_step: r.msPerStep, steps: r.steps,
+      }).catch(() => {});
+    }
+  } catch (e) {
+    out.innerHTML = `<p class="error">${esc(e.message)}</p>`;
+  } finally { btn.disabled = false; odEstimateApply(); }
+}
+
 // ---------------- 모델 ----------------
 function modelFiles(m) { const f = (m.info && m.info.files) || {}; return typeof f === "object" && !Array.isArray(f) ? f : {}; }
 function hasInt8(m) { const i = m.info || {}; return !!(i.onnx_int8 || modelFiles(m)["model.int8.onnx"]); }
@@ -1666,7 +2101,7 @@ function infoList(m) {
     ["이어 학습한 모델", parent],
     ["평가 손실 (전 → 후)", i.eval_loss_before != null || i.eval_loss_after != null ? `${fmtLoss(i.eval_loss_before)} → ${fmtLoss(i.eval_loss_after)}` : null],
     ["퍼플렉시티", i.perplexity_after != null ? fmtLoss(i.perplexity_after) : null],
-    ["장치", i.device ? `${i.device}${i.threads ? ` · ${i.threads}스레드` : ""}` : null],
+    ["장치", i.device ? `${typeof i.device === "object" ? i.device.label || "기기" : i.device}${i.threads ? ` · ${i.threads}스레드` : ""}` : null],
     ["학습 시간", i.seconds != null ? fmtDur(i.seconds) : null],
     ["ONNX", kind === "tiny" ? `${hasOnnx(m) ? "있음" : "없음"}${hasInt8(m) ? " · int8 있음" : ""}${i.onnx_verified ? " · 검증됨" : ""}` : null],
     ["예시 생성", i.sample || null],
@@ -1678,7 +2113,7 @@ function modelCardHtml(m) {
   const files = modelFiles(m);
   const fl = Object.keys(files);
   let h = `<div class="card model">
-    <div class="row wrap gap"><h3 class="grow">${esc(m.name)}</h3><span class="badge kind-${kind}">${kind === "tiny" ? "소형 AI" : "LoRA"}</span></div>
+    <div class="row wrap gap"><h3 class="grow">${esc(m.name)}</h3><span class="badge kind-${kind}">${kind === "tiny" ? "소형 AI" : "LoRA"}</span>${i.trained_on === "device" ? '<span class="badge origin-auto">📱 기기에서 학습</span>' : ""}</div>
     <p class="muted small">#${id} · ${esc(fmtTime(m.created_at))}</p>
     ${infoList(m)}
     ${i.onnx_error ? `<p class="error small">ONNX 변환 오류: ${esc(i.onnx_error)}</p>` : ""}
@@ -1756,7 +2191,9 @@ async function refreshLocalModelInfo() {
   try {
     const m = await ob.modelInfo();
     S.localModel = m;
-    $("#local-model-info").textContent = m
+    $("#local-model-info").textContent = m && m.source === "device"
+      ? `이 기기에서 학습한 모델: ${m.name || "기기 학습 모델"} (${fmtBytes(m.bytes)}${m.saved_at ? " · " + fmtTime(m.saved_at) : ""}). 실행 엔진을 받지 않고 이 기기에서 바로 생성합니다.`
+      : m
       ? `저장된 모델: ${m.name || "#" + m.id} (${m.variant || "fp32"} · ${fmtBytes(m.bytes)}${m.saved_at ? " · " + fmtTime(m.saved_at) : ""}). 인터넷 없이 이 기기에서 실행됩니다. 처음 한 번은 실행 엔진을 받아야 합니다.`
       : "받은 모델이 없습니다. 아래 목록에서 소형 AI 모델의 [이 기기로 받기]를 누르세요.";
     $("#local-del").hidden = !m || typeof ob.deleteModel !== "function";

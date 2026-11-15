@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import ingest, results, search, tinylm
-from .app import App
+from .app import App, LbwInvalid
 from .config import MASK
 from .db import now_iso
 from .export import list_drives, validate_target
@@ -25,17 +25,17 @@ from .jobs import missing_package_message
 from .online import OnlineError
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-STATIC = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/onboard.js": "onboard.js",
+STATIC = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/onboard.js": "onboard.js", "/trainer.js": "trainer.js",
           "/style.css": "style.css", "/sw.js": "sw.js", "/manifest.webmanifest": "manifest.webmanifest",
           "/icon.svg": "icon.svg"}
 # 휴대폰/브라우저가 받을 수 있는 소형 AI 모델 파일 (model.pt는 PyTorch 체크포인트라 내려주지 않는다)
-MOBILE_FILES = ("model.onnx", "model.int8.onnx", "vocab.json", "info.json")
+MOBILE_FILES = ("model.onnx", "model.int8.onnx", "vocab.json", "info.json", "model.lbw")
 SESSION_HOURS = 12
 MAX_BODY = 1_000_000
 MAX_DRAIN = 256 * 1024 * 1024      # 거절한 업로드를 끝까지 읽어 버릴 때의 상한 (연결이 끊겨 오류가 가려지는 것을 막기 위함)
 MAX_SNAPSHOT_CHUNKS = 200_000
 DEFAULT_SNAPSHOT_CHUNKS = 6000
-FILE_TYPES = {".zip": "application/zip", ".onnx": "application/octet-stream", ".json": "application/json",
+FILE_TYPES = {".zip": "application/zip", ".onnx": "application/octet-stream", ".lbw": "application/octet-stream", ".json": "application/json",
               ".jsonl": "application/x-ndjson", ".csv": "text/csv", ".md": "text/markdown", ".txt": "text/plain",
               ".db": "application/octet-stream", ".pt": "application/octet-stream",
               ".safetensors": "application/octet-stream", ".webmanifest": "application/manifest+json"}
@@ -453,9 +453,41 @@ def make_handler(app: App, sessions: Sessions):
         if not mdl or mdl["kind"] not in ("tiny", "mobile") or name not in MOBILE_FILES:
             raise HttpError(404, "파일이 없습니다.")
         path = Path(mdl["path"]) / name
+        if name == "model.lbw" and not path.is_file() and (Path(mdl["path"]) / "model.pt").is_file():
+            path = app.ensure_lbw(mdl)     # model.pt에서 만들어 폴더에 캐시 (torch 없으면 ImportError -> 400)
         if not path.is_file():
             raise HttpError(404, "파일이 없습니다.")
         h.send_file(path)
+
+    @route("POST", "/api/models/upload", "admin", raw=True)
+    def model_upload(h, m, body, role):
+        """휴대폰에서 학습한 가중치(.lbw)를 PC 모델로 등록한다."""
+        max_mb = float((app.cfg["mobile_training"] or {}).get("max_upload_mb", 64) or 64)
+        raw_len = h.headers.get("Content-Length")
+        if raw_len is None:
+            raise HttpError(411, "Content-Length 헤더가 필요합니다.")
+        try:
+            n = int(raw_len)
+        except ValueError:
+            raise HttpError(400, "Content-Length가 올바르지 않습니다.")
+        if n <= 0:
+            raise HttpError(400, "빈 파일입니다.")
+        if n > max_mb * 1024 * 1024:    # 본문을 읽기 전에 거절한다
+            raise HttpError(413, f"파일이 너무 큽니다 ({n / 1024 / 1024:.1f}MB). 최대 {max_mb:g}MB까지 올릴 수 있습니다.")
+        data = h.read_exact(n)
+        if len(data) < n:
+            raise HttpError(400, "파일을 끝까지 받지 못했습니다.")
+        hint = re.sub(r"[\x00-\x1f]", "", unquote(h.headers.get("X-Model-Name", "") or "")).strip() or None
+        try:
+            return app.register_device_model(data, hint, actor(h, role))
+        except LbwInvalid as e:
+            h._send(400, {"error": str(e), "errors": e.errors})
+
+    @route("POST", "/api/mobile-training/report")
+    def mobile_report(h, m, body, role):
+        keep = {k: body.get(k) for k in ("device", "arch", "batch_size", "seq_len", "ms_per_step", "steps")}
+        app.db.audit(actor(h, role), "mobile_benchmark", keep)
+        return {"ok": True}
 
     # ---------- 설정/내보내기 (관리자) ----------
     @route("GET", "/api/settings", "admin")
@@ -583,6 +615,8 @@ def make_handler(app: App, sessions: Sessions):
             if method == "GET" and path in STATIC:
                 f = WEB_DIR / STATIC[path]
                 ctype = mimetypes.guess_type(f.name)[0] or "text/plain"
+                if f.suffix == ".js":
+                    ctype = "application/javascript"
                 if f.suffix == ".webmanifest":
                     ctype = "application/manifest+json"
                 return self._send(200, f.read_bytes(), ctype + ("; charset=utf-8" if ctype.startswith("text") or "javascript" in ctype else ""))

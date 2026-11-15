@@ -359,3 +359,17 @@ body.noscroll { overflow: hidden; }
 .admin-only[hidden] { display: none !important; }
 /* 긴 이름의 버튼(외장 장치 경로 등)이 화면 밖으로 밀어내지 않도록 */
 #drives button { white-space: normal; text-align: left; max-width: 100%; overflow-wrap: anywhere; }
+
+/* ---------- 이 기기에서 학습 (온디바이스) ---------- */
+#od-card { overflow-wrap: anywhere; }
+#od-card .row > button { white-space: normal; }
+#od-card .banner .row { margin-bottom: 0; }
+#od-card .stats { grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); }
+#od-card .stat b { font-size: 15px; }
+#od-card .out { max-height: 220px; overflow: auto; }
+#od-card details { margin: 8px 0; }
+#od-bench-out .fit { font-weight: 600; }
+@media (max-width: 400px) {
+  #od-card .grid2 { grid-template-columns: 1fr 1fr; gap: 0 8px; }
+  #od-card .grid-fields { grid-template-columns: 1fr 1fr; }
+}

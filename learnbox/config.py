@@ -32,6 +32,9 @@ DEFAULTS: dict = {
         "results_to_fetch": 5,
     },
     "auto_collect": {"enabled": False, "interval_min": 60},
+    # 휴대폰/태블릿 브라우저에서 직접 학습(온디바이스). 올리기 상한과 기본 학습 설정.
+    "mobile_training": {"max_upload_mb": 64, "max_params": 2_000_000, "default_steps": 100, "default_batch": 8,
+                        "default_seq_len": 64, "checkpoint_every": 20, "thermal_pause": True},
     # 소형 AI 모델(처음부터 학습하는 글자 단위 GPT). PC와 휴대폰(온보드) 공용. preset 또는 직접 지정한 크기.
     "tiny_training": {
         "preset": "auto",  # auto | nano | mini | small | base | large | custom
