@@ -59,7 +59,8 @@ def collect_links(ctx, cfg, db, fetcher: Fetcher, urls: list[str], depth: int = 
     return stats
 
 
-def collect_search(ctx, cfg, db, fetcher: Fetcher, query: str, limit: int | None = None) -> dict:
+def collect_search(ctx, cfg, db, fetcher: Fetcher, query: str, limit: int | None = None,
+                   source: str = "search") -> dict:
     limit = int(limit or cfg["search"].get("results_to_fetch", 5))
     ctx.progress(0.0, f"검색 중: {query}")
     try:
@@ -67,6 +68,6 @@ def collect_search(ctx, cfg, db, fetcher: Fetcher, query: str, limit: int | None
     except OutsideWindow as e:
         return {"stopped": str(e), "results": []}
     urls = [r["url"] for r in results]
-    stats = collect_links(ctx, cfg, db, fetcher, urls, depth=0, source="search", query=query, max_pages=len(urls) or 1)
+    stats = collect_links(ctx, cfg, db, fetcher, urls, depth=0, source=source, query=query, max_pages=len(urls) or 1)
     stats["results"] = results
     return stats

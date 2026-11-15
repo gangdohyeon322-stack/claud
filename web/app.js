@@ -1274,15 +1274,19 @@ function checkArch(a) {
   if (a.d_model % a.n_head) return `차원(d_model ${a.d_model})은 헤드 수(${a.n_head})로 나누어떨어져야 합니다.`;
   return null;
 }
+const lastPreset = { tiny: null, al: null };
 function onPresetChange(prefix, silent) {
   const sel = $(`#${prefix}-preset`);
   const v = sel.value;
   const custom = v === "custom";
   $(`#${prefix}-custom`).hidden = !custom;
   if (custom && !ARCH_KEYS.some((k) => $(`#${prefix}-${k}`).value)) {
+    // 직접 설정으로 바꾸면 방금 보던 크기의 값에서 출발한다 (자동이면 이 PC 추천 크기)
     const rec = S.device && S.device.recommend && S.device.recommend.tiny_preset;
-    fillArch(prefix, presetsOf()[rec] || presetsOf().mini || FALLBACK_PRESETS.mini);
+    const from = lastPreset[prefix] && lastPreset[prefix] !== "auto" ? lastPreset[prefix] : rec;
+    fillArch(prefix, presetsOf()[from] || presetsOf()[rec] || presetsOf().mini || FALLBACK_PRESETS.mini);
   }
+  if (!custom) lastPreset[prefix] = v;
   if (prefix === "tiny") {
     const p = presetsOf()[v];
     $("#tiny-preset-desc").textContent = p && p.desc ? p.desc : v === "auto" ? "이 PC 성능에 맞는 크기를 자동으로 고릅니다." : custom ? "크기를 직접 정합니다. 차원은 헤드 수로 나누어떨어져야 합니다." : "";
@@ -1473,9 +1477,11 @@ function resultPath(name, rel) {
   const base = "/api/results/" + encodeURIComponent(name);
   return rel == null ? base + "/download" : base + "/files/" + String(rel).split("/").map(encodeURIComponent).join("/");
 }
+// 경로는 "/" 뒤에서 줄바꿈 (낱말 중간에서 끊기지 않게)
+function pathHtml(p) { return esc(p).replace(/\//g, "/<wbr>"); }
 function filesHtml(name, files, canDl) {
   return '<ul class="files">' + (files || []).map((f) => `
-    <li><span class="grow">${esc(f.path)}${f.dir ? ` <span class="muted">(파일 ${fmtNum(f.count)}개)</span>` : ""}</span>
+    <li><span class="grow">${pathHtml(f.path)}${f.dir ? ` <span class="muted">(파일 ${fmtNum(f.count)}개)</span>` : ""}</span>
       <span class="size">${fmtBytes(f.bytes)}</span>
       ${canDl && !f.dir ? `<button type="button" class="ghost small" data-act="dl-file" data-name="${esc(name)}" data-path="${esc(f.path)}" aria-label="${esc("받기: " + f.path)}">받기</button>` : ""}</li>`).join("") + "</ul>";
 }

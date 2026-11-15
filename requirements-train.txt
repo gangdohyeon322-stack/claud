@@ -1,8 +1,13 @@
-# 학습 기능용 (PC 모델 LoRA 학습, 휴대폰용 모델 학습과 ONNX 변환)
+# 학습 · 의미 검색 · 온라인 모델용 (용량 수 GB)
 # NVIDIA GPU가 있으면 먼저 https://pytorch.org 의 안내대로 CUDA용 torch를 설치한 뒤 이 파일을 설치하세요.
 -r requirements.txt
+# 소형 AI 모델 / LoRA 학습, 의미 검색(임베딩)
 torch>=2.2
-transformers>=4.45
+transformers>=4.56   # 5.x에서 시험했습니다 (모델을 불러올 때 dtype= 인자 사용)
 peft>=0.13
+# 소형 AI 모델의 ONNX 변환(휴대폰 온보드용) + 변환 결과 검증과 int8(경량) 변환
 onnx>=1.16
 onnxscript>=0.1
+onnxruntime>=1.18
+# 온라인 모델 (Claude API 공식 SDK)
+anthropic>=2.8      # 2.8에서 시험했습니다

@@ -503,8 +503,22 @@ def ingest_path(cfg, db, path: str, actor: str = "cli", progress=_noop_progress,
     p = Path(str(path)).expanduser()
     if not p.exists():
         raise ValueError(f"경로를 찾을 수 없습니다: {path}")
+    # LearnBox 데이터 폴더(config.json의 PIN 해시·API 키, DB, 모델)는 검색 대상으로 가져오지 않는다.
+    data_root = Path(cfg.data_dir).resolve() if getattr(cfg, "data_dir", None) else None
+
+    def inside_data(f: Path) -> bool:
+        if data_root is None:
+            return False
+        try:
+            f.resolve().relative_to(data_root)
+            return True
+        except (ValueError, OSError):
+            return False
+
+    if inside_data(p):
+        raise ValueError("LearnBox 데이터 폴더 안의 파일은 가져올 수 없습니다. 다른 폴더의 파일을 고르세요.")
     progress(0.0, "가져올 파일 찾는 중")
-    targets = [p] if p.is_file() else list(_iter_files(p))
+    targets = [p] if p.is_file() else [f for f in _iter_files(p) if not inside_data(f)]
     icfg = cfg["ingest"] if "ingest" in getattr(cfg, "data", cfg) else {}
     max_bytes = float(icfg.get("max_file_mb", 50) or 50) * 1024 * 1024
     stats = {"files": 0, "docs": 0, "duplicates": 0, "errors": [], "chars": 0, "skipped": 0, "total": len(targets)}

@@ -44,7 +44,7 @@
 }
 
 * { box-sizing: border-box; }
-html { -webkit-text-size-adjust: 100%; }
+html { -webkit-text-size-adjust: 100%; scroll-padding-top: 64px; scroll-padding-bottom: 80px; }
 body {
   margin: 0;
   background: var(--bg);
@@ -112,6 +112,8 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round
 
 /* ---------- 본문 ---------- */
 main, #login { max-width: 860px; margin: 0 auto; padding: 12px 16px; }
+/* 공백이 없는 긴 글(경로, 주소, 오류 메시지)이 화면 폭을 넘지 않게 한다 */
+main { overflow-wrap: anywhere; }
 .card {
   background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
   padding: 14px 16px; margin: 12px 0; min-width: 0;
@@ -186,6 +188,7 @@ button:disabled { opacity: .5; cursor: default; }
 .tabs button span { white-space: nowrap; }
 .tabs button.active { color: var(--accent); font-weight: 700; box-shadow: inset 0 3px 0 var(--accent); }
 @media (min-width: 760px) {
+  html { scroll-padding-top: 112px; scroll-padding-bottom: 24px; }
   body { padding-bottom: 24px; }
   .tabs {
     position: sticky; top: var(--header-h); bottom: auto; max-width: 860px; margin: 0 auto;
@@ -230,7 +233,7 @@ button:disabled { opacity: .5; cursor: default; }
 }
 .seg input:checked + span { background: var(--card); color: var(--accent); font-weight: 700; box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
 .seg input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: -2px; }
-.seg span.na { text-decoration: line-through; text-decoration-color: var(--muted); }
+.seg span.na { opacity: .55; text-decoration: underline dotted; text-underline-offset: 3px; }
 .filters { margin-top: 8px; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip {
@@ -304,7 +307,7 @@ mark.current { outline: 2px solid var(--accent); outline-offset: 1px; }
 .result-card h4 { margin-top: 0; color: var(--ok-text); }
 .files { list-style: none; padding: 0; margin: 8px 0 0; font-size: 13px; }
 .files li { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-top: 1px solid var(--line); min-width: 0; }
-.files li .grow { overflow-wrap: anywhere; }
+.files li .grow { overflow-wrap: break-word; }
 .files .size { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .results-item { border-top: 1px solid var(--line); padding: 10px 0; }
 .results-item:first-child { border-top: 0; }
@@ -354,3 +357,5 @@ body.noscroll { overflow: hidden; }
 .toast button { color: var(--bg); border-color: var(--bg); background: transparent; }
 @media (min-width: 760px) { .toast { bottom: 24px; } }
 .admin-only[hidden] { display: none !important; }
+/* 긴 이름의 버튼(외장 장치 경로 등)이 화면 밖으로 밀어내지 않도록 */
+#drives button { white-space: normal; text-align: left; max-width: 100%; overflow-wrap: anywhere; }

@@ -125,7 +125,7 @@ def export(cfg, db, target: str, include: list[str], actor: str, progress=lambda
     (out / "README.txt").write_text(
         "LearnBox 내보내기\n\n"
         "- learnbox.db: 수집 자료와 검색 인덱스 (SQLite)\n"
-        "- models/: 학습된 모델 (pc-*: LoRA 어댑터, mobile-*: ONNX 모델)\n"
+        "- models/: 학습된 모델 (tiny-*: 소형 AI 모델과 ONNX 파일, lora-*: LoRA 어댑터)\n"
         "- datasets/: 학습에 사용한 말뭉치\n"
         "- manifest.json: 파일별 SHA-256. 확인: python -m learnbox verify <이 폴더>\n"
         "- 다른 PC에서 쓰기: python -m learnbox --data <새 데이터 폴더> import <이 폴더>\n",
@@ -174,5 +174,6 @@ def import_export(export_dir: str, cfg, db) -> dict:
                     shutil.copytree(d, dst / d.name)
                     if sub == "models":
                         info = json.loads((d / "info.json").read_text(encoding="utf-8")) if (d / "info.json").exists() else {}
-                        db.add_model(info.get("kind", "unknown"), d.name, str(dst / d.name), info)
+                        kind = {"mobile": "tiny", "pc": "lora"}.get(info.get("kind"), info.get("kind", "unknown"))
+                        db.add_model(kind, d.name, str(dst / d.name), info)
     return {"documents_merged": merged}

@@ -111,7 +111,20 @@ class Config:
         self._lock = threading.Lock()
         self.data = copy.deepcopy(DEFAULTS)
         if self.path.exists():
-            self.data = _merge(DEFAULTS, json.loads(self.path.read_text(encoding="utf-8")))
+            saved = json.loads(self.path.read_text(encoding="utf-8"))
+            self.data = _merge(DEFAULTS, saved)
+            self._migrate_v1(saved)
+
+    def _migrate_v1(self, saved: dict) -> None:
+        """v1 설정 이름(pc_training, mobile_training)의 값을 새 이름(lora_training, tiny_training)으로 옮긴다."""
+        old = saved.get("pc_training")
+        if "lora_training" not in saved and isinstance(old, dict):
+            self.data["lora_training"] = _merge(DEFAULTS["lora_training"],
+                                                {k: v for k, v in old.items() if k in DEFAULTS["lora_training"]})
+        old = saved.get("mobile_training")
+        if "tiny_training" not in saved and isinstance(old, dict):  # 크기 이름(tiny/small)은 뜻이 달라져 옮기지 않는다
+            self.data["tiny_training"] = _merge(DEFAULTS["tiny_training"],
+                                                {k: v for k, v in old.items() if k in ("steps", "batch_size", "lr")})
 
     # 경로
     @property

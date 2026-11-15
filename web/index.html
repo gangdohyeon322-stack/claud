@@ -261,8 +261,8 @@
           <h4>주기와 기준</h4>
           <div class="grid2">
             <label>한 번에 학습할 단계 <input id="al-steps" type="number" min="1" step="1"></label>
-            <label>학습 시작 기준 (새 글자 수) <input id="al-minchars" type="number" min="1" step="1000"></label>
-            <label>학습 확인 간격(분) <input id="al-train-int" type="number" min="0" step="5"></label>
+            <label>학습 시작 기준 (새 글자 수) <input id="al-minchars" type="number" min="1" step="1" inputmode="numeric"></label>
+            <label>학습 확인 간격(분) <input id="al-train-int" type="number" min="0" step="1"></label>
             <label>수집 간격(분) <input id="al-collect-int" type="number" min="0" step="1"></label>
             <label>한 번에 수집할 페이지 <input id="al-pages" type="number" min="1" step="1"></label>
             <label>시간당 최대 페이지 <input id="al-maxhour" type="number" min="1" step="1"></label>
@@ -286,7 +286,7 @@
         <p id="tiny-preset-desc" class="muted small"></p>
         <div id="tiny-custom" class="grid-fields" hidden></div>
         <div class="grid2">
-          <label>학습 단계 <input id="tiny-steps" type="number" min="1" step="100"></label>
+          <label>학습 단계 <input id="tiny-steps" type="number" min="1" step="1" inputmode="numeric"></label>
           <label>배치 크기 <input id="tiny-batch" type="number" min="1" max="512" step="1"></label>
         </div>
         <label>이어서 학습
@@ -311,8 +311,8 @@
           <label>LoRA 차수(r)
             <select id="lora-r"><option>4</option><option selected>8</option><option>16</option><option>32</option><option>64</option></select>
           </label>
-          <label>문맥 길이 <input id="lora-seq" type="number" min="64" max="4096" step="64"></label>
-          <label>학습 단계 <input id="lora-steps" type="number" min="1" step="10"></label>
+          <label>문맥 길이 <input id="lora-seq" type="number" min="16" max="4096" step="1" inputmode="numeric"></label>
+          <label>학습 단계 <input id="lora-steps" type="number" min="1" step="1" inputmode="numeric"></label>
           <label>배치 크기 <input id="lora-batch" type="number" min="1" max="64" step="1"></label>
         </div>
         <label class="inline"><input type="checkbox" id="lora-qa" checked> Q&amp;A 학습 데이터도 사용 (있으면)</label>
@@ -358,7 +358,7 @@
           <button type="submit" id="local-gen-btn" class="secondary">생성</button>
           <button type="button" id="local-stop" class="ghost" hidden>중지</button>
         </div>
-        <label class="inline small">생성 길이 <input id="local-max" type="number" min="10" max="2000" step="10" class="num"></label>
+        <label class="inline small">생성 길이 <input id="local-max" type="number" min="1" max="2000" step="1" class="num"></label>
         <button type="button" id="local-del" class="ghost small" hidden>이 기기에서 모델 삭제</button>
       </form>
       <pre id="local-out" class="out" hidden aria-live="polite"></pre>

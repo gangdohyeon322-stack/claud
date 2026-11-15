@@ -9,7 +9,7 @@ import urllib.error
 import urllib.request
 import urllib.robotparser
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from .extract import decode, html_to_text
 from .timegate import ensure_allowed
@@ -40,8 +40,34 @@ def host_matches(host: str, domains: list[str]) -> bool:
     return False
 
 
+def to_ascii_url(url: str) -> str:
+    """한글 등이 들어 있는 주소(IRI)를 HTTP 요청에 쓸 수 있는 ASCII 주소로 바꾼다. 이미 인코딩된 %XX는 그대로 둔다."""
+    p = urlsplit(url.strip())
+    host = p.hostname or ""
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        pass
+    if ":" in host:  # IPv6
+        host = f"[{host}]"
+    netloc = host + (f":{p.port}" if p.port else "")
+    if p.username:
+        netloc = f"{quote(p.username, safe='%')}{':' + quote(p.password, safe='%') if p.password else ''}@{netloc}"
+    path = quote(p.path, safe="/%:@!$&'()*+,;=~-._")
+    query = quote(p.query, safe="=&%+:@!$'()*,;/?~-._[]")
+    return urlunsplit((p.scheme, netloc, path, query, ""))
+
+
+def _retry_after(headers) -> float | None:
+    try:
+        return max(0.0, float(headers.get("Retry-After")))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 class Fetcher:
     ROBOTS_TTL = 3600
+    MAX_RETRY_AFTER = 60.0   # 서버가 '잠시 뒤에' (429/503 + Retry-After)라고 하면 이 시간 이내일 때만 기다렸다 한 번 다시 시도
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -93,29 +119,42 @@ class Fetcher:
 
     # ---------- 저수준 요청 ----------
     def _request(self, url: str, headers: dict | None = None, max_bytes: int | None = None) -> tuple[int, str, str, bytes]:
-        ensure_allowed(self.cfg)  # 요청 직전마다 시간대 확인
-        self.check_url(url)
-        self._wait_turn(urlsplit(url).hostname or "")
-        req = urllib.request.Request(url, headers={"User-Agent": self.cfg["user_agent"], **(headers or {})})
         limit = max_bytes or int(self.cfg["max_page_bytes"])
-        try:
-            with self.opener.open(req, timeout=20) as r:
-                body = r.read(limit + 1)
-                if len(body) > limit:
-                    raise FetchError(f"페이지가 너무 큽니다 (>{limit} bytes): {url}")
-                return r.status, r.geturl(), r.headers.get("Content-Type", ""), body
-        except urllib.error.HTTPError as e:
-            return e.code, url, e.headers.get("Content-Type", "") if e.headers else "", b""
-        except urllib.error.URLError as e:
-            raise FetchError(f"접속 실패: {url} ({e.reason})") from e
+        for attempt in (0, 1):
+            ensure_allowed(self.cfg)  # 요청 직전마다 시간대 확인
+            self.check_url(url)
+            self._wait_turn(urlsplit(url).hostname or "")
+            req = urllib.request.Request(to_ascii_url(url), headers={"User-Agent": self.cfg["user_agent"], **(headers or {})})
+            try:
+                with self.opener.open(req, timeout=20) as r:
+                    body = r.read(limit + 1)
+                    if len(body) > limit:
+                        raise FetchError(f"페이지가 너무 큽니다 (>{limit} bytes): {url}")
+                    return r.status, r.geturl(), r.headers.get("Content-Type", ""), body
+            except urllib.error.HTTPError as e:
+                wait = _retry_after(e.headers) if e.code in (429, 503) else None
+                if attempt == 0 and wait is not None and wait <= self.MAX_RETRY_AFTER:
+                    time.sleep(wait)  # 서버가 알려 준 시간만큼 기다린 뒤 한 번만 다시 시도
+                    continue
+                return e.code, url, e.headers.get("Content-Type", "") if e.headers else "", b""
+            except urllib.error.URLError as e:
+                raise FetchError(f"접속 실패: {url} ({e.reason})") from e
+        raise FetchError(f"요청하지 못했습니다: {url}")  # pragma: no cover
 
     def get_json(self, url: str, headers: dict | None = None):
         import json
 
         status, _, _, body = self._request(url, {"Accept": "application/json", **(headers or {})})
         if status != 200:
-            raise FetchError(f"HTTP {status}: {url}")
+            raise FetchError(self._http_error(status, url))
         return json.loads(body.decode("utf-8"))
+
+    @staticmethod
+    def _http_error(status: int, url: str) -> str:
+        if status == 429:
+            return (f"HTTP 429: 서버가 요청이 너무 많다며 거절했습니다. 잠시 뒤 다시 시도하세요. 위키백과처럼 요청자를 확인하는 사이트는 "
+                    f"설정 파일의 user_agent에 연락처(이메일이나 웹 주소)를 넣어 달라고 요구합니다: {url}")
+        return f"HTTP {status}: {url}"
 
     # ---------- robots.txt ----------
     def robots_allows(self, url: str) -> bool:
@@ -145,7 +184,7 @@ class Fetcher:
             raise BlockedURL(f"robots.txt가 수집을 허용하지 않습니다: {url}")
         status, final_url, ctype, body = self._request(url)
         if status != 200:
-            raise FetchError(f"HTTP {status}: {url}")
+            raise FetchError(self._http_error(status, url))
         ctype_l = ctype.lower()
         text = decode(body, ctype)
         if "html" in ctype_l or not ctype_l:
