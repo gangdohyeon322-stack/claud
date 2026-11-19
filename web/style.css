@@ -318,10 +318,30 @@ mark.current { outline: 2px solid var(--accent); outline-offset: 1px; }
 .status:empty { display: none; }
 .status.running, .status.queued, .status.collecting, .status.training, .status.finishing { background: var(--accent-soft); color: var(--ok-text); }
 .status.done, .status.ended { background: var(--ok-bg); color: var(--ok-text); }
-.status.failed, .status.blocked, .status.waiting_window { background: var(--warn-bg); color: var(--warn-text); }
+.status.failed, .status.blocked, .status.waiting_window, .status.interrupted { background: var(--warn-bg); color: var(--warn-text); }
+.status.paused { background: transparent; color: var(--warn-text); box-shadow: inset 0 0 0 1px currentColor; }
+
+/* ---------- 작업: 일시정지 · 중간 저장 · 이어서 재개 ---------- */
+.job.job-paused .bar > div { background: var(--warn-text); opacity: .7; }
+.job .job-actions { margin: 10px 0 2px; }
+.job .job-actions button { white-space: normal; text-align: center; max-width: 100%; }
+.job .banner.job-hint { margin: 8px 0; padding: 8px 12px; font-size: 13px; }
+.job .pending-note { margin: 4px 0; }
+.job .pending-note .spinner { width: 12px; height: 12px; }
+.job.flash { animation: flash 1.6s ease-out; }
+.ckpt-line, .ckpt-note { display: flex; align-items: flex-start; gap: 6px; margin: 4px 0; min-width: 0; }
+.ckpt-line { color: var(--ok-text); }
+.ckpt-line svg, .ckpt-note svg { margin-top: 2px; }
+.ckpt-line > span, .ckpt-note > span { min-width: 0; overflow-wrap: anywhere; }
+.ckpt-note { padding: 6px 10px; border-radius: 8px; background: var(--ok-bg); color: var(--ok-text); }
+.ckpt-note.off { background: var(--warn-bg); color: var(--warn-text); }
+#s-ck-fields.off { opacity: .55; }
+.notif-list li.clickable { cursor: pointer; }
 .kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 12px; font-size: 13px; margin: 6px 0; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; overflow-wrap: anywhere; }
+.model-notes { margin: 4px 0 6px; padding-left: 18px; }
+.model-notes li { overflow-wrap: anywhere; margin: 2px 0; }
 .out { white-space: pre-wrap; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow-wrap: anywhere; margin: 8px 0; font: inherit; }
 .out .prompt { color: var(--muted); }
 details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }

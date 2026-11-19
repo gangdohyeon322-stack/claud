@@ -430,16 +430,160 @@ def same_arch(a: dict, b: dict, check_vocab: bool = True) -> bool:
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# 학습 중간 저장(체크포인트) 도우미 — 파일 구조와 원자적 교체는 learnbox.checkpoint가 맡는다.
+#   state_dir/state.pt   {"model","opt","scaler","gen","torch_rng","cuda_rng","recent","B","T"}
+#   state_dir/vocab.json {"itos": [...]}
+# ---------------------------------------------------------------------------------------------------------------
+_CKPT_STATE_KEYS = ("model", "opt", "scaler", "gen", "torch_rng", "cuda_rng", "recent", "B", "T")
+
+
+def _write_tiny_checkpoint(root, state: dict, itos: list[str], meta: dict) -> dict:
+    """state.pt와 vocab.json을 임시 폴더에 쓰고 확정한다. -> checkpoint.commit 반환값"""
+    import shutil
+
+    import torch
+
+    from . import checkpoint as ckpt
+
+    tmp = ckpt.begin(root)
+    try:
+        torch.save(state, tmp / "state.pt")
+        (tmp / "vocab.json").write_text(json.dumps({"itos": itos}, ensure_ascii=False), encoding="utf-8")
+        return ckpt.commit(root, tmp, meta)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
+def _read_tiny_checkpoint(root) -> dict:
+    """가장 최근의 온전한 소형 AI 체크포인트 -> {"meta", "dir", "state", "itos"}.
+
+    current의 상태 파일이 깨졌으면(checkpoint.json은 멀쩡해도) prev를 대신 읽는다. 없으면 한국어 ValueError."""
+    import torch
+
+    from . import checkpoint as ckpt
+
+    got = ckpt.load(root)
+    if got is None:
+        raise ValueError(f"이어서 할 체크포인트를 찾을 수 없습니다: {root}")
+    cands = [got]
+    prev = Path(root) / "prev"
+    if got[1].name == "current" and prev.is_dir():
+        pmeta = ckpt._read_meta(prev)
+        if pmeta is not None:
+            cands.append((pmeta, prev))
+    errors = []
+    for meta, d in cands:
+        if meta.get("kind") != "tiny":
+            raise ValueError(f"소형 AI 모델의 체크포인트가 아닙니다 (종류: {meta.get('kind')}). 이어서 할 수 없습니다.")
+        try:
+            state = torch.load(d / "state.pt", map_location="cpu", weights_only=True)
+            itos = json.loads((d / "vocab.json").read_text(encoding="utf-8"))["itos"]
+            missing = [k for k in _CKPT_STATE_KEYS if k not in state]
+            if missing:
+                raise KeyError(", ".join(missing))
+            if int(state["model"]["tok.weight"].shape[0]) != len(itos):
+                raise ValueError("어휘 파일이 모델과 맞지 않습니다")
+            _clean_arch(meta.get("arch"))
+            int(meta["step"]), int(meta["steps"]), str(meta["train_path"])
+        except Exception as e:
+            errors.append(f"{d.name}: {type(e).__name__}: {e}")
+            continue
+        return {"meta": meta, "dir": d, "state": state, "itos": itos}
+    raise ValueError("체크포인트 파일이 손상되어 이어서 할 수 없습니다 (" + "; ".join(errors)[:400] + ").")
+
+
+def _same_path(a, b) -> bool:
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except (TypeError, OSError):
+        return False
+
+
+_TRAIN_DEFAULTS = {"steps": 1500, "batch_size": 32, "lr": 3e-3, "seed": 0, "onnx_int8": True, "max_seconds": None}
+
+
+def _ignored_requests(meta: dict, arch, steps, batch_size, lr, seed, onnx_int8, max_seconds, train_path, eval_path,
+                      resume_from) -> list[str]:
+    """체크포인트에서 이어서 할 때 무시되는 호출자 값(체크포인트와 다른 것)을 사람이 읽을 문장 조각으로.
+    train()의 기본값 그대로인 인자는 '지정하지 않음'으로 보고 비교하지 않는다."""
+    d = _TRAIN_DEFAULTS
+    steps = None if steps == d["steps"] else steps
+    batch_size = None if batch_size == d["batch_size"] else batch_size
+    lr = None if lr == d["lr"] else lr
+    seed = None if seed == d["seed"] else seed
+    out = []
+    if arch is not None and not (isinstance(arch, dict) and str(arch.get("preset", "")).lower() in ("auto", "inherit")
+                                 and not any(arch.get(k) for k in ARCH_KEYS)):
+        try:
+            want = _clean_arch(arch)
+        except ValueError:
+            want = None
+        if want is None or not same_arch(want, meta["arch"]):
+            got = meta["arch"]
+            out.append("구조 " + (", ".join(f"{k} {want[k]}" for k in ARCH_KEYS if want[k] != int(got[k]))
+                                if want else "(올바르지 않음)"))
+    for name, given, stored in (("steps", steps, meta.get("steps")), ("batch_size", batch_size, meta.get("batch_size")),
+                                ("seed", seed, meta.get("seed"))):
+        try:
+            if given is not None and stored is not None and int(given) != int(stored):
+                out.append(f"{name} {given}")
+        except (TypeError, ValueError):
+            out.append(f"{name} {given}")
+    try:
+        if lr is not None and meta.get("lr") is not None and not math.isclose(float(lr), float(meta["lr"]),
+                                                                              rel_tol=1e-9):
+            out.append(f"lr {lr}")
+    except (TypeError, ValueError):
+        out.append(f"lr {lr}")
+    if onnx_int8 != d["onnx_int8"] and "onnx_int8" in meta and bool(onnx_int8) != bool(meta["onnx_int8"]):
+        out.append(f"onnx_int8 {bool(onnx_int8)}")
+    if max_seconds and "max_seconds" in meta and max_seconds != meta["max_seconds"]:
+        out.append(f"max_seconds {max_seconds}")
+    if train_path and not _same_path(train_path, meta.get("train_path")):
+        out.append(f"학습 자료 {train_path}")
+    if eval_path and meta.get("eval_path") and not _same_path(eval_path, meta["eval_path"]):
+        out.append(f"평가 자료 {eval_path}")
+    if resume_from and not (meta.get("parent_path") and _same_path(resume_from, meta["parent_path"])):
+        out.append(f"이어 학습할 모델 {Path(str(resume_from)).name}")
+    return out
+
+
+def _fmt_eta(sec: float) -> str:
+    sec = max(0, int(sec))
+    if sec < 60:
+        return "1분 미만"
+    h, m = divmod(sec // 60, 60)
+    if h:
+        return f"{h}시간 {m}분" if m else f"{h}시간"
+    return f"{m}분"
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # 학습
 # ---------------------------------------------------------------------------------------------------------------
 def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, batch_size: int = 32,
           lr: float = 3e-3, resume_from: str | None = None, device: str | None = None, threads: int | None = None,
           progress=lambda p, m: None, check_cancel=lambda: None, onnx_int8: bool = True, seed: int = 0,
-          max_seconds: float | None = None) -> dict:
+          max_seconds: float | None = None, checkpoint_dir: str | None = None, checkpoint_every_steps: int = 0,
+          checkpoint_every_sec: float = 600.0, resume_checkpoint: str | None = None, pause_point=None,
+          stop_requested=None, on_checkpoint=None) -> dict:
     """학습 파일(train/eval JSONL {"text",...})로 소형 AI 모델을 학습하고 out_dir에 저장한다.
 
     resume_from: 이어 학습할 기존 모델 폴더(구조가 같아야 함; arch=None이면 그 구조를 그대로 사용).
     max_seconds: 지정하면 그 시간이 지나면 학습을 멈추고(지금까지의 결과로) 저장한다.
+
+    중간 저장(체크포인트, docs/SPEC-pause-resume.md §1):
+    checkpoint_dir: 체크포인트 root (None이면 저장하지 않음). checkpoint_every_steps / checkpoint_every_sec:
+    N단계 / N초(일시정지 시간 제외)마다 저장, 0이면 그 기준은 끔.
+    resume_checkpoint: 이전 실행이 남긴 체크포인트 root. 주면 그 단계 다음부터 이어서 하며, 체크포인트에 기록된
+    값(구조·steps·batch_size·lr·seed·자료 경로·부모 모델 등)이 호출자의 같은 인자보다 우선한다(다르면 notes에 기록).
+    train_path/eval_path/arch는 None이어도 된다.
+    pause_point(save): 매 단계 옵티마이저 스텝(과 예약된 저장) 직후 1회 호출. save()는 지금 상태를 저장하고
+    요약을 돌려준다(이번 단계에 이미 저장했으면 그 요약, checkpoint_dir가 None이면 None). 안에서 보낸 시간은
+    학습 시간·남은 시간·토큰/초에서 뺀다. 발생한 예외(Cancelled 등)는 그대로 전파한다.
+    stop_requested(): True면 저장한 뒤 남은 단계를 건너뛰고 지금까지의 결과로 평가·내보내기를 마친다.
+    on_checkpoint(summary): 체크포인트를 쓸 때마다 checkpoint.commit 반환값 + "steps"로 호출.
     """
     import torch
     import torch.nn.functional as F
@@ -447,20 +591,51 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
     from .dataset import load_texts
 
     t_start = time.time()
+    out = Path(out_dir)
+    rs = None  # 체크포인트에서 이어서 할 때의 저장 내용
+    notes: list[str] = []
+    if resume_checkpoint:
+        progress(0.0, "체크포인트 읽는 중")
+        rs = _read_tiny_checkpoint(resume_checkpoint)
+        rmeta = rs["meta"]
+        ignored = _ignored_requests(rmeta, arch, steps, batch_size, lr, seed, onnx_int8, max_seconds, train_path,
+                                    eval_path, resume_from)
+        arch = _clean_arch(rmeta["arch"])
+        steps, batch_size, lr = int(rmeta["steps"]), int(rmeta.get("batch_size") or batch_size), rmeta["lr"]
+        seed = int(rmeta.get("seed") or 0)
+        onnx_int8 = bool(rmeta.get("onnx_int8", onnx_int8))
+        max_seconds = rmeta.get("max_seconds", max_seconds)
+        train_path, eval_path = rmeta["train_path"], rmeta.get("eval_path")
+        for p in (train_path, eval_path):
+            if p and not Path(p).is_file():
+                raise ValueError(f"체크포인트에 기록된 학습 자료가 없습니다: {p}. 이어서 할 수 없습니다.")
+        notes = [str(n) for n in (rmeta.get("notes") or [])]
+        if ignored:
+            notes.append("체크포인트에 기록된 설정으로 이어서 학습했습니다 (무시한 요청 값: " + ", ".join(ignored) + ").")
     steps = max(1, int(steps))
     lr = float(lr)
-    out = Path(out_dir)
     progress(0.0, "학습 자료 읽는 중")
     train_texts = [t for t in load_texts(train_path) if t]
-    eval_texts = [t for t in load_texts(eval_path) if t] if eval_path and Path(eval_path).exists() else []
+    eval_used = bool(eval_path and Path(eval_path).exists())
+    eval_texts = [t for t in load_texts(eval_path) if t] if eval_used else []
     if not train_texts:
         raise ValueError("학습할 자료가 없습니다. 먼저 자료를 수집하거나 파일을 가져오세요.")
+    # 체크포인트에 남길 자료 경로 (재개할 때 같은 자료를 다시 읽는다)
+    train_abs = str(Path(train_path).resolve())
+    eval_abs = str(Path(eval_path).resolve()) if eval_used else None
 
     # 이어 학습: 부모 모델과 어휘를 불러오고 구조를 확인한다.
     parent = None
     parent_state = None
     parent_total = 0
-    if resume_from:
+    parent_path = str(Path(resume_from).resolve()) if resume_from else None
+    if rs is not None:  # 체크포인트에서 이어서: 부모 정보와 어휘는 체크포인트의 것을 쓴다 (어휘를 다시 만들지 않음)
+        itos = list(rs["itos"])
+        parent = rmeta.get("parent")
+        parent_path = rmeta.get("parent_path")
+        parent_total = int(rmeta.get("parent_total") or 0)
+        parent_train_seq = int(rmeta.get("parent_train_seq") or 0)
+    elif resume_from:
         pdir = Path(resume_from)
         if not (pdir / "model.pt").exists() or not (pdir / "vocab.json").exists():
             raise ValueError(f"이어 학습할 모델을 찾을 수 없습니다: {pdir}")
@@ -505,33 +680,47 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
     n_tok = int(train_ids.numel())
     if n_tok < 34:
         raise ValueError("학습 자료가 너무 적습니다 (최소 30글자 이상 필요).")
-    T = min(seq_len, n_tok - 2)  # 자료가 문맥 길이보다 짧으면 짧은 문맥으로 학습
+    if rs is None:
+        T = min(seq_len, n_tok - 2)  # 자료가 문맥 길이보다 짧으면 짧은 문맥으로 학습
+    else:  # 저장할 때의 실제 문맥 길이 (자료가 그 사이 줄었으면 맞춰 줄인다)
+        T = max(1, min(int(rs["state"]["T"]), seq_len, n_tok - 2))
     eval_source = "eval"
     if eval_ids.numel() < max(34, min(T, 64) + 2):
         eval_ids = train_ids[-min(n_tok, max(T * 4, 256)):]
         eval_source = "train_tail"
     T_eval = min(T, int(eval_ids.numel()) - 2)
 
-    notes = []
     windows = n_tok - T
     batch_req = max(1, int(batch_size))
-    B = max(1, min(batch_req, windows, max(1, (n_tok - 1) // T)))
-    if B < batch_req:
-        notes.append(f"자료가 적어 배치 크기를 {batch_req}에서 {B}(으)로 줄였습니다.")
-    if T < seq_len:
-        notes.append(f"자료가 문맥 길이({seq_len})보다 짧아 {T}글자 문맥으로 학습했습니다.")
+    if rs is None:
+        B = max(1, min(batch_req, windows, max(1, (n_tok - 1) // T)))
+        if B < batch_req:
+            notes.append(f"자료가 적어 배치 크기를 {batch_req}에서 {B}(으)로 줄였습니다.")
+        if T < seq_len:
+            notes.append(f"자료가 문맥 길이({seq_len})보다 짧아 {T}글자 문맥으로 학습했습니다.")
+    else:  # 저장할 때의 실제 배치 (메모리 부족으로 줄인 것 포함)
+        B = max(1, min(int(rs["state"]["B"]), windows, max(1, (n_tok - 1) // T)))
+        if rmeta.get("train_chars") is not None and int(rmeta["train_chars"]) != n_tok:
+            notes.append("체크포인트를 저장한 뒤 학습 자료가 바뀌어, 끊기기 전과 똑같이 이어지지는 않습니다.")
 
     # 장치와 스레드
     dev, dev_note = _pick_device(device)
-    if dev_note:
+    if dev_note and dev_note not in notes:
         notes.append(dev_note)
     n_threads = max(1, int(threads)) if threads else _default_threads()
     old_threads = torch.get_num_threads()
     torch.set_num_threads(n_threads)
+    # 시간: 이전 실행(체크포인트)에서 쓴 시간 + 이번 실행에서 일시정지(pause_point 안) 시간을 뺀 시간
+    prev_elapsed = float(rmeta.get("elapsed") or 0.0) if rs is not None else 0.0
+    prev_train = float(rmeta.get("train_seconds") or 0.0) if rs is not None else 0.0
+    resumes = int(rmeta.get("resumes") or 0) + 1 if rs is not None else 0
+    paused = 0.0
     try:
         torch.manual_seed(seed)
         model = build_model(arch, vocab=V)
-        if parent_state is not None:
+        if rs is not None:
+            model.load_state_dict(rs["state"]["model"])
+        elif parent_state is not None:
             model.load_state_dict(parent_state)
         model.to(dev)
         model.fast = True
@@ -541,6 +730,12 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
         no_decay = [p for p in model.parameters() if p.dim() < 2]
         opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.01}, {"params": no_decay, "weight_decay": 0.0}],
                                 lr=lr, betas=(0.9, 0.95))
+        if rs is not None:  # 장치가 바뀌었어도(GPU 저장 -> CPU 재개 등) 상태 텐서를 매개변수 장치로 옮긴다
+            opt.load_state_dict(rs["state"]["opt"])
+            for st in opt.state.values():
+                for k, v in st.items():
+                    if k != "step" and torch.is_tensor(v) and v.device != dev:
+                        st[k] = v.to(dev)
         use_amp = dev.type == "cuda"
         amp_dtype = torch.float32
         if use_amp:
@@ -550,8 +745,12 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
             scaler = torch.amp.GradScaler("cuda", enabled=scale_on)
         except (AttributeError, TypeError):  # torch < 2.3
             scaler = torch.cuda.amp.GradScaler(enabled=scale_on)
+        if rs is not None and rs["state"].get("scaler") and scaler.is_enabled():
+            scaler.load_state_dict(rs["state"]["scaler"])
 
         gen = torch.Generator().manual_seed(seed + 1)
+        if rs is not None:
+            gen.set_state(rs["state"]["gen"])
 
         def get_batch(ids, n, length, g):
             ix = torch.randint(0, int(ids.numel()) - length, (n,), generator=g)  # 창 [i, i+length]
@@ -580,17 +779,78 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
             model.train()
             return sum(losses) / len(losses)
 
-        progress(0.02, "학습 전 평가 중")
-        eval_before = evaluate()
+        if rs is None:
+            progress(0.02, "학습 전 평가 중")
+            eval_before = evaluate()
+            recent: list[float] = []
+            step = 0
+        else:  # 학습 전 평가는 다시 하지 않는다 (처음 실행의 값)
+            eb = rmeta.get("eval_before")
+            eval_before = float(eb) if eb is not None else float("nan")
+            recent = [float(v) for v in rs["state"]["recent"]]
+            step = min(int(rmeta["step"]), steps)
+            torch.set_rng_state(rs["state"]["torch_rng"])
+            cuda_rng = rs["state"].get("cuda_rng")
+            if cuda_rng and dev.type == "cuda":
+                with contextlib.suppress(Exception):
+                    for i in range(min(len(cuda_rng), torch.cuda.device_count())):
+                        torch.cuda.set_rng_state(cuda_rng[i], i)
+            progress(0.03 + 0.85 * step / steps, f"체크포인트에서 이어서 학습합니다 ({step}/{steps}단계부터)")
         model.train()
-        recent: list[float] = []
+        start_step = step
         t0 = time.time()
-        done = 0
+        done = step
         stopped_early = False
         warmup = min(100, max(1, steps // 10))
         min_lr = lr * 0.1
         report_every = max(1, steps // 200)
-        step = 0
+
+        ck_steps = max(0, int(checkpoint_every_steps or 0))
+        ck_sec = max(0.0, float(checkpoint_every_sec or 0.0))
+        pause_at = None  # pause_point 안에 들어간 시각 (그 안에서 저장하면 이 시각까지의 시간으로 기록)
+        last_ck = {"step": None, "summary": None, "active": 0.0, "failed": False}
+
+        def clock() -> tuple[float, float]:
+            """(이번 실행의 경과 시간, 이번 실행의 학습 시간) — 일시정지 시간 제외"""
+            now = pause_at if pause_at is not None else time.time()
+            return now - t_start - paused, now - t0 - paused
+
+        def save():
+            """지금 상태를 체크포인트로 저장하고 요약을 돌려준다 (이번 단계에 이미 저장했으면 그 요약)."""
+            if not checkpoint_dir:
+                return None
+            if last_ck["step"] == step and last_ck["summary"] is not None:
+                return last_ck["summary"]
+            el, tr = clock()
+            state = {"model": model.state_dict(), "opt": opt.state_dict(),
+                     "scaler": scaler.state_dict() if scaler.is_enabled() else None,
+                     "gen": gen.get_state(), "torch_rng": torch.get_rng_state(),
+                     "cuda_rng": torch.cuda.get_rng_state_all() if dev.type == "cuda" else None,
+                     "recent": list(recent), "B": int(B), "T": int(T)}
+            meta = {"kind": "tiny", "step": int(step), "steps": int(steps), "arch": dict(arch),
+                    "batch_size": int(batch_req), "lr": lr, "seed": int(seed),
+                    "train_path": train_abs, "eval_path": eval_abs,
+                    "parent": parent, "parent_path": parent_path, "parent_total": int(parent_total),
+                    "parent_train_seq": int(parent_train_seq),
+                    "eval_before": float(eval_before) if math.isfinite(eval_before) else None,
+                    "elapsed": round(prev_elapsed + el, 3), "train_seconds": round(prev_train + tr, 3),
+                    "resumes": int(resumes), "notes": list(notes), "onnx_int8": bool(onnx_int8),
+                    "max_seconds": max_seconds, "train_chars": n_tok, "device": dev.type}
+            try:
+                res = _write_tiny_checkpoint(checkpoint_dir, state, itos, meta)
+            except (OSError, RuntimeError) as e:  # 저장장치 가득 참/빠짐 등: 학습은 계속하고 다음 기회에 다시 시도
+                last_ck["active"] = clock()[1]
+                if not last_ck["failed"]:
+                    last_ck["failed"] = True
+                    notes.append(f"중간 저장에 실패했습니다 ({step}단계): {type(e).__name__}: {str(e)[:200]}")
+                progress(0.03 + 0.85 * step / steps, f"중간 저장 실패 ({step}/{steps}단계) · 학습은 계속합니다")
+                return None
+            summary = {**res, "steps": int(steps)}
+            last_ck.update(step=step, summary=summary, active=clock()[1])
+            if on_checkpoint is not None:
+                on_checkpoint(summary)
+            return summary
+
         while step < steps:
             step += 1
             check_cancel()
@@ -628,15 +888,40 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
                     recent.pop(0)
             done = step
             if step % report_every == 0 or step == steps:
-                el = max(1e-6, time.time() - t0)
+                el = max(1e-6, time.time() - t0 - paused)
                 avg = sum(recent) / len(recent) if recent else float("nan")
-                progress(0.03 + 0.85 * step / steps,
-                         f"소형 AI 모델 학습 {step}/{steps} · loss {avg:.3f} · {step * B * T / el:,.0f} 토큰/초")
-            if max_seconds and time.time() - t_start > max_seconds and step < steps:
+                ran = max(1, step - start_step)
+                msg = (f"소형 AI 모델 학습 {step}/{steps} · loss {avg:.3f} · "
+                       f"{(step - start_step) * B * T / el:,.0f} 토큰/초")
+                if step < steps:
+                    msg += f" · 남은 시간 약 {_fmt_eta(el / ran * (steps - step))}"
+                progress(0.03 + 0.85 * step / steps, msg)
+            # (a) 예약된 중간 저장 (단계 / 시간 기준, 시간은 일시정지 제외)
+            if checkpoint_dir and ((ck_steps and step % ck_steps == 0)
+                                   or (ck_sec and clock()[1] - last_ck["active"] >= ck_sec)):
+                save()
+            # (b) 일시정지 지점: 안에서 블록되는 시간은 학습 시간에서 뺀다
+            if pause_point is not None:
+                pause_at = time.time()
+                try:
+                    pause_point(save)
+                finally:
+                    waited = time.time() - pause_at
+                    paused += waited
+                    pause_at = None
+                if waited >= 1.0:
+                    progress(0.03 + 0.85 * step / steps, f"소형 AI 모델 학습 {step}/{steps} · 다시 시작했습니다")
+            # (c) 지금까지 저장하고 끝내기
+            if stop_requested is not None and step < steps and stop_requested():
+                save()
+                stopped_early = True
+                notes.append(f"사용자가 {step}/{steps}단계에서 학습을 끝냈습니다.")
+                break
+            if max_seconds and prev_elapsed + (time.time() - t_start - paused) > max_seconds and step < steps:
                 stopped_early = True
                 notes.append(f"시간 제한({max_seconds:.0f}초)으로 {step}/{steps}단계에서 멈췄습니다.")
                 break
-        train_seconds = time.time() - t0
+        train_seconds = prev_train + (time.time() - t0 - paused)
         progress(0.88, "학습 후 평가 중")
         eval_after = evaluate()
         train_loss = sum(recent) / len(recent) if recent else float("nan")
@@ -684,12 +969,12 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
         "steps": int(done),
         "total_steps": int(parent_total + done),
         "parent": parent,
-        "parent_path": str(Path(resume_from).resolve()) if resume_from else None,
+        "parent_path": parent_path,
         "train_loss": _num(train_loss),
         "eval_loss_before": _num(eval_before),
         "eval_loss_after": eval_after_r,
         "perplexity_after": _num(math.exp(min(eval_after, 50.0)), 3) if math.isfinite(eval_after) else None,
-        "seconds": round(time.time() - t_start, 1),
+        "seconds": round(prev_elapsed + time.time() - t_start - paused, 1),
         "train_seconds": round(train_seconds, 1),
         "device": dev.type,
         "threads": n_threads,
@@ -710,6 +995,9 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
         "notes": notes,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+    if rs is not None:  # 체크포인트에서 이어서 한 경우만
+        info["resumed_from_step"] = int(start_step)
+        info["resumes"] = int(resumes)
     (out / "info.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     progress(1.0, f"완료 · 평가 loss {info['eval_loss_before']} → {eval_after_r}")
     return info

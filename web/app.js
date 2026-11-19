@@ -18,7 +18,10 @@ const KIND = {
   autolearn_train: "자율 학습(학습)", finalize_learning: "학습 종료·결과 내보내기", export: "외장 저장 내보내기",
   train_mobile: "소형 AI 학습", train_pc: "LoRA 학습",
 };
-const STATUS = { queued: "대기", running: "진행 중", done: "완료", failed: "실패", cancelled: "취소", blocked: "시간 밖 중지", interrupted: "중단" };
+const STATUS = { queued: "대기", running: "진행 중", paused: "일시정지", done: "완료", failed: "실패", cancelled: "취소", blocked: "시간 밖 중지", interrupted: "중단" };
+// 일시정지·중간 저장·이어서 재개를 쓰는 PC 학습 작업 (docs/SPEC-pause-resume.md)
+const CKPT_KINDS = ["train_tiny", "train_lora"];
+const PAUSED_HINT = "일시정지 중에도 서버와 저장장치는 연결되어 있어야 합니다. 저장장치를 빼려면 서버를 끄세요.";
 const PHASE = {
   idle: "대기", collecting: "수집 중", training: "학습 중", waiting_window: "허용 시간 기다리는 중",
   finishing: "학습 종료 중", cooldown: "다음 수집까지 쉬는 중",
@@ -44,6 +47,7 @@ const DEFAULTS = {
     targets: { tiny: true, lora: false, embeddings: true, qa: false }, collect_interval_min: 10, pages_per_cycle: 5,
     max_pages_per_hour: 60, train_min_new_chars: 20000, train_interval_min: 60, steps_per_cycle: 300, train_outside_window: false,
   },
+  training_checkpoint: { enabled: true, every_minutes: 10, every_steps: 0, dir: "" },
 };
 const SUPPORTED = [".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl", ".html", ".htm", ".xml", ".pdf", ".docx", ".srt", ".log"];
 const LORA_CUSTOM = "__custom";
@@ -86,6 +90,17 @@ function relTime(iso) {
   const a = Math.abs(min);
   const t = a < 60 ? `${a}분` : a < 1440 ? `${Math.round(a / 60)}시간` : `${Math.round(a / 1440)}일`;
   return min > 0 ? `${t} 후` : `${t} 전`;
+}
+// 지난 시각을 "3분 전"처럼 (1분 안이거나 시계가 어긋나 미래로 보이면 "방금")
+function ago(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const min = Math.floor((Date.now() - d) / 60000);
+  if (min < 1) return "방금";
+  if (min < 60) return `${min}분 전`;
+  const h = Math.floor(min / 60);
+  return h < 24 ? `${h}시간 전` : `${Math.floor(h / 24)}일 전`;
 }
 function fmtBytes(n) {
   n = Number(n);
@@ -152,6 +167,9 @@ const S = {
   status: null, device: null, myDevice: null, models: [], settings: null, auto: null, snapInfo: null, localModel: null,
   docsOffset: 0, notifSeen: num(store("lb_notif_seen")), notifInit: false, uploadQueue: [], uploading: false,
   formsBuilt: false, defaultsApplied: false, est: { tiny: 0, lora: 0, al: 0 }, lastResultKey: "", genAbort: null,
+  // 작업 탭: 요청 중인 작업 id, 서버가 아직 반영하지 않은 요청(일시정지/끝내기), 마지막으로 그린 HTML, 응답 순서
+  jobBusy: new Set(), jobPending: new Map(), jobsHtml: "", jobsSeq: 0, focusJob: null,
+  connLost: false, // 마지막 API 요청이 네트워크 오류였음 (서버 꺼짐·연결 끊김)
 };
 const SS = { q: "", engine: store("lb_engine") || "search", sources: [], mode: "hybrid", offset: 0, limit: 10, total: 0, seq: 0, askSeq: 0, local: false };
 if (!ENGINE_LABEL[SS.engine]) SS.engine = "search";
@@ -170,10 +188,12 @@ async function api(path, opts = {}) {
     r = await fetch(path, { method: opts.method || "GET", headers, body, signal: opts.signal, cache: "no-store" });
   } catch (e) {
     if (e && e.name === "AbortError") throw e;
+    setConnLost(true);
     const err = new Error("PC의 LearnBox에 연결할 수 없습니다.");
     err.network = true;
     throw err;
   }
+  setConnLost(false);
   if (r.status === 401 && !path.endsWith("/login")) { logout(true); throw new Error("다시 로그인하세요."); }
   if (opts.raw) {
     if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || "HTTP " + r.status); }
@@ -184,6 +204,15 @@ async function api(path, opts = {}) {
   return data;
 }
 const post = (p, body) => api(p, { method: "POST", body: body || {} });
+// 서버가 꺼졌거나(강제 종료·전원) 연결이 끊긴 동안: 상단 표시는 'PC 연결 안 됨', [작업] 탭에는 '마지막으로 받은 상태' 안내.
+// (주기 갱신은 오류를 조용히 넘기므로 이것이 없으면 꺼진 서버의 학습이 계속 '진행 중'으로 보인다)
+function setConnLost(lost) {
+  if (S.connLost === lost) return;
+  S.connLost = lost;
+  updateNet();
+  const b = $("#jobs-conn");
+  if (b) b.hidden = !lost;
+}
 
 // 인증이 필요한 다운로드: fetch(Bearer) -> blob -> object URL -> <a download>
 async function downloadAuth(path, filename, btn) {
@@ -333,8 +362,8 @@ $$("#tabs button").forEach((b) => b.addEventListener("click", () => switchTab(b.
 function updateNet() {
   const on = navigator.onLine;
   const n = $("#net");
-  n.textContent = !on ? "오프라인" : S.offline ? "PC 연결 안 됨" : "온라인";
-  n.classList.toggle("off", !on || S.offline);
+  n.textContent = !on ? "오프라인" : S.offline || S.connLost ? "PC 연결 안 됨" : "온라인";
+  n.classList.toggle("off", !on || S.offline || S.connLost);
 }
 window.addEventListener("online", async () => {
   updateNet();
@@ -376,6 +405,14 @@ function setBadge(n) {
 function isLearningEnd(n) {
   return n.level === "success" && ((n.data && n.data.kind === "learning_end") || /학습이 종료/.test(n.title || ""));
 }
+// 서버가 다시 켜졌을 때 '이어서 재개할 수 있는 학습'을 알리는 알림 → 누르면 [작업] 탭
+function isTrainInterrupted(n) { return !!(n && n.data && n.data.kind === "train_interrupted"); }
+function openJobs(jobId, notifId, unread) {
+  if (unread && notifId) post("/api/notifications/read", { ids: [notifId] }).then(() => pollNotifications()).catch(() => {});
+  toggleNotif(false);
+  S.focusJob = jobId || null;
+  switchTab("jobs");
+}
 async function pollNotifications() {
   if (!S.token || S.offline) return;
   let r;
@@ -395,6 +432,7 @@ async function pollNotifications() {
   S.notifSeen = Math.max(S.notifSeen, maxId);
   store("lb_notif_seen", S.notifSeen);
   const end = fresh.filter(isLearningEnd).pop();
+  const intr = fresh.filter(isTrainInterrupted).pop();
   if (end) {
     toast(`${end.title}\n${String(end.body || "").split("\n").slice(-1)[0]}`, {
       ms: 12000, action: { label: "결과 보기", fn: () => openResult(end.data && end.data.result) },
@@ -402,6 +440,12 @@ async function pollNotifications() {
     browserNotify(end.title, end.body || "", "learnbox-" + end.id);
     S.lastResultKey = "";
     if (S.tab === "train") loadTrain(false);
+  } else if (intr) {
+    toast(`${intr.title}\n${intr.body || ""}`, {
+      ms: 12000, action: { label: "작업 보기", fn: () => openJobs(num(intr.data.job_id), num(intr.id), !intr.read) },
+    });
+    browserNotify(intr.title, intr.body || "", "learnbox-" + intr.id);
+    if (S.tab === "jobs") loadJobs();
   } else {
     const last = fresh[fresh.length - 1];
     toast(last.title + (fresh.length > 1 ? ` (외 ${fresh.length - 1}건)` : ""), last.level === "error" || last.level === "warning" ? 7000 : 4000);
@@ -438,8 +482,12 @@ async function loadNotifPanel() {
   try {
     const r = await api("/api/notifications?limit=30");
     setBadge(r.unread || 0);
-    ul.innerHTML = (r.notifications || []).map((n) => `
-      <li class="${n.read ? "" : "unread"}">
+    ul.innerHTML = (r.notifications || []).map((n) => {
+      // 학습 중단 알림은 항목 어디를 눌러도 [작업] 탭으로 (키보드는 안의 버튼으로)
+      const ti = isTrainInterrupted(n);
+      const jobAttrs = ti ? ` data-act="notif-jobs" data-id="${num(n.id)}" data-job="${num(n.data.job_id)}" data-unread="${n.read ? 0 : 1}"` : "";
+      return `
+      <li class="${n.read ? "" : "unread"}${ti ? " clickable" : ""}"${jobAttrs}>
         <span class="lv ${cls(n.level)}" aria-hidden="true"></span>
         <div class="grow">
           <div class="t">${esc(n.title)}</div>
@@ -448,9 +496,11 @@ async function loadNotifPanel() {
           <div class="row wrap gap">
             ${n.read ? "" : `<button type="button" class="ghost small" data-act="notif-read" data-id="${num(n.id)}">읽음</button>`}
             ${n.data && n.data.result ? `<button type="button" class="secondary small" data-act="notif-result" data-name="${esc(n.data.result)}">결과 보기</button>` : ""}
+            ${ti ? `<button type="button" class="secondary small"${jobAttrs}>작업 탭에서 보기</button>` : ""}
           </div>
         </div>
-      </li>`).join("") || '<li class="muted small">알림이 없습니다.</li>';
+      </li>`;
+    }).join("") || '<li class="muted small">알림이 없습니다.</li>';
   } catch (e) { ul.innerHTML = `<li class="error small">${esc(e.message)}</li>`; }
 }
 function toggleNotif(open) {
@@ -1226,6 +1276,32 @@ function initTrainForms() {
     onLoraBaseChange(true);
   }
   if (S.settings && !S.defaultsApplied) applySettingsDefaults(S.settings);
+  renderCkptNotes();
+}
+// 소형 AI / LoRA 카드의 '중간 저장' 한 줄 (관리 > 설정 > 학습 중간 저장 값을 그대로 보여 준다)
+function ckptSettings() {
+  return { ...DEFAULTS.training_checkpoint, ...((S.settings && S.settings.training_checkpoint) || {}) };
+}
+function ckptNoteText(c) {
+  if (!c.enabled) return { off: true, text: "중간 저장이 꺼져 있습니다. 학습이 끊기면 처음부터 다시 해야 합니다. [관리] 탭 설정에서 켤 수 있습니다." };
+  const m = num(c.every_minutes), s = num(c.every_steps);
+  const every = m > 0 && s > 0 ? `${m}분 또는 ${fmtNum(s)}단계마다` : m > 0 ? `${m}분마다` : s > 0 ? `${fmtNum(s)}단계마다` : "";
+  return {
+    off: false,
+    text: every ? `학습 중 ${every} 중간 저장합니다. 끊겨도 [작업] 탭에서 이어서 재개할 수 있습니다.`
+      : "주기 저장은 꺼져 있고, 일시정지하거나 '지금까지 저장하고 끝내기'를 누를 때만 중간 저장합니다.",
+  };
+}
+function renderCkptNotes() {
+  const known = !!(S.settings && typeof S.settings === "object");
+  const n = ckptNoteText(ckptSettings());
+  for (const id of ["#tiny-ckpt", "#lora-ckpt"]) {
+    const el = $(id);
+    if (!el) continue;
+    el.hidden = !known; // 설정을 읽기 전에는 틀릴 수 있는 문구를 보이지 않는다
+    el.classList.toggle("off", n.off);
+    $(".ckpt-text", el).textContent = n.text;
+  }
 }
 function applyAutolearnDefaults(a) {
   const t = a.targets || {};
@@ -2097,7 +2173,7 @@ function infoList(m) {
     ["Q&A 예시", i.qa_examples ? fmtNum(i.qa_examples) : null],
   ];
   rows.push(
-    ["학습 단계", i.steps != null ? `${fmtNum(i.steps)}${i.total_steps && i.total_steps !== i.steps ? ` (누적 ${fmtNum(i.total_steps)})` : ""}` : null],
+    ["학습 단계", i.steps != null ? `${fmtNum(i.steps)}${i.total_steps && i.total_steps !== i.steps ? ` (누적 ${fmtNum(i.total_steps)})` : ""}${i.stopped_early ? " · 일찍 끝냄" : ""}` : null],
     ["이어 학습한 모델", parent],
     ["평가 손실 (전 → 후)", i.eval_loss_before != null || i.eval_loss_after != null ? `${fmtLoss(i.eval_loss_before)} → ${fmtLoss(i.eval_loss_after)}` : null],
     ["퍼플렉시티", i.perplexity_after != null ? fmtLoss(i.perplexity_after) : null],
@@ -2108,6 +2184,11 @@ function infoList(m) {
   );
   return '<dl class="kv">' + rows.filter((r) => r[1] != null && r[1] !== "").map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("") + "</dl>";
 }
+// 학습 메모 (info.notes): 사용자가 몇 단계에서 끝냈는지, 배치를 줄였는지, 체크포인트에서 이어서 했는지 등
+function modelNotesHtml(i) {
+  const notes = (Array.isArray(i.notes) ? i.notes : []).filter((n) => typeof n === "string" && n.trim());
+  return notes.length ? `<ul class="model-notes small muted" aria-label="학습 메모">${notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>` : "";
+}
 function modelCardHtml(m) {
   const kind = modelKind(m), i = m.info || {}, id = num(m.id);
   const files = modelFiles(m);
@@ -2116,6 +2197,7 @@ function modelCardHtml(m) {
     <div class="row wrap gap"><h3 class="grow">${esc(m.name)}</h3><span class="badge kind-${kind}">${kind === "tiny" ? "소형 AI" : "LoRA"}</span>${i.trained_on === "device" ? '<span class="badge origin-auto">📱 기기에서 학습</span>' : ""}</div>
     <p class="muted small">#${id} · ${esc(fmtTime(m.created_at))}</p>
     ${infoList(m)}
+    ${modelNotesHtml(i)}
     ${i.onnx_error ? `<p class="error small">ONNX 변환 오류: ${esc(i.onnx_error)}</p>` : ""}
     ${fl.length ? `<details><summary>파일 ${fl.length}개</summary><ul class="files">${fl.map((n) => `<li><span class="grow">${esc(n)}</span><span class="size">${fmtBytes(files[n])}</span></li>`).join("")}</ul></details>` : ""}`;
   if (kind === "tiny") {
@@ -2263,12 +2345,23 @@ function jobSummary(j) {
     const parts = Object.keys(ev).map((t) => `${TARGET_LABEL[t] || t} ${fmtLoss(ev[t] && ev[t].before)} → ${fmtLoss(ev[t] && ev[t].after)}`);
     return parts.length ? "평가 손실: " + parts.join(" · ") : r.models ? `모델 ${r.models.length}개` : "";
   }
-  if (k.startsWith("train")) return r.eval_loss_after != null ? `평가 손실 ${fmtLoss(r.eval_loss_before)} → ${fmtLoss(r.eval_loss_after)}` : "";
+  if (k.startsWith("train")) {
+    const parts = [];
+    if (r.eval_loss_after != null) parts.push(`평가 손실 ${fmtLoss(r.eval_loss_before)} → ${fmtLoss(r.eval_loss_after)}`);
+    if (r.stopped_early) parts.push("사용자가 일찍 끝냄");
+    if (r.resumed_from_step != null) parts.push(`${num(r.resumed_from_step)}단계부터 이어서 학습${num(r.resumes) > 1 ? ` (재개 ${num(r.resumes)}회)` : ""}`);
+    return parts.join(" · ");
+  }
   if (k === "export") return r.path ? `${r.path} (${r.files}개 파일, ${fmtBytes(r.bytes)})` : "";
   return "";
 }
 function jobParams(j) {
   const p = j.params || {};
+  const from = p.resumed_from_job ? `작업 #${num(p.resumed_from_job)}의 중간 저장에서 이어서` : "";
+  if (from && CKPT_KINDS.includes(j.kind)) return [jobParamsBase(j, p), from].filter(Boolean).join(" · ");
+  return jobParamsBase(j, p);
+}
+function jobParamsBase(j, p) {
   if (j.kind === "collect_search" && p.query) return "검색어: " + p.query;
   if (j.kind === "collect_links" && p.urls) return p.urls[0] + (p.urls.length > 1 ? ` 외 ${p.urls.length - 1}개` : "");
   if (j.kind === "ingest_path" && p.path) return p.path;
@@ -2277,27 +2370,132 @@ function jobParams(j) {
   if (j.kind === "export" && p.target) return p.target;
   return "";
 }
+// 체크포인트 요약 {path, step, steps, saved_at, bytes}: 서버가 디스크에서 확인해 붙인 j.checkpoint (null이면 없음),
+// 서버가 그 키를 주지 않았을 때만 result.checkpoint (저장장치가 빠졌거나 지운 뒤의 오래된 값을 보여 주지 않게)
+function jobCkpt(j) {
+  const r = j.result && typeof j.result === "object" ? j.result : {};
+  const c = "checkpoint" in j ? j.checkpoint : r.checkpoint;
+  return c && typeof c === "object" && c.step != null ? c : null;
+}
+function ckptSteps(c) { return num(c.steps) > 0 ? `${num(c.step)}/${num(c.steps)}단계` : `${num(c.step)}단계`; }
+// 서버가 can_* 불리언을 주면 그대로 따르고, 없을 때만 상태로 짐작한다
+function jobFlag(j, name, guess) { return typeof j[name] === "boolean" ? j[name] : !!guess; }
+function jobActionsHtml(j, ck) {
+  const id = num(j.id), st = j.status;
+  const admin = S.role === "admin";
+  const train = CKPT_KINDS.includes(j.kind);
+  const active = st === "running" || st === "queued" || st === "paused";
+  const r = j.result && typeof j.result === "object" ? j.result : {};
+  const busy = S.jobBusy.has(id);
+  const pend = S.jobPending.get(id);
+  const out = [];
+  const btn = (op, label, klass, off) => `<button type="button" class="${klass ? klass + " " : ""}small" data-act="job-op" data-op="${op}" data-id="${id}" data-status="${cls(st)}"${train ? ' data-train="1"' : ""}
+    aria-label="${esc(`작업 #${id} ${label}`)}"${busy || off ? " disabled" : ""}${busy ? ' aria-busy="true"' : ""}>${esc(label)}</button>`;
+  if (admin && train) {
+    const finishing = !!(pend && pend.op === "finish");
+    if (jobFlag(j, "can_resume", st === "paused")) out.push(btn("resume", "재개", "", finishing));
+    if (jobFlag(j, "can_pause", st === "running")) out.push(btn("pause", "일시정지", "secondary", !!pend));
+    if (jobFlag(j, "can_finish", st === "running" || st === "paused")) out.push(btn("finish", "지금까지 저장하고 끝내기", "secondary", finishing));
+  }
+  if (active && (admin || String(j.kind).startsWith("collect"))) out.push(btn("cancel", "취소", "danger"));
+  if (admin && train && !active) {
+    if (jobFlag(j, "can_restart", ck && (st === "interrupted" || st === "failed") && !r.resumed_by)) {
+      out.push(btn("restart", ck ? `이어서 재개 (${ckptSteps(ck)}부터)` : "이어서 재개", ""));
+    }
+    if (ck && !r.resumed_by) out.push(btn("discard", "체크포인트 삭제", "danger"));
+  }
+  return out.length ? `<div class="row wrap gap job-actions">${out.join("")}</div>` : "";
+}
+function jobCardHtml(j) {
+  const id = num(j.id), st = j.status;
+  const active = st === "running" || st === "queued" || st === "paused";
+  const r = j.result && typeof j.result === "object" ? j.result : {};
+  // 이어서 재개한 작업은 체크포인트를 새 작업에 넘겼으므로 여기서는 보이지 않는다 (같은 폴더를 새 작업이 쓴다)
+  const ck = r.resumed_by ? null : jobCkpt(j);
+  // 서버가 상태를 바꿨으면 '요청함' 표시는 지운다
+  const pend = S.jobPending.get(id);
+  if (pend && pend.status !== st) S.jobPending.delete(id);
+  const pending = S.jobPending.get(id);
+  const errs = Array.isArray(r.errors) && r.errors.length ? `<details><summary>오류 ${r.errors.length}건</summary><pre>${esc(r.errors.map((x) => typeof x === "string" ? x : JSON.stringify(x)).join("\n"))}</pre></details>` : "";
+  const tb = r.traceback ? `<details><summary>자세한 오류</summary><pre>${esc(r.traceback)}</pre></details>` : "";
+  const params = jobParams(j);
+  const ckLine = ck ? `<div class="small ckpt-line" title="${esc([fmtTime(ck.saved_at), ck.path].filter(Boolean).join(" · "))}">
+      <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M5 4h11l3 3v13H5z"/><path d="M8 4v5h7V4"/><path d="M8 20v-6h8v6"/></svg>
+      <span>마지막 저장: ${esc(ago(ck.saved_at) || fmtTime(ck.saved_at) || "-")} · ${esc(ckptSteps(ck))}${num(ck.bytes) > 0 ? ` · ${esc(fmtBytes(ck.bytes))}` : ""}</span></div>` : "";
+  let hint = "";
+  if (st === "paused") {
+    hint = `<div class="banner warn small job-hint">${esc(PAUSED_HINT)} ${ck
+      ? "다시 켠 뒤 [작업] 탭에서 '이어서 재개'로 마지막 저장 지점부터 계속할 수 있습니다."
+      : "중간 저장이 없어 서버를 끄면 처음부터 다시 해야 합니다."}</div>`;
+  }
+  const pendNote = pending ? `<div class="small muted pending-note"><span class="spinner" aria-hidden="true"></span>${esc(pending.op === "pause"
+    ? "일시정지 요청함 · 지금 단계를 마치고 저장한 뒤 멈춥니다…" : "끝내기 요청함 · 지금까지 저장하고 평가하는 중…")}</div>` : "";
+  const handed = r.resumed_by ? `<div class="small muted">이어받은 작업: #${num(r.resumed_by)}</div>` : "";
+  return `<div class="card job job-${cls(st)}" id="job-${id}">
+    <div class="row wrap gap"><b>#${id} ${esc(KIND[j.kind] || j.kind)}</b> <span class="status ${cls(st)}">${esc(STATUS[st] || st)}</span>
+      <span class="muted small">${esc(j.actor === "autolearn" ? "자율 학습" : j.actor || "")} · ${esc(fmtTime(j.created_at))}</span></div>
+    ${params ? `<div class="small muted">${esc(params)}</div>` : ""}
+    ${active ? `<div class="bar" role="progressbar" aria-label="${esc(`작업 #${id} 진행률`)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(num(j.progress) * 100)}"><div style="width:${Math.round(Math.max(0, Math.min(1, num(j.progress))) * 100)}%"></div></div>` : ""}
+    <div class="small">${esc(j.message || "")}</div>
+    ${pendNote}${ckLine}${hint}${handed}
+    <div class="small muted">${esc(jobSummary(j))}</div>${errs}${tb}
+    ${jobActionsHtml(j, ck)}
+  </div>`;
+}
 async function loadJobs() {
+  const seq = ++S.jobsSeq;
+  let jobs;
+  try { ({ jobs } = await api("/api/jobs")); } catch (e) { return; }
+  if (seq !== S.jobsSeq) return; // 더 늦게 보낸 요청의 결과가 이미 그려졌다
+  const html = (jobs || []).map(jobCardHtml).join("") || '<div class="card muted">작업이 없습니다.</div>';
+  // 바뀐 것이 없으면 다시 그리지 않는다 (펼친 오류, 포커스 유지)
+  if (html !== S.jobsHtml) { $("#jobs").innerHTML = html; S.jobsHtml = html; }
+  if (S.focusJob) {
+    const c = $("#job-" + num(S.focusJob));
+    S.focusJob = null;
+    if (c) {
+      c.scrollIntoView({ behavior: "smooth", block: "center" });
+      c.classList.remove("flash"); void c.offsetWidth; c.classList.add("flash");
+      S.jobsHtml = ""; // flash 클래스가 붙었으니 다음 갱신 때 새로 그린다
+    }
+  }
+}
+// 작업 버튼: 경로, 성공 안내, (필요하면) 확인 문구
+const JOB_OPS = {
+  pause: { path: "pause", ok: "일시정지를 요청했습니다. 지금 단계를 마치고 저장한 뒤 멈춥니다.", pend: true },
+  resume: { path: "resume", ok: "학습을 재개했습니다." },
+  finish: { path: "finish", ok: "지금까지 저장하고 끝내도록 요청했습니다. 평가와 저장을 마치면 모델 목록에 등록됩니다.", pend: true },
+  cancel: {
+    path: "cancel", ok: "취소를 요청했습니다.",
+    confirm: (el) => el.dataset.train ? "이 학습 작업을 취소할까요?\n취소하면 중간 저장(체크포인트)도 지워져 이어서 할 수 없습니다. 지금까지 학습한 것을 모델로 남기려면 '지금까지 저장하고 끝내기'를 누르세요." : "",
+  },
+  restart: { path: "restart", ok: (r) => `마지막 저장 지점부터 이어서 학습을 시작했습니다 (작업 #${num(r.job_id)}).` },
+  discard: {
+    path: "discard-checkpoint", ok: "체크포인트를 삭제했습니다.",
+    confirm: () => "이 작업의 체크포인트(중간 저장)를 삭제할까요?\n삭제하면 이 작업을 이어서 재개할 수 없습니다.",
+  },
+};
+async function jobAction(el) {
+  const id = Number(el.dataset.id), op = JOB_OPS[el.dataset.op];
+  if (!op || !Number.isFinite(id) || S.jobBusy.has(id)) return;
+  const q = op.confirm ? op.confirm(el) : "";
+  if (q && !confirm(q)) return;
+  const status = el.dataset.status || "";
+  S.jobBusy.add(id);
+  S.jobsHtml = "";
+  $$(`#job-${id} [data-act="job-op"]`).forEach((b) => { b.disabled = true; b.setAttribute("aria-busy", "true"); });
   try {
-    const { jobs } = await api("/api/jobs");
-    $("#jobs").innerHTML = (jobs || []).map((j) => {
-      const active = j.status === "running" || j.status === "queued";
-      const canCancel = active && (S.role === "admin" || String(j.kind).startsWith("collect"));
-      const r = j.result || {};
-      const errs = Array.isArray(r.errors) && r.errors.length ? `<details><summary>오류 ${r.errors.length}건</summary><pre>${esc(r.errors.map((x) => typeof x === "string" ? x : JSON.stringify(x)).join("\n"))}</pre></details>` : "";
-      const tb = r.traceback ? `<details><summary>자세한 오류</summary><pre>${esc(r.traceback)}</pre></details>` : "";
-      const params = jobParams(j);
-      return `<div class="card job">
-        <div class="row wrap gap"><b>#${num(j.id)} ${esc(KIND[j.kind] || j.kind)}</b> <span class="status ${cls(j.status)}">${esc(STATUS[j.status] || j.status)}</span>
-          <span class="muted small">${esc(j.actor === "autolearn" ? "자율 학습" : j.actor || "")} · ${esc(fmtTime(j.created_at))}</span>
-          ${canCancel ? `<button type="button" class="danger small" data-act="cancel-job" data-id="${num(j.id)}">취소</button>` : ""}</div>
-        ${params ? `<div class="small muted">${esc(params)}</div>` : ""}
-        ${active ? `<div class="bar"><div style="width:${Math.round(num(j.progress) * 100)}%"></div></div>` : ""}
-        <div class="small">${esc(j.message || "")}</div>
-        <div class="small muted">${esc(jobSummary(j))}</div>${errs}${tb}
-      </div>`;
-    }).join("") || '<div class="card muted">작업이 없습니다.</div>';
-  } catch (e) { /* 무시 */ }
+    const r = await post(`/api/jobs/${id}/${op.path}`);
+    if (op.pend) S.jobPending.set(id, { op: el.dataset.op, status });
+    toast(typeof op.ok === "function" ? op.ok(r || {}) : op.ok, 6000);
+  } catch (e) {
+    toast(e.message || "요청을 처리하지 못했습니다.", 8000);
+  } finally {
+    S.jobBusy.delete(id);
+    S.jobsHtml = "";
+    await loadJobs();
+    $$(`#job-${id} [data-act="job-op"][aria-busy]`).forEach((b) => { b.disabled = false; b.removeAttribute("aria-busy"); });
+  }
 }
 
 // ---------------- 관리 ----------------
@@ -2350,6 +2548,12 @@ async function loadAdmin() {
     setVal("#s-al-maxhour", al.max_pages_per_hour);
     const fm = al.formats || [];
     $$(".al-fmt").forEach((c) => (c.checked = fm.includes(c.value)));
+    const tc = { ...DEFAULTS.training_checkpoint, ...(s.training_checkpoint || {}) };
+    $("#s-ck-enabled").checked = tc.enabled !== false;
+    setVal("#s-ck-minutes", tc.every_minutes);
+    setVal("#s-ck-steps", tc.every_steps);
+    $("#s-ck-dir").value = tc.dir || "";
+    syncCkptFields();
     $("#audit").innerHTML = (a.audit || []).map((x) => `<li><span class="grow">${esc(fmtTime(x.ts))} · <b>${esc(x.action)}</b> · ${esc(x.actor)}<br><span class="muted">${esc(x.detail)}</span></span></li>`).join("") || '<li class="muted">기록이 없습니다.</li>';
   } catch (e) { toast(e.message); }
   const st = S.status || await refreshStatus();
@@ -2357,6 +2561,21 @@ async function loadAdmin() {
   $("#online-status").textContent = o ? (o.available ? `지금 사용 가능 (키: ${{ settings: "설정", env: "환경변수", profile: "로그인 프로필" }[o.key_source] || "확인됨"}).` : `지금은 쓸 수 없음: ${o.reason || ""}`) : "";
 }
 $("#add-window").addEventListener("click", () => $("#windows").appendChild(windowRow({ days: [0, 1, 2, 3, 4, 5, 6], start: "01:00", end: "06:00" })));
+// 중간 저장을 끄면 간격·위치 입력을 잠근다 (값은 그대로 저장되어 다시 켜면 쓰인다)
+function syncCkptFields() {
+  const on = $("#s-ck-enabled").checked;
+  $$("#s-ck-fields input").forEach((i) => (i.disabled = !on));
+  $("#s-ck-fields").classList.toggle("off", !on);
+}
+$("#s-ck-enabled").addEventListener("change", syncCkptFields);
+// 설정 화면의 '학습 중간 저장' 값을 읽는다. 잘못된 값이면 { error }
+function readCkptSettings() {
+  const n = (sel) => { const v = $(sel).value.trim(); return v === "" ? 0 : Number(v); };
+  const mins = n("#s-ck-minutes"), steps = n("#s-ck-steps");
+  if (!Number.isFinite(mins) || mins < 0) return { error: "중간 저장 간격(분)은 0 이상의 숫자로 입력하세요." };
+  if (!Number.isInteger(steps) || steps < 0) return { error: "중간 저장 단계 간격은 0 이상의 정수로 입력하세요." };
+  return { value: { enabled: $("#s-ck-enabled").checked, every_minutes: mins, every_steps: steps, dir: $("#s-ck-dir").value.trim() } };
+}
 $("#save-settings").addEventListener("click", async () => {
   const lines = (s) => s.split("\n").map((x) => x.trim()).filter(Boolean);
   const windows = $$("#windows .window-row").map((r) => {
@@ -2365,6 +2584,8 @@ $("#save-settings").addEventListener("click", async () => {
   }).filter((w) => w.days.length && w.start && w.end);
   const formats = $$(".al-fmt:checked").map((c) => c.value);
   if (!formats.length) { $("#settings-msg").textContent = "결과 문서 형식을 하나 이상 고르세요."; return; }
+  const ckpt = readCkptSettings();
+  if (ckpt.error) { $("#settings-msg").textContent = ckpt.error; return; }
   const body = {
     allowed_windows: windows, timezone: $("#s-tz").value.trim(),
     allowed_domains: lines($("#s-allowed").value), blocked_domains: lines($("#s-blocked").value),
@@ -2377,6 +2598,7 @@ $("#save-settings").addEventListener("click", async () => {
     embeddings: { enabled: $("#s-emb-enabled").checked, model: $("#s-emb-model").value.trim() },
     autolearn: { results_export_target: $("#s-al-target").value.trim(), train_outside_window: $("#s-al-outside").checked,
       max_pages_per_hour: Number($("#s-al-maxhour").value) || 1, formats },
+    training_checkpoint: ckpt.value,
   };
   try {
     await post("/api/settings", body);
@@ -2411,7 +2633,7 @@ const ACTIONS = {
     await api("/api/documents/" + Number(el.dataset.id), { method: "DELETE" }).catch((x) => toast(x.message));
     loadDocs(false);
   },
-  "cancel-job": async (el) => { await post(`/api/jobs/${Number(el.dataset.id)}/cancel`).catch((x) => toast(x.message)); loadJobs(); },
+  "job-op": (el) => jobAction(el),
   "get-model": (el) => downloadModelToDevice(Number(el.dataset.id), el),
   "ask-with": (el) => {
     SS.engine = "lora"; store("lb_engine", "lora");
@@ -2425,6 +2647,7 @@ const ACTIONS = {
   "dl-file": (el) => downloadAuth(resultPath(el.dataset.name, el.dataset.path), el.dataset.path.split("/").pop() || "file", el),
   "notif-read": async (el) => { await post("/api/notifications/read", { ids: [Number(el.dataset.id)] }).catch((x) => toast(x.message)); loadNotifPanel(); },
   "notif-result": (el) => openResult(el.dataset.name),
+  "notif-jobs": (el) => openJobs(Number(el.dataset.job), Number(el.dataset.id), el.dataset.unread === "1"),
 };
 document.addEventListener("click", (e) => {
   const el = e.target.closest("[data-act]");

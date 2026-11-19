@@ -587,23 +587,203 @@ def _fmt_eta(sec: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 학습 중간 저장(체크포인트) — 폴더 구조·원자적 교체는 learnbox/checkpoint.py
+# state_dir/adapter/ (PEFT save_pretrained) + state_dir/trainer.pt + checkpoint.json(meta)
+# ---------------------------------------------------------------------------
+CKPT_KIND = "lora"
+_CKPT_ADAPTER = "adapter"
+_CKPT_TRAINER = "trainer.pt"
+
+# (train_lora 인자 이름, meta 키) — 재개할 때 체크포인트 값이 우선한다 (다르면 notes에 한 줄)
+_CKPT_OVERRIDES = (
+    ("base_model", "base_model"), ("max_steps", "steps"), ("lr", "lr"), ("seq_len", "seq_len"),
+    ("batch_size", "batch_size"), ("grad_accum", "grad_accum"), ("lora_r", "lora_r"), ("lora_alpha", "lora_alpha"),
+    ("qa_path", "qa_path"), ("train_path", "train_path"), ("eval_path", "eval_path"), ("seed", "seed"),
+    ("dtype", "dtype"), ("max_train_tokens", "max_train_tokens"), ("gradient_checkpointing", "gradient_checkpointing"),
+)
+
+
+def _abs_file(path) -> str | None:
+    """있는 파일이면 절대 경로 문자열, 아니면 None (체크포인트 meta 기록용)."""
+    if not path:
+        return None
+    p = Path(path).expanduser()
+    return str(p.resolve()) if p.is_file() else None
+
+
+def _ckpt_same(arg: str, given, stored) -> bool:
+    if arg in ("qa_path", "train_path", "eval_path"):
+        if not stored:
+            return False
+        try:
+            return Path(given).expanduser().resolve() == Path(stored).expanduser().resolve()
+        except (OSError, RuntimeError, TypeError):
+            return str(given) == str(stored)
+    if arg == "base_model":
+        return bool(stored) and _same_model(str(given), str(stored))
+    if arg == "dtype":
+        return _DTYPE_NAMES.get(str(given).lower()) == stored
+    if arg == "gradient_checkpointing":
+        return bool(given) == bool(stored)
+    try:
+        return math.isclose(float(given), float(stored), rel_tol=1e-9, abs_tol=0.0)
+    except (TypeError, ValueError):
+        return str(given) == str(stored)
+
+
+def _ckpt_ignored_note(given: dict, meta: dict) -> str | None:
+    """호출자가 넘긴 값 중 체크포인트 값과 다른 것들을 한 줄로 (넘기지 않은 값·auto는 비교하지 않음)."""
+    diffs = []
+    for arg, key in _CKPT_OVERRIDES:
+        g = given.get(arg)
+        if g is None or g == "" or (arg == "dtype" and str(g).lower() == "auto"):
+            continue
+        s = meta.get(key)
+        if not _ckpt_same(arg, g, s):
+            diffs.append(f"{arg} {g}→{s}")
+    if not diffs:
+        return None
+    return "체크포인트에 기록된 설정으로 이어서 학습합니다(넘겨받은 값 무시: " + ", ".join(diffs) + ")."
+
+
+def _read_trainer_state(torch, state_dir: Path) -> dict:
+    """체크포인트 폴더의 어댑터 파일 확인 + trainer.pt 읽기 (CPU로). 문제가 있으면 예외."""
+    adir = state_dir / _CKPT_ADAPTER
+    if not (adir / "adapter_config.json").is_file():
+        raise FileNotFoundError(f"{adir / 'adapter_config.json'} 없음")
+    if not any((adir / f).is_file() for f in ("adapter_model.safetensors", "adapter_model.bin")):
+        raise FileNotFoundError(f"{adir / 'adapter_model.safetensors'} 없음")
+    tr = torch.load(state_dir / _CKPT_TRAINER, map_location="cpu", weights_only=True)
+    if not isinstance(tr, dict) or not isinstance(tr.get("opt"), dict) or tr.get("py_rng") is None:
+        raise ValueError(f"{_CKPT_TRAINER} 내용이 올바르지 않음")
+    return tr
+
+
+def _open_lora_checkpoint(root) -> tuple[dict, Path, dict]:
+    """resume_checkpoint 열기 → (meta, state_dir, trainer 상태). current가 깨졌으면 prev를 쓴다. 실패는 한국어 ValueError."""
+    import torch
+
+    from . import checkpoint as ckpt
+
+    root = Path(root).expanduser()
+    got = ckpt.load(root)
+    if not got:
+        raise ValueError(f"이어서 할 체크포인트를 찾을 수 없거나 손상되었습니다: {root}")
+    meta, d = got
+    if meta.get("kind") != CKPT_KIND:
+        raise ValueError(f"LoRA 학습 체크포인트가 아닙니다(종류: {meta.get('kind') or '알 수 없음'}). "
+                         f"이어서 할 수 없습니다: {root}")
+    cands = [(meta, d)]
+    prev = root / "prev"
+    if d.name == "current" and prev.is_dir():
+        pm = ckpt._read_meta(prev)
+        if pm is not None and pm.get("kind") == CKPT_KIND:
+            cands.append((pm, prev))
+    err: Exception | None = None
+    for m, sd in cands:
+        try:
+            return m, sd, _read_trainer_state(torch, sd)
+        except Exception as e:  # 파일 일부가 없거나 깨짐 → 다음 후보(prev)
+            err = e
+    raise ValueError(f"체크포인트 파일이 손상되어 이어서 할 수 없습니다: {root} ({err})") from err
+
+
+def _set_py_rng(rnd: random.Random, state) -> None:
+    """torch.save/load를 거친 random.getstate() 값을 되돌린다 (리스트로 바뀌었어도 튜플로)."""
+    version, internal, gauss = state
+    rnd.setstate((int(version), tuple(int(v) for v in internal), gauss))
+
+
+def _restore_torch_rng(torch, tr: dict, dev: str) -> None:
+    rng = tr.get("torch_rng")
+    if rng is not None:
+        torch.set_rng_state(rng.to("cpu", dtype=torch.uint8) if hasattr(rng, "to") else rng)
+    cuda_rng = tr.get("cuda_rng")
+    if cuda_rng and dev == "cuda" and torch.cuda.is_available():
+        try:
+            states = [s.to("cpu", dtype=torch.uint8) for s in cuda_rng]
+            if len(states) == torch.cuda.device_count():
+                torch.cuda.set_rng_state_all(states)
+            else:  # GPU 개수가 바뀜: 첫 GPU만 맞춘다
+                torch.cuda.set_rng_state(states[0])
+        except (RuntimeError, IndexError):
+            pass
+
+
+def _optimizer_to_params(torch, opt) -> None:
+    """옵티마이저 상태 텐서를 각 파라미터의 장치로 (GPU에서 저장 → CPU에서 재개 등). step은 그대로 둔다."""
+    for p, st in opt.state.items():
+        for k, v in list(st.items()):
+            if k != "step" and torch.is_tensor(v) and v.device != p.device:
+                st[k] = v.to(p.device)
+
+
+# ---------------------------------------------------------------------------
 # 학습
 # ---------------------------------------------------------------------------
 def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-4, seq_len=512, batch_size=2,
                grad_accum=4, lora_r=8, lora_alpha=16, qa_path: str | None = None, resume_from: str | None = None,
                threads: int | None = None, progress=_noop_progress, check_cancel=_noop, *,
                device: str | None = None, dtype: str | None = "auto", gradient_checkpointing: bool | None = None,
-               max_train_tokens: int | None = None, seed: int = 0, **ignored) -> dict:
+               max_train_tokens: int | None = None, seed: int = 0,
+               checkpoint_dir: str | None = None, checkpoint_every_steps: int = 0,
+               checkpoint_every_sec: float = 600.0, resume_checkpoint: str | None = None,
+               pause_point=None, stop_requested=None, on_checkpoint=None, **ignored) -> dict:
     """공개 소형 언어모델에 LoRA 추가 학습. out_dir에 어댑터 + 토크나이저 + info.json 저장.
 
-    resume_from: 기존 어댑터 폴더에서 이어 학습 (기반 모델이 같아야 함, r/alpha는 기존 어댑터 값 유지).
+    resume_from: 기존 어댑터 폴더에서 새 학습을 시작 (기반 모델이 같아야 함, r/alpha는 기존 어댑터 값 유지).
     추가 키워드: device("cuda"/"mps"/"cpu"), dtype("auto"/"float32"/"bfloat16"/"float16"),
     gradient_checkpointing(None=메모리 보고 자동), max_train_tokens(토큰화 상한), seed.
     알 수 없는 키워드(use_qa 등)는 무시하고 info["ignored_params"]에 기록한다.
+
+    중간 저장·일시정지(docs/SPEC-pause-resume.md §1):
+      checkpoint_dir: 체크포인트 root (None이면 저장 안 함). checkpoint_every_steps / checkpoint_every_sec: 저장 간격.
+      resume_checkpoint: 이전 실행이 남긴 체크포인트 root → 그 단계 다음부터 이어서 (기록된 설정이 우선,
+        resume_from보다 우선). pause_point(save): 매 단계 옵티마이저 스텝 뒤 호출(일시정지 동안 블록).
+      stop_requested(): True면 지금까지 저장하고 끝내기. on_checkpoint(summary): 체크포인트를 쓸 때마다.
+      학습 함수는 체크포인트를 지우지 않는다(작업 계층의 몫).
     """
     import torch
 
+    from . import checkpoint as ckpt
     from .dataset import load_texts
+
+    # --- 체크포인트에서 이어서 하기: 기록된 설정이 우선 ---
+    ck_meta: dict | None = None
+    ck_dir: Path | None = None
+    ck_tr: dict | None = None
+    pre_notes: list[str] = []
+    if resume_checkpoint:
+        ck_meta, ck_dir, ck_tr = _open_lora_checkpoint(resume_checkpoint)
+        given = {"base_model": base_model, "max_steps": max_steps, "lr": lr, "seq_len": seq_len,
+                 "batch_size": batch_size, "grad_accum": grad_accum, "lora_r": lora_r, "lora_alpha": lora_alpha,
+                 "qa_path": qa_path, "train_path": train_path, "eval_path": eval_path, "seed": seed, "dtype": dtype,
+                 "max_train_tokens": max_train_tokens, "gradient_checkpointing": gradient_checkpointing}
+        m = ck_meta
+        try:
+            base_model = str(m.get("base_model") or "")
+            max_steps, lr, seq_len = int(m["steps"]), float(m["lr"]), int(m["seq_len"])
+            batch_size, grad_accum = int(m["batch_size"]), int(m["grad_accum"])
+            lora_r, lora_alpha, seed = int(m["lora_r"]), int(m["lora_alpha"]), int(m.get("seed") or 0)
+            dtype = m.get("dtype") or "auto"
+            max_train_tokens = int(m["max_train_tokens"]) if m.get("max_train_tokens") else None
+            gradient_checkpointing = bool(m.get("gradient_checkpointing"))
+            start_step = int(m["step"])
+            if not 0 <= start_step <= max_steps:
+                raise ValueError(f"step {start_step}")
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"체크포인트 정보가 올바르지 않습니다({e}). 이어서 할 수 없습니다: "
+                             f"{resume_checkpoint}") from e
+        train_path, eval_path, qa_path = m.get("train_path"), m.get("eval_path"), m.get("qa_path")
+        for p in (train_path, eval_path):
+            if p and not Path(p).is_file():
+                raise ValueError(f"체크포인트에 기록된 학습 자료가 없습니다: {p}. 이어서 할 수 없습니다.")
+        note = _ckpt_ignored_note(given, m)
+        if note:
+            pre_notes.append(note)
+        if resume_from and not (m.get("parent_path") and _ckpt_same("train_path", resume_from, m["parent_path"])):
+            pre_notes.append("체크포인트에서 이어서 하므로 이어 학습할 어댑터(resume_from) 지정은 무시했습니다.")
+        resume_from = None
 
     max_steps = int(max_steps)
     if max_steps < 1:
@@ -628,10 +808,18 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
                              f"선택한 기반 모델({base_model})과 다릅니다.")
     if not base_model:
         raise ValueError("기반 모델을 지정하세요.")
-    parent_total = int(parent_info.get("total_steps") or parent_info.get("steps") or 0) if rdir else 0
+    if ck_meta is not None:
+        parent_name, parent_path = ck_meta.get("parent"), ck_meta.get("parent_path")
+        parent_total = int(ck_meta.get("parent_total") or 0)
+    else:
+        parent_name, parent_path = (rdir.name, str(rdir)) if rdir else (None, None)
+        parent_total = int(parent_info.get("total_steps") or parent_info.get("steps") or 0) if rdir else 0
 
     unload()  # 답변용으로 올려 둔 모델을 내려 메모리 확보 (한 번에 하나)
     t0 = time.time()
+    paused = 0.0  # 일시정지(pause_point 안)에서 보낸 시간: 학습 시간·남은 시간 계산에서 뺀다
+    elapsed_before = float(ck_meta.get("elapsed") or 0.0) if ck_meta else 0.0
+    resumes = int(ck_meta.get("resumes") or 0) + 1 if ck_meta else 0
     n_threads = _set_threads(threads)
     torch.manual_seed(seed)
     rnd = random.Random(seed)
@@ -640,17 +828,26 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     dtype_name, auto_ckpt, notes = _plan(dev, dtype, est, training=True)
     use_ckpt = auto_ckpt if gradient_checkpointing is None else bool(gradient_checkpointing)
     torch_dtype = getattr(torch, dtype_name)
+    if ck_meta is not None:  # 처음 실행의 안내 문구를 이어받는다 (중복 제거)
+        notes = list(dict.fromkeys([str(n) for n in (ck_meta.get("notes") or [])] + notes + pre_notes))
+        if ck_meta.get("device") and ck_meta["device"] != dev:
+            notes.append(f"저장했던 장치({ck_meta['device']})와 다른 장치({dev})에서 이어서 학습합니다.")
 
     # --- 모델 불러오기 ---
     from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import AutoModelForCausalLM
 
-    progress(0.0, f"기반 모델 불러오는 중: {base_model} ({dev}, {dtype_name})")
+    if ck_meta is not None:
+        progress(0.0, f"체크포인트({ck_meta['step']}/{max_steps}단계)에서 이어서 학습 준비 중: "
+                      f"{base_model} ({dev}, {dtype_name})")
+    else:
+        progress(0.0, f"기반 모델 불러오는 중: {base_model} ({dev}, {dtype_name})")
 
     def on_download():
         progress(0.01, f"기반 모델 내려받는 중(처음 한 번만): {base_model}")
 
-    tok_src = str(rdir) if rdir and _has_tokenizer(rdir) else base_model
+    tok_dir = rdir if rdir else (Path(parent_path) if ck_meta is not None and parent_path else None)
+    tok_src = str(tok_dir) if tok_dir and tok_dir.is_dir() and _has_tokenizer(tok_dir) else base_model
     tok = _load_tokenizer(tok_src, fallback=base_model, on_download=on_download)
     pad_id = _pad_id(tok)
     model = _from_pretrained(AutoModelForCausalLM, base_model, on_download=on_download, dtype=torch_dtype)
@@ -666,7 +863,12 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     if use_ckpt:
         _enable_checkpointing(model)
     check_cancel()
-    if rdir:
+    if ck_dir is not None:
+        try:
+            model = PeftModel.from_pretrained(model, str(ck_dir / _CKPT_ADAPTER), is_trainable=True)
+        except Exception as e:
+            raise ValueError(f"체크포인트의 LoRA 어댑터를 불러오지 못했습니다: {e}. 이어서 할 수 없습니다.") from e
+    elif rdir:
         model = PeftModel.from_pretrained(model, str(rdir), is_trainable=True)
     else:
         model = get_peft_model(model, LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=0.05,
@@ -678,7 +880,7 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
 
-    # --- 데이터 ---
+    # --- 데이터 (재개 때도 같은 seed로 다시 토큰화 → 같은 블록·평가 구간) ---
     progress(0.04, "학습 자료를 토큰으로 바꾸는 중")
     train_texts = load_texts(train_path) if train_path and Path(train_path).is_file() else []
     eval_texts = load_texts(eval_path) if eval_path and Path(eval_path).is_file() else []
@@ -689,6 +891,8 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     train_ids, texts_used = _tokenize_texts(tok, order, cap, check_cancel,
                                             lambda f: progress(0.04 + 0.05 * f, "학습 자료를 토큰으로 바꾸는 중"))
     n_eval = 16 if dev == "cuda" else 8
+    if ck_meta is not None and ck_meta.get("n_eval"):
+        n_eval = int(ck_meta["n_eval"])  # 장치가 바뀌어도 학습 전·후 평가 구간을 같게
     eval_ids, _ = _tokenize_texts(tok, eval_texts, n_eval * seq_len, check_cancel)
     train_t = torch.frombuffer(train_ids, dtype=torch.int32) if len(train_ids) else torch.zeros(0, dtype=torch.int32)
     eval_t = torch.frombuffer(eval_ids, dtype=torch.int32) if len(eval_ids) else torch.zeros(0, dtype=torch.int32)
@@ -697,6 +901,8 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     if not eval_spans:  # 평가 자료가 없으면 학습 자료 끝부분으로
         eval_spans = [(train_t, s, e) for s, e in train_blocks[-n_eval:]]
 
+    if ck_meta is not None and qa_path and not Path(qa_path).is_file() and ck_meta.get("qa_examples"):
+        notes.append(f"체크포인트에 기록된 Q&A 파일이 없어 Q&A 예시 없이 이어서 학습합니다: {qa_path}")
     qa_rows = load_qa(qa_path)
     qa_examples = []
     for r in qa_rows:
@@ -710,6 +916,11 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
         p_qa = min(0.5, max(0.25, len(qa_examples) / (len(qa_examples) + len(train_blocks))))
     else:
         p_qa = 1.0 if qa_examples else 0.0
+    if ck_meta is not None:
+        changed = [k for k, v in (("train_tokens", len(train_ids)), ("qa_examples", len(qa_examples)))
+                   if ck_meta.get(k) is not None and int(ck_meta[k]) != v]
+        if changed:
+            notes.append("학습 자료가 체크포인트를 저장할 때와 달라 학습 순서가 처음과 다를 수 있습니다.")
 
     def block_example(t, s, e):
         return t[s:e].long(), None
@@ -731,18 +942,99 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
         model.train()
         return tot / cnt if cnt else None
 
-    progress(0.1, "학습 전 평가 중")
-    eval_before = evaluate()
+    if ck_meta is not None:
+        eval_before = ck_meta.get("eval_before")  # 학습 전 평가는 처음 실행 때 값
+        eval_before = float(eval_before) if isinstance(eval_before, (int, float)) else None
+    else:
+        progress(0.1, "학습 전 평가 중")
+        eval_before = evaluate()
 
     # --- 학습 루프 ---
-    params = [p for p in model.parameters() if p.requires_grad]
+    named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    param_names = [n for n, _ in named]
+    params = [p for _, p in named]
+    if ck_tr is not None and ck_tr.get("param_names"):
+        saved_names = [str(n) for n in ck_tr["param_names"]]
+        lookup = dict(named)
+        if sorted(saved_names) != sorted(param_names):
+            raise ValueError("체크포인트의 LoRA 구조가 지금 모델과 맞지 않습니다. 이어서 할 수 없습니다.")
+        param_names, params = saved_names, [lookup[n] for n in saved_names]  # 저장할 때와 같은 순서
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
     warmup = max(1, min(20, max_steps // 10))
-    model.train()
     history: list[float] = []
-    t_loop = time.time()
     qa_used = 0
-    for step in range(1, max_steps + 1):
+    start = 1
+    if ck_tr is not None:
+        try:
+            opt.load_state_dict(ck_tr["opt"])
+        except (ValueError, KeyError, RuntimeError) as e:
+            raise ValueError(f"체크포인트의 옵티마이저 상태를 불러오지 못했습니다: {e}. 이어서 할 수 없습니다.") from e
+        _optimizer_to_params(torch, opt)
+        history = [float(v) for v in (ck_tr.get("history") or [])]
+        qa_used = int(ck_tr.get("qa_used") or 0)
+        start = int(ck_meta["step"]) + 1
+        _set_py_rng(rnd, ck_tr["py_rng"])   # 토큰화(셔플) 뒤에 덮어써야 배치 순서가 이어진다
+        _restore_torch_rng(torch, ck_tr, dev)
+        notes.append(f"{start - 1}/{max_steps}단계 체크포인트에서 이어서 학습했습니다.")
+        ck_tr = None  # 메모리 정리 (옵티마이저 상태 사본)
+    model.train()
+
+    ck_root = Path(checkpoint_dir).expanduser() if checkpoint_dir else None
+    every_steps = max(0, int(checkpoint_every_steps or 0))
+    every_sec = max(0.0, float(checkpoint_every_sec or 0.0))
+    rec = {"train_path": _abs_file(train_path), "eval_path": _abs_file(eval_path),
+           "qa_path": str(Path(qa_path).expanduser().resolve()) if qa_path else None}
+    last_saved_step: int | None = None
+    last_summary: dict | None = None
+    last_save_t = time.monotonic()
+    ckpt_errors, ckpt_last_err = 0, ""
+    step = start - 1
+
+    def save_checkpoint() -> dict | None:
+        """지금 상태로 체크포인트 저장 → 요약. 이번 단계에 이미 저장했으면 그 요약. 저장 안 함/실패면 None."""
+        nonlocal last_saved_step, last_summary, last_save_t, ckpt_errors, ckpt_last_err
+        if ck_root is None:
+            return None
+        if last_saved_step == step:
+            return last_summary
+        try:
+            tmp = ckpt.begin(ck_root)
+            try:  # 임베딩은 학습하지 않으므로 저장 안 함
+                model.save_pretrained(str(tmp / _CKPT_ADAPTER), save_embedding_layers=False)
+            except TypeError:
+                model.save_pretrained(str(tmp / _CKPT_ADAPTER))
+            torch.save({
+                "opt": opt.state_dict(), "py_rng": rnd.getstate(), "torch_rng": torch.get_rng_state(),
+                "cuda_rng": torch.cuda.get_rng_state_all() if dev == "cuda" else None,
+                "history": list(history), "qa_used": int(qa_used), "param_names": list(param_names),
+            }, tmp / _CKPT_TRAINER)
+            meta = {
+                "kind": CKPT_KIND, "step": int(step), "steps": max_steps, "base_model": base_model, "lr": lr,
+                "seq_len": seq_len, "batch_size": batch_size, "grad_accum": grad_accum,
+                "lora_r": lora_r, "lora_alpha": lora_alpha, "qa_path": rec["qa_path"],
+                "train_path": rec["train_path"], "eval_path": rec["eval_path"], "seed": int(seed),
+                "dtype": dtype_name, "max_train_tokens": int(max_train_tokens) if max_train_tokens else None,
+                "gradient_checkpointing": bool(use_ckpt), "parent": parent_name, "parent_path": parent_path,
+                "parent_total": parent_total, "eval_before": eval_before,
+                "elapsed": round(elapsed_before + time.time() - t0 - paused, 3), "resumes": resumes,
+                "notes": list(notes),
+                # 덧붙인 정보: 장치, 평가 구간 수, 자료 크기(재개 때 바뀌었는지 확인용)
+                "device": dev, "n_eval": n_eval, "train_tokens": len(train_ids), "qa_examples": len(qa_examples),
+            }
+            summary = dict(ckpt.commit(ck_root, tmp, meta))
+        except Exception as e:  # 저장장치 문제 등: 학습은 계속하고 다음 기회에 다시 저장
+            ckpt_errors += 1
+            ckpt_last_err = f"{type(e).__name__}: {e}"
+            return None
+        summary["steps"] = max_steps
+        last_saved_step, last_summary, last_save_t = step, summary, time.monotonic()
+        if on_checkpoint is not None:
+            on_checkpoint(summary)
+        return summary
+
+    t_loop = time.time()  # paused는 루프 안(pause_point)에서만 늘어난다
+    stopped_at: int | None = None
+    for step in range(start, max_steps + 1):
         check_cancel()
         if step <= warmup:
             cur_lr = lr * step / warmup
@@ -770,11 +1062,31 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
         opt.zero_grad(set_to_none=True)
         if n_ok:
             history.append(acc / n_ok)
-        el = time.time() - t_loop
-        eta = el / step * (max_steps - step)
+        el = max(0.0, time.time() - t_loop - paused)  # 일시정지 시간 제외
+        eta = el / max(1, step - start + 1) * (max_steps - step)
         last = f"{history[-1]:.3f}" if history else "-"
         progress(0.12 + 0.83 * step / max_steps,
                  f"LoRA 학습 {step}/{max_steps} · loss {last} · 남은 시간 약 {_fmt_eta(eta)}")
+        # (a) 정해진 간격이면 중간 저장
+        if ck_root is not None and ((every_steps and step % every_steps == 0)
+                                    or (every_sec and time.monotonic() - last_save_t >= every_sec)):
+            save_checkpoint()
+        # (b) 일시정지 지점 (요청이 있으면 저장 후 여기서 블록, 취소면 예외가 그대로 올라감)
+        if pause_point is not None:
+            tp = time.time()
+            try:
+                pause_point(save_checkpoint)
+            finally:
+                paused += max(0.0, time.time() - tp)
+        # (c) 지금까지 저장하고 끝내기
+        if stop_requested is not None and step < max_steps and stop_requested():
+            save_checkpoint()
+            stopped_at = step
+            notes.append(f"사용자가 {step}/{max_steps}단계에서 학습을 끝냈습니다.")
+            break
+    if ckpt_errors:
+        notes.append(f"중간 저장에 {ckpt_errors}번 실패했습니다(마지막 오류: {ckpt_last_err}).")
+    done = stopped_at if stopped_at is not None else max_steps
 
     progress(0.95, "학습 후 평가 중")
     eval_after = evaluate()
@@ -798,28 +1110,31 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
 
     info = {
         "kind": "lora", "base_model": base_model, "device": dev, "dtype": dtype_name,
-        "steps": max_steps, "total_steps": parent_total + max_steps,
-        "parent": rdir.name if rdir else None, "parent_path": str(rdir) if rdir else None,
+        "steps": done, "total_steps": parent_total + done,
+        "parent": parent_name, "parent_path": parent_path,
         "lora_r": lora_r, "lora_alpha": lora_alpha,
         "trainable_params": int(trainable), "total_params": int(total),
         "train_loss": rnd4(sum(tail) / len(tail)) if tail else None,
         "eval_loss_before": rnd4(eval_before), "eval_loss_after": rnd4(eval_after),
         "perplexity_after": rnd4(math.exp(min(eval_after, 30.0))) if eval_after is not None else None,
-        "seconds": round(time.time() - t0, 1), "threads": n_threads,
+        "seconds": round(elapsed_before + time.time() - t0 - paused, 1), "threads": n_threads,
         "train_blocks": len(train_blocks), "train_tokens": len(train_ids), "train_texts": len(train_texts),
         "train_texts_used": texts_used, "eval_blocks": len(eval_spans),
         "qa_examples": len(qa_examples), "qa_samples_used": qa_used,
         "seq_len": seq_len, "batch_size": batch_size, "grad_accum": grad_accum, "lr": lr,
-        "gradient_checkpointing": use_ckpt, "notes": notes,
+        "gradient_checkpointing": use_ckpt, "stopped_early": stopped_at is not None, "notes": notes,
         "loss_history": [round(v, 4) for v in history[::stride]],
         "adapter_bytes": sum(v for k, v in files.items() if k.startswith("adapter_model")),
         "files": files, "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+    if ck_meta is not None:
+        info["resumed_from_step"] = int(ck_meta["step"])
+        info["resumes"] = resumes
     if ignored:
         info["ignored_params"] = sorted(ignored)
     (out / "info.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    del model, opt, params
+    del model, opt, params, named
     gc.collect()
     if dev == "cuda":
         torch.cuda.empty_cache()

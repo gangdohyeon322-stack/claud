@@ -393,6 +393,10 @@
     <div class="card admin-only" id="tiny-card">
       <h3>소형 AI 모델 학습</h3>
       <p class="muted small">모은 자료만으로 처음부터 학습하는 글자 단위 모델입니다. PC에서 학습하고 휴대폰 브라우저에서도 실행됩니다(온보드). 크기가 클수록 문장이 자연스럽지만 학습이 오래 걸립니다.</p>
+      <p class="small ckpt-note" id="tiny-ckpt" hidden>
+        <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M5 4h11l3 3v13H5z"/><path d="M8 4v5h7V4"/><path d="M8 20v-6h8v6"/></svg>
+        <span class="ckpt-text"></span>
+      </p>
       <form id="tiny-form">
         <label>크기
           <select id="tiny-preset"></select>
@@ -414,6 +418,10 @@
     <div class="card admin-only" id="lora-card">
       <h3>LoRA 학습</h3>
       <p class="muted small">공개 소형 언어모델(Qwen2.5)에 모은 자료를 추가 학습합니다. 답변할 때 검색한 자료를 함께 넣습니다. GPU가 있으면 자동으로 쓰고, CPU만 있으면 매우 느립니다.</p>
+      <p class="small ckpt-note" id="lora-ckpt" hidden>
+        <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M5 4h11l3 3v13H5z"/><path d="M8 4v5h7V4"/><path d="M8 20v-6h8v6"/></svg>
+        <span class="ckpt-text"></span>
+      </p>
       <form id="lora-form">
         <label>기반 모델
           <select id="lora-base"></select>
@@ -482,6 +490,7 @@
 
   <!-- ================= 작업 ================= -->
   <section id="tab-jobs" class="tab" hidden aria-label="작업">
+    <div id="jobs-conn" class="banner warn small" role="status" hidden>PC의 LearnBox에 연결할 수 없습니다. 아래는 마지막으로 받은 작업 상태입니다. 서버가 꺼졌다면 다시 켠 뒤 로그인하고, 끊긴 학습은 '이어서 재개'로 마지막 저장 지점부터 계속하세요.</div>
     <div id="jobs"></div>
   </section>
 
@@ -555,6 +564,21 @@
       <h4>의미 검색</h4>
       <label class="inline"><input id="s-emb-enabled" type="checkbox"> 의미 검색(임베딩) 사용</label>
       <label>임베딩 모델 <input id="s-emb-model" autocomplete="off" placeholder="intfloat/multilingual-e5-small"></label>
+
+      <h4 id="s-ck-title">학습 중간 저장</h4>
+      <p class="muted small">PC에서 소형 AI·LoRA를 학습하는 동안 학습 상태를 주기적으로 저장합니다. 전원이 꺼지거나 저장장치 연결이 끊겨도 [작업] 탭에서 마지막 저장 지점부터 이어서 재개할 수 있습니다.</p>
+      <label class="inline"><input id="s-ck-enabled" type="checkbox"> 중간 저장 사용</label>
+      <div id="s-ck-fields">
+        <div class="grid2">
+          <label>간격(분) <input id="s-ck-minutes" type="number" min="0" step="1" inputmode="numeric" aria-describedby="s-ck-every-hint"></label>
+          <label>단계 간격 <input id="s-ck-steps" type="number" min="0" step="1" inputmode="numeric" aria-describedby="s-ck-every-hint"></label>
+        </div>
+        <p id="s-ck-every-hint" class="muted small">0이면 그 기준으로는 저장하지 않습니다. 둘 다 0이면 일시정지하거나 '지금까지 저장하고 끝내기'를 누를 때만 저장합니다.</p>
+        <label>저장 위치 (비우면 데이터 폴더/checkpoints)
+          <input id="s-ck-dir" autocomplete="off" spellcheck="false" placeholder="예: C:\LearnBox\checkpoints  /home/me/learnbox-ckpt" aria-describedby="s-ck-dir-hint">
+        </label>
+        <p id="s-ck-dir-hint" class="small warn-text">외장 하드에서 학습한다면 내장 드라이브 경로를 권장합니다. 외장 하드 연결이 끊겨도 중간 저장이 남습니다.</p>
+      </div>
 
       <h4>자율 학습 기본값</h4>
       <label>학습 종료 시 결과 복사 위치 (비우면 복사 안 함) <input id="s-al-target" placeholder="예: E:\LearnBox  /media/user/USB"></label>

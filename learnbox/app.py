@@ -4,12 +4,15 @@ from __future__ import annotations
 import importlib
 import math
 import importlib.util
+import re
 import shutil
 import threading
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
 
+from . import checkpoint
 from .autolearn import AutoLearner, record_collect
 from .collector import collect_links, collect_search
 from .config import Config
@@ -17,10 +20,12 @@ from .dataset import build_corpus
 from .db import DB
 from .export import export
 from .fetcher import Fetcher
-from .jobs import AutoCollector, JobManager
+from .jobs import PAUSABLE_KINDS, AutoCollector, Cancelled, JobManager, canonical_kind
 from .timegate import describe, is_allowed, next_allowed
 
 ENGINES = ("search", "tiny", "lora", "online")
+CKPT_KIND = {"train_tiny": "tiny", "train_lora": "lora"}     # 작업 종류 -> 체크포인트 meta["kind"]
+LIVE_STATUSES = ("queued", "running", "paused")
 ARCH_KEYS = ("d_model", "n_layer", "n_head", "seq_len", "vocab_size")
 TINY_KINDS = ("tiny", "mobile")   # 'mobile'은 예전 이름 (DB가 시작할 때 tiny로 바꾼다)
 LORA_KINDS = ("lora", "pc")
@@ -76,6 +81,43 @@ def _bool(v) -> bool:
     return bool(v)
 
 
+def _nonneg(value, name: str) -> float:
+    """0 이상의 숫자 (빈 값은 0)."""
+    if value in (None, ""):
+        return 0.0
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"'{name}'이(가) 올바른 숫자가 아닙니다: {value!r}") from None
+    if not math.isfinite(v) or v < 0:
+        raise ValueError(f"'{name}'은(는) 0 이상이어야 합니다 (입력: {value}).")
+    return v
+
+
+def _set_final(ctx, result: dict) -> None:
+    """작업이 정상 반환하지 못했을 때 남길 result (JobContext.final_result)."""
+    try:
+        ctx.final_result = result
+    except AttributeError:
+        pass
+
+
+def _same_path(a, b) -> bool:
+    if not a or not b:
+        return False
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except (OSError, ValueError):
+        return str(a) == str(b)
+
+
+_MODEL_DIR_RE = re.compile(r"^(tiny|lora)-\d{8}-\d{6}(-\d+)?$")    # _new_model_dir가 만드는 이름
+_RESUMABLE_HINT = re.compile(r"\s*·\s*이어서 재개할 수 있습니다 \([^)]*\)\s*$")
+_RESUMED_BY = re.compile(r"\s*·?\s*작업 #\d+\(으\)로 이어서 재개함\s*$")
+STATUS_KO = {"queued": "대기", "running": "진행 중", "paused": "일시정지", "done": "완료", "failed": "실패",
+             "cancelled": "취소", "blocked": "시간 밖 중지", "interrupted": "중단"}
+
+
 def _sub(progress, lo: float, hi: float):
     def f(p, m=""):
         try:
@@ -103,11 +145,14 @@ class App:
             "finalize_learning": self._finalize_learning,
             "export": self._export,
         })
+        self.jobs.checkpoint_of = self.job_checkpoint             # 재시작 때 '이어서 재개' 안내용
         self.auto = AutoCollector(self.cfg, self.db, self.jobs)   # 설정 auto_collect (단순 예약 수집)
         self.autolearn = AutoLearner(self)                        # 자율 학습 (수집 + 학습 + 학습 종료)
         self._profile_warm = threading.Event()
+        self._restart_lock = threading.Lock()
 
     def start_background(self) -> None:
+        self.remove_orphan_model_dirs()     # 작업 스레드를 켜기 전에 (지금 만드는 중인 폴더와 헷갈리지 않게)
         self.jobs.start()
         if self.auto.ident is None:
             self.auto.start()
@@ -252,6 +297,21 @@ class App:
             return name, path
         raise RuntimeError("모델 폴더 이름을 만들 수 없습니다.")
 
+    def remove_orphan_model_dirs(self) -> list[str]:
+        """이전 실행이 강제로 끝나(전원 끊김·강제 종료) 정리하지 못한 **빈** 학습 모델 폴더(tiny-*/lora-*)를 지운다.
+        등록된 모델 폴더와 내용이 있는 폴더는 건드리지 않는다. 반환: 지운 폴더 이름."""
+        removed: list[str] = []
+        try:
+            registered = {Path(m["path"]).resolve() for m in self.db.list_models() if m.get("path")}
+            for d in self.cfg.models_dir.iterdir():
+                if (d.is_dir() and _MODEL_DIR_RE.match(d.name) and d.resolve() not in registered
+                        and not any(d.iterdir())):
+                    d.rmdir()
+                    removed.append(d.name)
+        except OSError:
+            pass
+        return removed
+
     # ---------- 휴대폰 온디바이스 학습 (.lbw) ----------
     def ensure_lbw(self, model_row: dict) -> Path:
         """tiny 모델 폴더의 model.lbw를 돌려준다. 없으면 model.pt에서 만들어 폴더에 캐시한다."""
@@ -385,26 +445,115 @@ class App:
             "threads": self._threads(p),
         }
 
-    def _train_tiny(self, ctx, p):
-        plan = self.plan_tiny(p)
-        ctx.progress(0.0, "말뭉치 만드는 중")
-        corpus = build_corpus(self.db, self.cfg.datasets_dir)
-        name, out = self._new_model_dir("tiny")
+    # ---------- 학습 중간 저장 · 일시정지 · 이어서 재개 (docs/SPEC-pause-resume.md) ----------
+    def checkpoint_base(self) -> Path:
+        """체크포인트 폴더들의 위치: 설정 training_checkpoint.dir, 비어 있으면 데이터 폴더/checkpoints."""
+        d = str((self.cfg["training_checkpoint"] or {}).get("dir") or "").strip()
+        return Path(d).expanduser().resolve() if d else self.cfg.data_dir / "checkpoints"
+
+    def checkpoint_root(self, job_id) -> Path | None:
+        """작업의 체크포인트 root (…/job-<id>). 중간 저장을 껐으면(enabled False) None."""
+        if not _bool((self.cfg["training_checkpoint"] or {}).get("enabled", True)):
+            return None
+        return self.checkpoint_base() / f"job-{int(job_id)}"
+
+    def _checkpoint_kwargs(self, ctx, p: dict) -> tuple[Path | None, dict]:
+        """학습 함수에 넘길 중간 저장·일시정지 인자 -> (체크포인트 root, kwargs).
+
+        params.resume_checkpoint가 있으면 그 root를 그대로 계속 쓴다(새 작업 폴더로 옮기지 않음).
+        params.checkpoint_minutes(명령줄 --checkpoint-minutes)는 설정의 간격보다 우선 (0이면 시간 기준 저장 끔)."""
+        tc = self.cfg["training_checkpoint"] or {}
+        enabled = _bool(tc.get("enabled", True))
+        given = p.get("checkpoint_minutes")
+        minutes = _nonneg(given if given not in (None, "") else tc.get("every_minutes", 10), "checkpoint_minutes")
+        every_steps = int(_nonneg(tc.get("every_steps", 0), "every_steps"))
+        resume = str(p.get("resume_checkpoint") or "").strip() or None
+        job_id = getattr(ctx, "id", None)
+        root = Path(resume) if resume else (self.checkpoint_root(job_id) if job_id is not None else None)
+        if not enabled:      # 꺼져 있으면 정기 저장은 하지 않는다 (이어서 하는 작업은 일시정지·끝내기 때만 저장)
+            minutes, every_steps = 0.0, 0
+        kw = {"checkpoint_dir": str(root) if root else None, "checkpoint_every_steps": every_steps,
+              "checkpoint_every_sec": minutes * 60.0, "pause_point": getattr(ctx, "pause_point", None),
+              "stop_requested": getattr(ctx, "stop_requested", None),
+              "on_checkpoint": getattr(ctx, "on_checkpoint", None)}
+        if resume:
+            kw["resume_checkpoint"] = resume
+        return root, kw
+
+    def _run_training(self, ctx, kind: str, root: Path | None, call) -> tuple[str, Path, dict]:
+        """모델 폴더를 만들고 call(out)으로 학습한다. 실패하면 모델 폴더는 지우고, 체크포인트는
+        취소면 지우고(사용자가 버린 것) 그 밖의 예외면 보존해 작업 result에 남긴다(이어서 재개)."""
+        name, out = self._new_model_dir(kind)
         try:
-            info = _mod("tinylm").train(
-                f"{corpus['dir']}/train.jsonl", f"{corpus['dir']}/eval.jsonl", out, plan["arch"],
-                steps=plan["steps"], batch_size=plan["batch_size"], lr=plan["lr"],
-                resume_from=plan["resume"]["path"] if plan["resume"] else None, threads=plan["threads"],
-                progress=_sub(ctx.progress, 0.03, 1.0), check_cancel=ctx.check_cancel)
+            info = call(out)
+        except Cancelled:
+            shutil.rmtree(out, ignore_errors=True)
+            self._remove_checkpoint(root)
+            _set_final(ctx, {"checkpoint": None, "checkpoint_removed": True})
+            raise
         except BaseException:
             shutil.rmtree(out, ignore_errors=True)
+            try:
+                s = checkpoint.summary(root) if root else None
+            except OSError:
+                s = None
+            if s:
+                _set_final(ctx, {"checkpoint": s, "resumable": True})
             raise
-        info = dict(info)
+        return name, out, dict(info)
+
+    @staticmethod
+    def _remove_checkpoint(root: Path | None) -> bool:
+        """체크포인트 root를 지운다. 체크포인트 폴더 모양(current/prev/.tmp만 있음)일 때만 지운다 (잘못된 경로 보호)."""
+        if not root:
+            return False
+        r = Path(root)
+        if not r.is_dir():
+            return False
+        if any(c.name not in ("current", "prev", ".tmp") for c in r.iterdir()):
+            return False
+        checkpoint.remove(r)
+        return True
+
+    def _resume_meta(self, root: str | None) -> dict:
+        try:
+            got = checkpoint.load(root) if root else None
+        except OSError:
+            got = None
+        return got[0] if got else {}
+
+    def _train_tiny(self, ctx, p):
+        tinylm = _mod("tinylm")
+        root, ck = self._checkpoint_kwargs(ctx, p)
+        common = {"progress": _sub(ctx.progress, 0.03, 1.0), "check_cancel": ctx.check_cancel, **ck}
+        if ck.get("resume_checkpoint"):      # 체크포인트에서 이어서: 기록된 자료·설정을 쓴다 (말뭉치를 새로 만들지 않음)
+            ctx.progress(0.0, "체크포인트에서 이어서 학습 준비 중")
+            meta = self._resume_meta(ck["resume_checkpoint"])
+            corpus = {"dir": str(Path(meta["train_path"]).parent), "resumed": True} if meta.get("train_path") else None
+            threads = self._threads(p)
+
+            def call(out):
+                return tinylm.train(None, None, out, None, threads=threads, **common)
+        else:
+            plan = self.plan_tiny(p)
+            ctx.progress(0.0, "말뭉치 만드는 중")
+            corpus = build_corpus(self.db, self.cfg.datasets_dir)
+
+            def call(out):
+                return tinylm.train(
+                    f"{corpus['dir']}/train.jsonl", f"{corpus['dir']}/eval.jsonl", out, plan["arch"],
+                    steps=plan["steps"], batch_size=plan["batch_size"], lr=plan["lr"],
+                    resume_from=plan["resume"]["path"] if plan["resume"] else None, threads=plan["threads"], **common)
+        name, out, info = self._run_training(ctx, "tiny", root, call)
         info["corpus"] = corpus
+        if p.get("resumed_from_job") not in (None, ""):
+            info["resumed_from_job"] = p.get("resumed_from_job")
         info["model_id"] = self.db.add_model("tiny", name, str(out), info)
+        self._remove_checkpoint(root)       # 완료(또는 지금까지 저장하고 끝내기): 체크포인트는 더 필요 없다
         self.db.notify("success", "소형 AI 모델 학습을 마쳤습니다",
                        f"{name} · {info.get('steps')}단계 · 평가 loss {_fmt(info.get('eval_loss_before'))} → "
-                       f"{_fmt(info.get('eval_loss_after'))}", {"kind": "train_tiny", "model_id": info["model_id"]})
+                       f"{_fmt(info.get('eval_loss_after'))}" + (" · 일찍 끝냄" if info.get("stopped_early") else ""),
+                       {"kind": "train_tiny", "model_id": info["model_id"]})
         return info
 
     def plan_lora(self, p: dict) -> dict:
@@ -430,27 +579,222 @@ class App:
         }
 
     def _train_lora(self, ctx, p):
-        plan = self.plan_lora(p)
-        ctx.progress(0.0, "말뭉치 만드는 중")
-        corpus = build_corpus(self.db, self.cfg.datasets_dir)
-        name, out = self._new_model_dir("lora")
-        try:
-            info = _mod("train_pc").train_lora(
-                f"{corpus['dir']}/train.jsonl", f"{corpus['dir']}/eval.jsonl", out, plan["base_model"],
-                max_steps=plan["max_steps"], lr=plan["lr"], seq_len=plan["seq_len"], batch_size=plan["batch_size"],
-                grad_accum=plan["grad_accum"], lora_r=plan["lora_r"], lora_alpha=plan["lora_alpha"],
-                qa_path=plan["qa_path"], resume_from=plan["resume"]["path"] if plan["resume"] else None,
-                threads=plan["threads"], progress=_sub(ctx.progress, 0.03, 1.0), check_cancel=ctx.check_cancel)
-        except BaseException:
-            shutil.rmtree(out, ignore_errors=True)
-            raise
-        info = dict(info)
+        train_pc = _mod("train_pc")
+        root, ck = self._checkpoint_kwargs(ctx, p)
+        common = {"progress": _sub(ctx.progress, 0.03, 1.0), "check_cancel": ctx.check_cancel, **ck}
+        if ck.get("resume_checkpoint"):      # 기록된 설정이 우선이므로 설정 값은 넘기지 않는다(None)
+            ctx.progress(0.0, "체크포인트에서 이어서 학습 준비 중")
+            meta = self._resume_meta(ck["resume_checkpoint"])
+            corpus = {"dir": str(Path(meta["train_path"]).parent), "resumed": True} if meta.get("train_path") else None
+            threads = self._threads(p)
+
+            def call(out):
+                return train_pc.train_lora(
+                    None, None, out, None, max_steps=None, lr=None, seq_len=None, batch_size=None, grad_accum=None,
+                    lora_r=None, lora_alpha=None, qa_path=None, resume_from=None, threads=threads, **common)
+        else:
+            plan = self.plan_lora(p)
+            ctx.progress(0.0, "말뭉치 만드는 중")
+            corpus = build_corpus(self.db, self.cfg.datasets_dir)
+
+            def call(out):
+                return train_pc.train_lora(
+                    f"{corpus['dir']}/train.jsonl", f"{corpus['dir']}/eval.jsonl", out, plan["base_model"],
+                    max_steps=plan["max_steps"], lr=plan["lr"], seq_len=plan["seq_len"], batch_size=plan["batch_size"],
+                    grad_accum=plan["grad_accum"], lora_r=plan["lora_r"], lora_alpha=plan["lora_alpha"],
+                    qa_path=plan["qa_path"], resume_from=plan["resume"]["path"] if plan["resume"] else None,
+                    threads=plan["threads"], **common)
+        name, out, info = self._run_training(ctx, "lora", root, call)
         info["corpus"] = corpus
+        if p.get("resumed_from_job") not in (None, ""):
+            info["resumed_from_job"] = p.get("resumed_from_job")
         info["model_id"] = self.db.add_model("lora", name, str(out), info)
+        self._remove_checkpoint(root)
         self.db.notify("success", "LoRA 모델 학습을 마쳤습니다",
                        f"{name} · {info.get('steps')}단계 · 평가 loss {_fmt(info.get('eval_loss_before'))} → "
-                       f"{_fmt(info.get('eval_loss_after'))}", {"kind": "train_lora", "model_id": info["model_id"]})
+                       f"{_fmt(info.get('eval_loss_after'))}" + (" · 일찍 끝냄" if info.get("stopped_early") else ""),
+                       {"kind": "train_lora", "model_id": info["model_id"]})
         return info
+
+    # ---------- 작업 목록 표시 · 이어서 재개 · 체크포인트 삭제 ----------
+    def _job_ckpt_root(self, job: dict) -> Path | None:
+        """작업이 쓰는(썼던) 체크포인트 root: result.checkpoint.path → params.resume_checkpoint → 기본 위치/job-<id>."""
+        res = job.get("result") if isinstance(job.get("result"), dict) else {}
+        params = job.get("params") if isinstance(job.get("params"), dict) else {}
+        ck = res.get("checkpoint") if isinstance(res.get("checkpoint"), dict) else {}
+        root = ck.get("path") or params.get("resume_checkpoint")
+        if root:
+            return Path(str(root))
+        return self.checkpoint_base() / f"job-{int(job['id'])}"
+
+    def job_checkpoint(self, job: dict) -> dict | None:
+        """학습 작업의 체크포인트 요약 (디스크에서 읽을 수 있는 것만). 다른 작업이 이어받았으면(resumed_by) None."""
+        kind = canonical_kind(str(job.get("kind") or ""))
+        if kind not in PAUSABLE_KINDS:
+            return None
+        res = job.get("result") if isinstance(job.get("result"), dict) else {}
+        if res.get("resumed_by"):
+            return None
+        root = self._job_ckpt_root(job)
+        try:
+            s = checkpoint.summary(root) if root else None
+        except OSError:
+            s = None
+        if s and s.get("kind") not in (None, CKPT_KIND[kind]):
+            return None
+        return s
+
+    def annotate_job(self, job: dict) -> dict:
+        """작업 목록용: checkpoint 요약과 can_pause/can_resume/can_finish/can_restart (+요청 상태)를 붙인다."""
+        j = dict(job)
+        kind = canonical_kind(str(j.get("kind") or ""))
+        train = kind in PAUSABLE_KINDS
+        st = j.get("status")
+        jid = j.get("id")
+        res = j["result"] if isinstance(j.get("result"), dict) else {}
+        ck = self.job_checkpoint(j) if train and st in ("running", "paused", "interrupted", "failed") else None
+        active = train and self.jobs.is_active(jid)
+        pause_req = active and jid in self.jobs.pause_flags
+        finish_req = active and jid in self.jobs.finish_flags
+        j.update(
+            checkpoint=ck, pause_requested=bool(pause_req), finish_requested=bool(finish_req),
+            can_pause=bool(active and st == "running" and not pause_req and not finish_req),
+            can_resume=bool(active and (st == "paused" or pause_req) and not finish_req),
+            can_finish=bool(active and st in ("running", "paused") and not finish_req),
+            can_restart=bool(train and st in ("interrupted", "failed") and ck and not res.get("resumed_by")),
+        )
+        return j
+
+    def list_jobs(self, limit: int = 40) -> list[dict]:
+        return [self.annotate_job(j) for j in self.db.list_jobs(limit)]
+
+    def _live_root_user(self, root: Path, exclude: int | None = None) -> dict | None:
+        """이 체크포인트 root를 쓰고 있는 대기/실행/일시정지 중 학습 작업."""
+        with self.db.conn() as c:
+            rows = [self.db._job(r) for r in c.execute(
+                "SELECT * FROM jobs WHERE status IN ('queued','running','paused') AND kind IN "
+                "('train_tiny','train_lora','train_mobile','train_pc')")]
+        for j in rows:
+            if j["id"] != exclude and _same_path(self._job_ckpt_root(j), root):
+                return j
+        return None
+
+    def restart_job(self, job_id, actor: str = "admin", enqueue: bool = True) -> int:
+        """중단/실패한 학습 작업을 체크포인트에서 이어서 하는 새 작업을 만든다 -> 새 작업 번호.
+
+        새 작업 params = 원래 params + resume_checkpoint(원래 root 그대로) + resumed_from_job.
+        enqueue=False면 줄에 넣지 않는다 (명령줄이 현재 스레드에서 직접 실행)."""
+        with self._restart_lock:
+            try:
+                job = self.db.get_job(int(job_id))
+            except (TypeError, ValueError):
+                job = None
+            if not job:
+                raise ValueError("작업이 없습니다.")
+            kind = canonical_kind(job["kind"])
+            if kind not in PAUSABLE_KINDS:
+                raise ValueError("소형 AI·LoRA 학습 작업만 이어서 재개할 수 있습니다.")
+            st = job["status"]
+            if st == "paused":
+                raise ValueError("일시정지된 작업입니다. '재개'를 누르세요.")
+            if st in ("queued", "running"):
+                raise ValueError("아직 진행 중인 작업입니다.")
+            if st not in ("interrupted", "failed"):
+                raise ValueError(f"중단되었거나 실패한 작업만 이어서 재개할 수 있습니다 (지금 상태: {STATUS_KO.get(st, st)}).")
+            res = dict(job["result"]) if isinstance(job.get("result"), dict) else {}
+            if res.get("resumed_by"):
+                raise ValueError(f"이미 작업 #{res['resumed_by']}(으)로 이어서 재개했습니다. 그 작업에서 이어서 하세요.")
+            root = self._job_ckpt_root(job)
+            got = checkpoint.load(root) if root else None
+            if not got:
+                raise ValueError("이어서 할 체크포인트가 없습니다. 처음부터 다시 학습하세요.")
+            if got[0].get("kind") != CKPT_KIND[kind]:
+                raise ValueError("이 작업의 체크포인트가 아닙니다 (종류가 다릅니다). 이어서 할 수 없습니다.")
+            other = self._live_root_user(root, exclude=job["id"])
+            if other:
+                raise ValueError(f"작업 #{other['id']}이(가) 이미 이 체크포인트로 학습 중입니다.")
+            params = {**(job.get("params") if isinstance(job.get("params"), dict) else {}),
+                      "resume_checkpoint": str(root), "resumed_from_job": job["id"]}
+            # 작업 목록의 요청자는 다른 작업처럼 역할만 ('admin@127.0.0.1' -> 'admin'); 감사 기록에는 그대로 남긴다
+            owner = str(actor).split("@", 1)[0] or str(actor)
+            new_id = self.jobs.submit(kind, params, owner) if enqueue else self.db.create_job(kind, params, owner)
+            res["resumed_by"] = new_id
+            # 원래 작업의 '이어서 재개할 수 있습니다' 안내를 '작업 #N(으)로 이어서 재개함'으로 바꾼다 (실패 사유는 그대로)
+            base = _RESUMABLE_HINT.sub("", str(job.get("message") or ""))
+            msg = (f"{base} · " if base else "") + f"작업 #{new_id}(으)로 이어서 재개함"
+            self.db.update_job(job["id"], result=res, message=msg[:500])
+        self.db.audit(actor, "job_restart", {"job_id": job["id"], "new_job_id": new_id, "step": got[0].get("step"),
+                                             "steps": got[0].get("steps")})
+        return new_id
+
+    def discard_checkpoint(self, job_id, actor: str = "admin") -> dict:
+        """중단/실패한 학습 작업의 체크포인트를 지운다 (이어서 재개할 수 없게 됨)."""
+        try:
+            job = self.db.get_job(int(job_id))
+        except (TypeError, ValueError):
+            job = None
+        if not job:
+            raise ValueError("작업이 없습니다.")
+        if canonical_kind(job["kind"]) not in PAUSABLE_KINDS:
+            raise ValueError("학습 작업이 아닙니다.")
+        if job["status"] in LIVE_STATUSES:
+            raise ValueError("진행 중인 작업의 체크포인트는 지울 수 없습니다. 먼저 취소하거나 끝내세요.")
+        res = dict(job["result"]) if isinstance(job.get("result"), dict) else {}
+        if res.get("resumed_by"):
+            raise ValueError(f"이 체크포인트는 작업 #{res['resumed_by']}이(가) 이어받았습니다. 그 작업에서 지우세요.")
+        root = self._job_ckpt_root(job)
+        other = self._live_root_user(root, exclude=job["id"]) if root else None
+        if other:
+            raise ValueError(f"작업 #{other['id']}이(가) 이 체크포인트로 학습 중이라 지울 수 없습니다.")
+        s = checkpoint.summary(root) if root else None
+        if not (root and Path(root).is_dir()):
+            raise ValueError("지울 체크포인트가 없습니다.")
+        if not self._remove_checkpoint(root):
+            raise ValueError(f"체크포인트 폴더가 아닌 것 같아 지우지 않았습니다: {root}")
+        res.update(checkpoint=None, checkpoint_discarded=True)
+        res.pop("resumable", None)
+        # '이어서 재개할 수 있습니다 (N/M단계)' 안내가 남아 있으면 지우고 삭제했다고 적는다 (사유는 그대로)
+        base = _RESUMABLE_HINT.sub("", str(job.get("message") or ""))
+        msg = (f"{base} · " if base else "") + "체크포인트 삭제함"
+        self.db.update_job(job["id"], result=res, message=msg[:500])
+        self.db.audit(actor, "checkpoint_discard", {"job_id": job["id"], "step": (s or {}).get("step"),
+                                                    "bytes": (s or {}).get("bytes")})
+        return {"ok": True, "bytes": (s or {}).get("bytes") or 0}
+
+    def cancel_job(self, job_id: int) -> None:
+        """작업 취소 (일시정지 중이어도 깨워서 취소). 시작 전에 취소한 '이어서 재개' 작업은 원래 작업이
+        다시 이어서 재개할 수 있게 되돌린다 (체크포인트는 그대로)."""
+        before = self.db.get_job(job_id)
+        self.jobs.cancel(job_id)
+        if not before or before["status"] != "queued" or canonical_kind(before["kind"]) not in PAUSABLE_KINDS:
+            return
+        after = self.db.get_job(job_id)
+        src = (before.get("params") or {}).get("resumed_from_job") if isinstance(before.get("params"), dict) else None
+        if not src or not after or after["status"] != "cancelled":
+            return
+        try:
+            orig = self.db.get_job(int(src))
+        except (TypeError, ValueError):
+            orig = None
+        res = orig.get("result") if orig and isinstance(orig.get("result"), dict) else None
+        if res is not None and res.get("resumed_by") == job_id:
+            res = dict(res)
+            res.pop("resumed_by")
+            self.db.update_job(orig["id"], result=res)
+            orig = self.db.get_job(orig["id"])
+            base = _RESUMED_BY.sub("", str(orig.get("message") or ""))
+            ck = self.job_checkpoint(orig)
+            if ck:
+                base = (f"{base} · " if base else "") + f"이어서 재개할 수 있습니다 ({ck.get('step')}/{ck.get('steps')}단계)"
+            self.db.update_job(orig["id"], message=base[:500])
+
+    def suspend_training(self, timeout: float = 120.0, reason: str = "서버를 종료해 중단됨") -> list[int]:
+        """이 프로세스에서 실행 중인 학습 작업을 저장하고 '중단됨'으로 멈춘다 (서버 종료 전). 반환: 요청한 작업 번호."""
+        ids = [i for i in self.jobs.active_training() if self.jobs.interrupt(i, reason)]
+        end = time.monotonic() + max(0.0, float(timeout))
+        while ids and time.monotonic() < end and any(self.jobs.is_active(i) for i in ids):
+            time.sleep(0.2)
+        return ids
 
     def _autolearn_train(self, ctx, p):
         return _mod("autolearn").run_autolearn_train(self, int(p["session_id"]), progress=ctx.progress,

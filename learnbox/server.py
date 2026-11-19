@@ -327,17 +327,61 @@ def make_handler(app: App, sessions: Sessions):
     # ---------- 작업 ----------
     @route("GET", "/api/jobs")
     def jobs(h, m, body, role):
-        return {"jobs": app.db.list_jobs(40)}
+        # 학습 작업에는 checkpoint 요약과 can_pause/can_resume/can_finish/can_restart가 붙는다 (화면이 버튼을 고름)
+        return {"jobs": app.list_jobs(40)}
 
-    @route("POST", r"/api/jobs/(\d+)/cancel")
-    def cancel(h, m, body, role):
+    def job_or_404(m) -> dict:
         job = app.db.get_job(int(m.group(1)))
         if not job:
             raise HttpError(404, "작업이 없습니다.")
+        return job
+
+    @route("POST", r"/api/jobs/(\d+)/cancel")
+    def cancel(h, m, body, role):
+        job = job_or_404(m)
         if role != "admin" and not job["kind"].startswith("collect"):
             raise HttpError(403, "수집이 아닌 작업은 관리자만 취소할 수 있습니다.")
-        app.jobs.cancel(job["id"])
+        app.cancel_job(job["id"])         # 일시정지 중인 학습도 깨워서 취소한다
         return {"ok": True}
+
+    # ----- 학습 일시정지 · 재개 · 지금까지 저장하고 끝내기 · 이어서 재개 · 체크포인트 삭제 (관리자) -----
+    def job_reply(job_id: int) -> dict:
+        return {"ok": True, "job": app.annotate_job(app.db.get_job(job_id))}
+
+    @route("POST", r"/api/jobs/(\d+)/pause", "admin")
+    def job_pause(h, m, body, role):
+        job = job_or_404(m)
+        app.jobs.pause(job["id"])         # 학습 작업이 아니거나 실행 중이 아니면 한국어 ValueError -> 400
+        app.db.audit(actor(h, role), "job_pause", {"job_id": job["id"]})
+        return job_reply(job["id"])
+
+    @route("POST", r"/api/jobs/(\d+)/resume", "admin")
+    def job_resume(h, m, body, role):
+        job = job_or_404(m)
+        app.jobs.resume(job["id"])
+        app.db.audit(actor(h, role), "job_resume", {"job_id": job["id"]})
+        return job_reply(job["id"])
+
+    @route("POST", r"/api/jobs/(\d+)/finish", "admin")
+    def job_finish(h, m, body, role):
+        job = job_or_404(m)
+        app.jobs.finish(job["id"])
+        app.db.audit(actor(h, role), "job_finish", {"job_id": job["id"]})
+        return job_reply(job["id"])
+
+    @route("POST", r"/api/jobs/(\d+)/restart", "admin")
+    def job_restart(h, m, body, role):
+        job = job_or_404(m)
+        if job["kind"] in ("train_tiny", "train_mobile"):
+            need_pkgs("torch")
+        elif job["kind"] in ("train_lora", "train_pc"):
+            need_pkgs("torch", "transformers", "peft")
+        return {"job_id": app.restart_job(job["id"], actor(h, role))}
+
+    @route("POST", r"/api/jobs/(\d+)/discard-checkpoint", "admin")
+    def job_discard_checkpoint(h, m, body, role):
+        job = job_or_404(m)
+        return app.discard_checkpoint(job["id"], actor(h, role))
 
     # ---------- 학습 (관리자) ----------
     def need_pkgs(*mods: str):
@@ -346,19 +390,33 @@ def make_handler(app: App, sessions: Sessions):
             raise HttpError(400, "학습 패키지가 없습니다: pip install -r requirements-train.txt "
                                  f"(필요: {', '.join(mods)})")
 
+    def train_params(body: dict) -> dict:
+        """학습 요청 본문 -> 작업 params. 체크포인트 경로(resume_checkpoint)는 '이어서 재개'(restart)만 정한다."""
+        p = {k: v for k, v in body.items() if k not in ("resume_checkpoint", "resumed_from_job")}
+        if p.get("checkpoint_minutes") not in (None, ""):
+            try:
+                v = float(p["checkpoint_minutes"])
+            except (TypeError, ValueError):
+                raise HttpError(400, "중간 저장 간격(checkpoint_minutes)은 숫자여야 합니다.")
+            if not v >= 0:
+                raise HttpError(400, "중간 저장 간격(checkpoint_minutes)은 0 이상이어야 합니다.")
+        return p
+
     @route("POST", "/api/train/mobile", "admin")   # 이전 이름
     @route("POST", "/api/train/tiny", "admin")
     def train_tiny(h, m, body, role):
         need_pkgs("torch")
-        app.plan_tiny(body)         # 잘못된 값은 작업을 만들기 전에 바로 알려 준다
-        return {"job_id": app.jobs.submit("train_tiny", body, role)}
+        p = train_params(body)
+        app.plan_tiny(p)            # 잘못된 값은 작업을 만들기 전에 바로 알려 준다
+        return {"job_id": app.jobs.submit("train_tiny", p, role)}
 
     @route("POST", "/api/train/pc", "admin")       # 이전 이름
     @route("POST", "/api/train/lora", "admin")
     def train_lora(h, m, body, role):
         need_pkgs("torch", "transformers", "peft")
-        app.plan_lora(body)
-        return {"job_id": app.jobs.submit("train_lora", body, role)}
+        p = train_params(body)
+        app.plan_lora(p)
+        return {"job_id": app.jobs.submit("train_lora", p, role)}
 
     @route("POST", "/api/index/embeddings", "admin")
     def index_embeddings(h, m, body, role):
@@ -490,6 +548,36 @@ def make_handler(app: App, sessions: Sessions):
         return {"ok": True}
 
     # ---------- 설정/내보내기 (관리자) ----------
+    def checkpoint_settings(sec) -> dict:
+        """설정 '학습 중간 저장'(training_checkpoint) 검사·정리. 잘못된 값은 저장 전에 400."""
+        if not isinstance(sec, dict):
+            raise HttpError(400, "학습 중간 저장 설정이 올바르지 않습니다.")
+        out = {}
+        if "enabled" in sec:
+            v = sec["enabled"]
+            out["enabled"] = v.strip().lower() in ("1", "true", "yes", "on", "y", "예") if isinstance(v, str) else bool(v)
+        for key, label, as_int in (("every_minutes", "저장 간격(분)", False), ("every_steps", "단계 간격", True)):
+            if key not in sec:
+                continue
+            raw = sec[key]
+            try:
+                v = 0.0 if raw in (None, "") else float(raw)
+            except (TypeError, ValueError):
+                raise HttpError(400, f"학습 중간 저장의 {label}은(는) 숫자여야 합니다.")
+            if not v >= 0 or v == float("inf"):
+                raise HttpError(400, f"학습 중간 저장의 {label}은(는) 0 이상이어야 합니다.")
+            out[key] = int(v) if as_int else (int(v) if v == int(v) else v)
+        if "dir" in sec:
+            d = str(sec["dir"] or "").strip()
+            if d:
+                p = Path(d).expanduser()
+                if not p.is_absolute():
+                    raise HttpError(400, "저장 위치는 전체 경로로 입력하세요 (예: D:\\LearnBox\\checkpoints, /home/me/checkpoints).")
+                if p.exists() and not p.is_dir():
+                    raise HttpError(400, f"저장 위치가 폴더가 아닙니다: {d}")
+            out["dir"] = d
+        return out
+
     @route("GET", "/api/settings", "admin")
     def settings_get(h, m, body, role):
         return app.cfg.public()
@@ -504,6 +592,8 @@ def make_handler(app: App, sessions: Sessions):
         target = (body.get("autolearn") or {}).get("results_export_target") if isinstance(body.get("autolearn"), dict) else None
         if target:
             validate_target(app.cfg, str(target))    # 없는 경로/데이터 폴더 안은 저장 전에 알려 준다
+        if "training_checkpoint" in body:
+            body["training_checkpoint"] = checkpoint_settings(body["training_checkpoint"])
         app.cfg.update(body)
         app.db.audit(role, "settings", _scrub_settings(body))
         return app.cfg.public()
@@ -708,6 +798,12 @@ def serve(app: App, host: str = "127.0.0.1", port: int = 8750, certfile: str | N
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
+        if app.jobs.active_training():   # 학습 중이면 지금 상태를 저장하고 '중단됨'으로 남긴다 (나중에 이어서 재개)
+            print("\n학습 중인 작업을 저장하는 중입니다… (한 번 더 Ctrl+C를 누르면 저장하지 않고 바로 끝냅니다)", flush=True)
+            try:
+                app.suspend_training()
+            except KeyboardInterrupt:
+                pass
         print("\n종료합니다.")
     finally:
         app.autolearn.stop()

@@ -355,19 +355,47 @@ class DB:
             return [self._job(r) for r in c.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,))]
 
     def running_jobs(self, kinds: tuple[str, ...]) -> int:
+        """대기·실행·일시정지 중인 작업 수 (일시정지한 학습도 무거운 작업 줄을 차지한다)."""
         q = ",".join("?" * len(kinds))
         with self.conn() as c:
             return c.execute(
-                f"SELECT count(*) FROM jobs WHERE status IN ('queued','running') AND kind IN ({q})", kinds
+                f"SELECT count(*) FROM jobs WHERE status IN ('queued','running','paused') AND kind IN ({q})", kinds
             ).fetchone()[0]
 
-    def mark_interrupted(self) -> None:
+    def mark_interrupted(self, checkpoint_of=None) -> list[dict]:
+        """이전 실행에서 끝나지 못한 작업(대기/실행/일시정지)을 '중단됨'으로 바꾼다. result는 그대로 둔다(체크포인트 정보 보존).
+
+        checkpoint_of(job) -> 체크포인트 요약 | None (없으면 result.checkpoint를 쓴다). 요약이 있으면 메시지에
+        '이어서 재개할 수 있습니다 (N/M단계)'를 붙인다. 반환: 바꾼 작업들 (각각 "checkpoint" 키 포함)."""
         with self.conn() as c:
-            c.execute(
-                "UPDATE jobs SET status='interrupted', message='엔진이 재시작되어 중단됨', finished_at=? "
-                "WHERE status IN ('queued','running')",
-                (now_iso(),),
-            )
+            rows = [self._job(r) for r in c.execute(
+                "SELECT * FROM jobs WHERE status IN ('queued','running','paused') ORDER BY id")]
+        out = []
+        for job in rows:
+            try:
+                if checkpoint_of is not None:
+                    ck = checkpoint_of(job)
+                else:
+                    res = job.get("result") if isinstance(job.get("result"), dict) else {}
+                    ck = res.get("checkpoint") if isinstance(res.get("checkpoint"), dict) else None
+            except Exception:   # 체크포인트 확인 실패(저장장치 빠짐 등)는 '없음'으로 본다
+                ck = None
+            if not (isinstance(ck, dict) and ck.get("step") is not None):
+                ck = None
+            msg = "엔진이 재시작되어 중단됨"
+            if ck:
+                steps = ck.get("steps") if ck.get("steps") is not None else "?"
+                msg += f" · 이어서 재개할 수 있습니다 ({ck['step']}/{steps}단계)"
+            job.update(status="interrupted", message=msg, checkpoint=ck)
+            out.append(job)
+        if out:
+            ts = now_iso()
+            with self.conn() as c:
+                c.executemany(
+                    "UPDATE jobs SET status='interrupted', message=?, finished_at=? "
+                    "WHERE id=? AND status IN ('queued','running','paused')",
+                    [(j["message"], ts, j["id"]) for j in out])
+        return out
 
     @staticmethod
     def _job(r) -> dict:

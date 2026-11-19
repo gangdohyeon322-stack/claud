@@ -55,6 +55,11 @@ def _add_arch_flags(s) -> None:
         s.add_argument(flag, type=int, dest=key, help=f"{key} (직접 설정, 0이면 preset 값)")
 
 
+def _add_checkpoint_flag(s) -> None:
+    s.add_argument("--checkpoint-minutes", type=float, metavar="N",
+                   help="학습 중 N분마다 중간 저장 (기본: 설정값, 0이면 시간 기준 저장을 끄고 Ctrl+C 때만 저장)")
+
+
 def _add_start_flags(s) -> None:
     s.add_argument("--targets", help="학습 대상 (쉼표로): tiny,lora,embeddings,qa")
     s.add_argument("--tiny-preset", help="소형 AI 모델 크기 (auto | nano | mini | small | base | large | custom)")
@@ -141,6 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--batch-size", type=int)
     s.add_argument("--lr", type=float)
     s.add_argument("--resume", type=int, metavar="MODEL_ID", help="이 소형 AI 모델에서 이어서 학습")
+    _add_checkpoint_flag(s)
 
     s = sub.add_parser("train-lora", aliases=["train-pc"], help="PC용 LoRA 학습")
     s.add_argument("--base-model")
@@ -150,6 +156,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--batch-size", type=int)
     s.add_argument("--no-qa", action="store_true", help="Q&A 학습 데이터(qa.jsonl)를 섞지 않기")
     s.add_argument("--resume", type=int, metavar="MODEL_ID", help="이 LoRA 모델에서 이어서 학습")
+    _add_checkpoint_flag(s)
+
+    s = sub.add_parser("jobs", help="최근 작업 목록 (번호, 종류, 상태, 체크포인트 단계)")
+    s.add_argument("--limit", type=int, default=20)
+
+    s = sub.add_parser("resume-job", help="중단/실패한 학습 작업을 체크포인트에서 이어서 하기 (Ctrl+C로 저장하고 멈춤)")
+    s.add_argument("job_id", type=int, help="이어서 할 작업 번호 (`jobs`로 확인)")
 
     sub.add_parser("index-embeddings", help="의미 검색 색인 만들기")
 
@@ -325,6 +338,131 @@ def cmd_models(app, args) -> int:
     return 0
 
 
+KIND_LABELS = {"collect_links": "링크 수집", "collect_search": "검색 수집", "ingest_path": "파일 가져오기",
+               "index_embeddings": "의미 검색 색인", "build_qa": "Q&A 데이터 생성", "train_tiny": "소형 AI 학습",
+               "train_lora": "LoRA 학습", "autolearn_train": "자율 학습(학습)", "finalize_learning": "학습 종료·결과 내보내기",
+               "export": "외장 저장 내보내기", "train_mobile": "소형 AI 학습", "train_pc": "LoRA 학습"}
+STATUS_LABELS = {"queued": "대기", "running": "진행 중", "paused": "일시정지", "done": "완료", "failed": "실패",
+                 "cancelled": "취소", "blocked": "시간 밖 중지", "interrupted": "중단"}
+
+
+def _ago(iso) -> str:
+    """ISO 시각 -> '3분 전' (읽지 못하면 원문)."""
+    from datetime import datetime, timezone
+
+    try:
+        t = datetime.fromisoformat(str(iso))
+    except (TypeError, ValueError):
+        return str(iso or "-")
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    sec = max(0, int((datetime.now(timezone.utc) - t).total_seconds()))
+    if sec < 60:
+        return "방금"
+    if sec < 3600:
+        return f"{sec // 60}분 전"
+    if sec < 86400:
+        return f"{sec // 3600}시간 전"
+    return t.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _resume_cmd(args, job_id) -> str:
+    """이어서 하기 명령 (기본 데이터 폴더가 아니면 --data를 붙인다)."""
+    data = getattr(args, "data", None)
+    extra = ""
+    if data and data != os.environ.get("LEARNBOX_DATA", "data"):
+        extra = " --data " + (f'"{data}"' if any(c.isspace() for c in str(data)) else str(data))
+    return f"python -m learnbox{extra} resume-job {job_id}"
+
+
+def cmd_jobs(app, args) -> int:
+    rows = app.list_jobs(max(1, min(int(args.limit or 20), 200)))
+    if not rows:
+        print("작업이 없습니다.")
+        return 0
+    for j in rows:
+        st = j.get("status")
+        line = f"#{j['id']} {KIND_LABELS.get(j['kind'], j['kind'])} · {STATUS_LABELS.get(st, st)}"
+        if st in ("running", "paused"):
+            line += f" · {round(float(j.get('progress') or 0) * 100)}%"
+        ck = j.get("checkpoint")
+        if ck:
+            line += f" · 체크포인트 {ck.get('step')}/{ck.get('steps')}단계 ({_ago(ck.get('saved_at'))} 저장)"
+        if j.get("message"):
+            line += f" · {j['message']}"
+        print(line)
+        if j.get("can_restart"):
+            print(f"    이어서 하려면: {_resume_cmd(args, j['id'])}")
+    return 0
+
+
+def _run_job_cli(app, args, job_id: int) -> int:
+    """작업을 작업 스레드에서 돌리고 진행을 출력한다. Ctrl+C면 지금 단계를 마치고 저장한 뒤 멈춘다(이어서 재개 가능)."""
+    import threading
+
+    jobs = app.jobs
+    jobs.echo = True
+    t = threading.Thread(target=jobs.run_existing, args=(job_id,), name="cli-job", daemon=True)
+    t.start()
+    try:
+        while t.is_alive():
+            t.join(0.2)
+    except KeyboardInterrupt:
+        return _cli_stop(app, args, job_id, t)
+    return _print_job(app.db.get_job(job_id))
+
+
+def _cli_stop(app, args, job_id: int, t) -> int:
+    """Ctrl+C: 일시정지 요청처럼 지금 단계를 마치고 체크포인트를 저장한 뒤 '중단됨'으로 끝낸다."""
+    from .db import now_iso
+
+    print("\n멈추는 중입니다: 지금 단계를 마치고 체크포인트를 저장합니다… "
+          "(한 번 더 Ctrl+C를 누르면 저장을 기다리지 않고 바로 끝냅니다)", flush=True)
+    forced = False
+    try:
+        while t.is_alive() and not app.jobs.interrupt(job_id, "명령줄에서 중지됨"):
+            t.join(0.1)        # 작업이 막 시작하는 중이면 잠깐 기다렸다가 다시 요청
+        while t.is_alive():
+            t.join(0.2)
+    except KeyboardInterrupt:
+        forced = True
+    job = app.db.get_job(job_id)
+    if job and job["status"] in ("queued", "running", "paused"):
+        ck = app.job_checkpoint(job)
+        msg = "명령줄에서 강제로 중지됨" + (f" · 이어서 재개할 수 있습니다 ({ck['step']}/{ck['steps']}단계)" if ck else "")
+        app.db.update_job(job_id, status="interrupted", message=msg, finished_at=now_iso())
+        job = app.db.get_job(job_id)
+    if job["status"] in ("done", "blocked"):       # 저장하기 전에 학습이 끝났다
+        return _print_job(job)
+    print(f"[{job['status']}] {job['message']}")
+    ck = app.job_checkpoint(job) if job["status"] in ("interrupted", "failed") else None
+    if ck:
+        print(f"체크포인트: {ck.get('step')}/{ck.get('steps')}단계 저장됨 ({ck.get('path')})")
+        print(f"{_resume_cmd(args, job_id)}로 이어서 할 수 있습니다.")
+    else:
+        off = not (app.cfg["training_checkpoint"] or {}).get("enabled", True)
+        print("저장된 체크포인트가 없어 이어서 할 수 없습니다." + (" (설정에서 학습 중간 저장이 꺼져 있습니다)" if off else ""))
+    return 130
+
+
+def cmd_resume_job(app, args) -> int:
+    new_id = app.restart_job(args.job_id, "cli", enqueue=False)
+    ck = (app.db.get_job(new_id)["params"] or {}).get("resume_checkpoint")
+    print(f"작업 #{args.job_id}의 체크포인트에서 이어서 학습합니다 (새 작업 #{new_id}, 체크포인트 {ck}).")
+    print("멈추려면 Ctrl+C (지금 단계를 마치고 저장한 뒤 멈춥니다).", flush=True)
+    return _run_job_cli(app, args, new_id)
+
+
+def _train_cli(app, args, kind: str, params: dict) -> int:
+    if getattr(args, "checkpoint_minutes", None) is not None:
+        if args.checkpoint_minutes < 0:
+            raise ValueError("--checkpoint-minutes는 0 이상이어야 합니다.")
+        params["checkpoint_minutes"] = args.checkpoint_minutes
+    job_id = app.db.create_job(kind, params, "cli")
+    print(f"학습 작업 #{job_id}을(를) 시작합니다. 멈추려면 Ctrl+C (지금 단계를 마치고 저장한 뒤 멈춥니다).", flush=True)
+    return _run_job_cli(app, args, job_id)
+
+
 def _run_loop(app, args) -> int:
     """자율 학습을 이 프로세스에서 직접 돌린다 (작업 스레드를 켜고 tick을 반복)."""
     from .autolearn import TICK_SEC
@@ -481,6 +619,10 @@ def _dispatch(app, args) -> int:
         return cmd_models(app, args)
     if cmd == "autolearn":
         return cmd_autolearn(app, args)
+    if cmd == "jobs":
+        return cmd_jobs(app, args)
+    if cmd == "resume-job":
+        return cmd_resume_job(app, args)
     if cmd == "import":
         from .export import import_export
 
@@ -498,14 +640,14 @@ def _dispatch(app, args) -> int:
         params = {k: v for k, v in {"preset": args.preset, "steps": args.steps, "batch_size": args.batch_size,
                                     "lr": args.lr, "resume_from_model_id": args.resume,
                                     **{k: getattr(args, k) for k, _ in ARCH_FLAGS}}.items() if v}
-        return _print_job(jobs.run_inline("train_tiny", params))
+        return _train_cli(app, args, "train_tiny", params)
     if cmd in ("train-lora", "train-pc"):
         params = {k: v for k, v in {"base_model": args.base_model, "lora_r": args.lora_r, "max_steps": args.max_steps,
                                     "seq_len": args.seq_len, "batch_size": args.batch_size,
                                     "resume_from_model_id": args.resume}.items() if v}
         if args.no_qa:
             params["use_qa"] = False
-        return _print_job(jobs.run_inline("train_lora", params))
+        return _train_cli(app, args, "train_lora", params)
     if cmd == "index-embeddings":
         return _print_job(jobs.run_inline("index_embeddings", {}))
     if cmd == "build-qa":
