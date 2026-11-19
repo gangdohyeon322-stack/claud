@@ -43,6 +43,13 @@ DEFAULTS: dict = {
         "batch_size": 32,
         "lr": 3e-3,
     },
+    # PC 학습 중간 저장(체크포인트)과 일시정지. 끊겨도 마지막 저장 지점부터 이어서 할 수 있다.
+    "training_checkpoint": {
+        "enabled": True,
+        "every_minutes": 10,   # 이 시간마다 저장 (0이면 시간 기준 저장 안 함)
+        "every_steps": 0,      # 이 단계마다 저장 (0이면 단계 기준 저장 안 함)
+        "dir": "",             # 비우면 데이터 폴더/checkpoints. 외장 하드에서 학습할 때는 내장 드라이브 경로를 권장
+    },
     # 공개 소형 언어모델에 LoRA 추가 학습 (PC)
     "lora_training": {
         "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
