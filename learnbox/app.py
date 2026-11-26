@@ -848,7 +848,7 @@ class App:
         return rows
 
     def ask(self, question: str, engine: str = "search", model_id=None, sources: list[str] | None = None,
-            k: int | None = None) -> dict:
+            k: int | None = None, history: list[dict] | None = None) -> dict:
         """학습한 자료를 근거로 답한다. engine: search(검색만) | tiny(소형 AI) | lora | online(온라인 모델).
 
         반환 {"engine","answer","citations","sources","extract","model","note"}. 근거 번호 [n]은 sources의 n번째.
@@ -882,7 +882,7 @@ class App:
             online = _mod("online")
             out["model"] = online.status(self.cfg)["model"]
             try:
-                r = online.ask(self.cfg, q, contexts)
+                r = online.ask(self.cfg, q, contexts, history=history)  # 이전 대화(대화 모드)는 온라인 모델만 받는다
             except online.OnlineError as e:
                 if e.kind == "refusal":   # 거절은 오류가 아니라 '답이 없음'으로 보여 준다
                     out["note"] = str(e)

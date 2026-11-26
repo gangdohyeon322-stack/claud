@@ -179,8 +179,14 @@ def make_handler(app: App, sessions: Sessions):
         sources = body.get("sources")
         if sources is not None and not (isinstance(sources, list) and all(isinstance(s, str) for s in sources)):
             raise HttpError(400, "sources는 문자열 목록이어야 합니다.")
+        history = body.get("history")
+        if history is not None:
+            if not isinstance(history, list):
+                raise HttpError(400, "history는 목록이어야 합니다.")
+            history = [{"role": h.get("role"), "content": str(h.get("content", ""))[:4000]}
+                       for h in history[-12:] if isinstance(h, dict)]
         try:
-            return app.ask(q, body.get("engine") or "search", body.get("model_id"), sources)
+            return app.ask(q, body.get("engine") or "search", body.get("model_id"), sources, history=history)
         except OnlineError as e:
             raise HttpError(ONLINE_STATUS.get(e.kind, 502), str(e))
 
