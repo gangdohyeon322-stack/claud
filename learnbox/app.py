@@ -12,10 +12,10 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from . import checkpoint
+from . import accel, checkpoint
 from .autolearn import AutoLearner, record_collect
 from .collector import collect_links, collect_search
-from .config import Config
+from .config import Config, amp_value, device_value
 from .dataset import build_corpus
 from .db import DB
 from .export import export
@@ -183,12 +183,20 @@ class App:
                 "device": "cpu", "tier": None}
         if self._profile_warm.is_set():
             try:
-                prof = _mod("devices").pc_profile()
+                devices = _mod("devices")
+                prof = devices.pc_profile()
                 gpu = prof.get("gpu") or {}
                 if gpu.get("type") == "cuda":
-                    caps["device"] = f"cuda ({gpu.get('name') or 'GPU'})"
+                    amd = " · AMD ROCm" if gpu.get("vendor") == "amd" or gpu.get("rocm") else ""
+                    caps["device"] = f"cuda ({gpu.get('name') or 'GPU'}{amd})"
+                elif gpu.get("type") == "xpu":
+                    caps["device"] = f"xpu ({gpu.get('name') or 'Intel GPU'})"
                 elif gpu.get("type") == "mps":
                     caps["device"] = "mps (Apple)"
+                else:
+                    ok, tpu = devices.tpu_usable(prof)
+                    if ok:       # GPU가 없고 TPU 런타임 + torch_xla (TPU는 학습을 시작할 때 연다)
+                        caps["device"] = f"tpu ({tpu.get('accelerator_type') or 'TPU'})"
                 caps["tier"] = prof.get("tier")
             except Exception:
                 pass
@@ -219,21 +227,76 @@ class App:
         for name, pr in tinylm.PRESETS.items():
             presets[name] = {**pr, "estimate": tinylm.estimate(tinylm.resolve_arch(name), 32)}
         return {"pc": pc, "recommend": devices.recommend(pc), "presets": presets,
-                "base_models": train_pc.BASE_MODELS, "limits": {k: list(v) for k, v in tinylm.LIMITS.items()}}
+                "base_models": train_pc.BASE_MODELS, "limits": {k: list(v) for k, v in tinylm.LIMITS.items()},
+                "accel": self._accel_devices(pc), "defaults": self.training_defaults()}
+
+    def training_defaults(self) -> dict:
+        """학습 폼의 기본 선택: 설정 training_device, lora_training.amp (잘못 저장된 값은 auto로 본다)."""
+        out = {}
+        for key, raw, check in (("training_device", self.cfg.get("training_device"), device_value),
+                                ("amp", (self.cfg["lora_training"] or {}).get("amp"), amp_value)):
+            try:
+                out[key] = check(raw)
+            except ValueError:
+                out[key] = "auto"
+        return out
+
+    @staticmethod
+    def _accel_devices(pc: dict) -> dict:
+        """학습 폼의 장치 선택용: 장치별 사용 가능 여부·이름, '자동'이 고를 장치 (TPU는 열지 않고 짐작만)."""
+        acc = pc.get("accel") if isinstance(pc.get("accel"), dict) else {}
+        avail = acc.get("available") if isinstance(acc.get("available"), dict) else None
+        if avail is None:
+            try:
+                avail = accel.available(probe_tpu=False)
+            except Exception:
+                avail = {"auto": True, "cpu": True}
+        gpu = pc.get("gpu") or {}
+        tpu = acc.get("tpu") if isinstance(acc.get("tpu"), dict) else {}
+        rocm = gpu.get("rocm") or (True if acc.get("rocm") else None)
+        names = {"cuda": gpu.get("name") if gpu.get("type") == "cuda" else None,
+                 "xpu": acc.get("xpu_name") or (gpu.get("name") if gpu.get("type") == "xpu" else None),
+                 "mps": gpu.get("name") if gpu.get("type") == "mps" else None,
+                 "tpu": tpu.get("accelerator_type")}
+        labels = {"auto": "자동", "cuda": "GPU (AMD ROCm)" if rocm else "GPU", "tpu": "TPU", "xpu": "Intel Arc",
+                  "mps": "Mac", "cpu": "CPU"}
+        out = {}
+        for d in accel.DEVICES:
+            out[d] = {"available": bool(avail.get(d, d in ("auto", "cpu"))), "label": labels[d], "name": names.get(d)}
+        if tpu.get("likely") and not tpu.get("installed"):
+            out["tpu"]["note"] = "TPU 패키지(torch_xla)가 없습니다: python -m learnbox.setup_accel"
+        auto = next((d for d in ("cuda", "tpu", "xpu", "mps") if out[d]["available"]), "cpu")
+        cuda_bf16 = None
+        if out["cuda"]["available"]:
+            try:
+                cuda_bf16 = bool(accel.native_bf16("cuda"))
+            except Exception:
+                cuda_bf16 = None
+        return {"auto": auto, "devices": out, "cuda_bf16": cuda_bf16, "rocm": rocm,
+                "torch_version": acc.get("torch_version") or pc.get("torch_version"),
+                "torch_xla_version": acc.get("torch_xla_version"),
+                "tpu": {k: tpu.get(k) for k in ("installed", "likely", "ok", "accelerator_type", "hbm_gb")}}
 
     def estimate(self, body: dict) -> dict:
-        """모델 크기/메모리 예상. body: {"kind":"tiny", preset, d_model…, batch_size} 또는 {"kind":"lora", ...}"""
+        """모델 크기/메모리 예상. body: {"kind":"tiny", preset, d_model…, batch_size} 또는 {"kind":"lora", ...}
+
+        device(선택, auto|cuda|tpu|xpu|mps|cpu): 그 장치 기준 판단을 덧붙인다 (auto·없음이면 예전 결과 그대로)."""
         kind = str(body.get("kind") or "tiny")
         devices, tinylm = _mod("devices"), _mod("tinylm")
+        dev = device_value(body.get("device"), "device")
         if kind == "lora":
             lt = self.cfg["lora_training"]
             base = str(body.get("base_model") or lt.get("base_model") or "").strip()
             if not base:
                 raise ValueError("기반 모델을 지정하세요.")
-            return _mod("train_pc").estimate_lora(
+            train_pc = _mod("train_pc")
+            kw = {"profile": devices.pc_profile()}
+            if dev != "auto":       # auto·없음이면 예전 호출 그대로
+                kw["device"] = dev
+            return train_pc.estimate_lora(
                 base, _int(body.get("lora_r"), lt.get("lora_r", 8), "lora_r", 1, 512),
                 _int(body.get("seq_len"), lt.get("seq_len", 512), "seq_len", 16, 32768),
-                _int(body.get("batch_size"), lt.get("batch_size", 2), "batch_size", 1, 512), profile=devices.pc_profile())
+                _int(body.get("batch_size"), lt.get("batch_size", 2), "batch_size", 1, 512), **kw)
         if kind != "tiny":
             raise ValueError("kind는 tiny 또는 lora여야 합니다.")
         tt = self.cfg["tiny_training"]
@@ -241,7 +304,17 @@ class App:
         arch = tinylm.resolve_arch(preset, {k: body.get(k) for k in ARCH_KEYS},
                                    recommended=devices.recommend()["tiny_preset"] if preset == "auto" else "mini")
         batch = _int(body.get("batch_size"), tt.get("batch_size", 32), "batch_size", 1, 4096)
-        return {"arch": arch, "estimate": tinylm.estimate(arch, batch)}
+        out = {"arch": arch, "estimate": tinylm.estimate(arch, batch)}
+        if dev == "tpu":     # TPU 메모리(HBM)를 알면 들어감/안 들어감, 모르면 None(측정 필요) (PRD 6.8)
+            _, tpu = devices.tpu_usable(devices.pc_profile())
+            try:
+                hbm = float(tpu.get("total_gb") or tpu.get("hbm_gb") or accel.tpu_hint().get("hbm_gb") or 0) or None
+            except (TypeError, ValueError):
+                hbm = None
+            need = out["estimate"].get("train_ram_mb")
+            out["device_fit"] = {"device": "tpu", "mem_gb": hbm,
+                                 "fits": None if not (hbm and need is not None) else need <= hbm * 1024 * 0.75}
+        return out
 
     # ---------- 수집 작업 ----------
     def _record(self, p: dict, stats: dict) -> None:
@@ -423,6 +496,15 @@ class App:
         t = _int(p.get("threads"), (self.cfg["autolearn"] or {}).get("threads") or 0, "threads", 0, 1024)
         return t or None
 
+    def _train_device(self, p: dict) -> str:
+        """학습 장치: 요청 device → LEARNBOX_DEVICE → 설정 training_device → auto (PRD 6.1).
+        요청 값이 잘못되면 한국어 ValueError. 환경변수·설정 값은 학습 함수(accel.pick)가 못 쓰면 CPU + 안내로 처리한다."""
+        return accel.requested_device(device_value(p.get("device"), "device"), self.cfg.get("training_device"))
+
+    def _train_amp(self, p: dict) -> str:
+        """LoRA 정밀도 모드: 요청 amp → LEARNBOX_AMP → 설정 lora_training.amp → auto (PRD 6.4)."""
+        return accel.requested_amp(amp_value(p.get("amp"), "amp"), (self.cfg["lora_training"] or {}).get("amp"))
+
     def plan_tiny(self, p: dict) -> dict:
         """소형 AI 모델 학습 요청을 검사하고 구조/이어 학습 대상/단계를 정한다 (잘못되면 한국어 ValueError)."""
         tt, tinylm = self.cfg["tiny_training"], _mod("tinylm")
@@ -442,7 +524,7 @@ class App:
             "steps": _int(p.get("steps"), tt.get("steps", 1500), "steps", 1, 10_000_000),
             "batch_size": _int(p.get("batch_size"), tt.get("batch_size", 32), "batch_size", 1, 4096),
             "lr": _float(p.get("lr"), tt.get("lr", 3e-3), "lr", 0.0),
-            "threads": self._threads(p),
+            "threads": self._threads(p), "device": self._train_device(p),
         }
 
     # ---------- 학습 중간 저장 · 일시정지 · 이어서 재개 (docs/SPEC-pause-resume.md) ----------
@@ -530,10 +612,10 @@ class App:
             ctx.progress(0.0, "체크포인트에서 이어서 학습 준비 중")
             meta = self._resume_meta(ck["resume_checkpoint"])
             corpus = {"dir": str(Path(meta["train_path"]).parent), "resumed": True} if meta.get("train_path") else None
-            threads = self._threads(p)
+            threads, device = self._threads(p), self._train_device(p)
 
-            def call(out):
-                return tinylm.train(None, None, out, None, threads=threads, **common)
+            def call(out):   # 소형 AI에는 amp를 넘기지 않는다 (정밀도는 장치로 정해짐)
+                return tinylm.train(None, None, out, None, threads=threads, device=device, **common)
         else:
             plan = self.plan_tiny(p)
             ctx.progress(0.0, "말뭉치 만드는 중")
@@ -543,7 +625,8 @@ class App:
                 return tinylm.train(
                     f"{corpus['dir']}/train.jsonl", f"{corpus['dir']}/eval.jsonl", out, plan["arch"],
                     steps=plan["steps"], batch_size=plan["batch_size"], lr=plan["lr"],
-                    resume_from=plan["resume"]["path"] if plan["resume"] else None, threads=plan["threads"], **common)
+                    resume_from=plan["resume"]["path"] if plan["resume"] else None, threads=plan["threads"],
+                    device=plan["device"], **common)
         name, out, info = self._run_training(ctx, "tiny", root, call)
         info["corpus"] = corpus
         if p.get("resumed_from_job") not in (None, ""):
@@ -576,6 +659,7 @@ class App:
             "lora_r": _int(p.get("lora_r"), lt.get("lora_r", 8), "lora_r", 1, 512),
             "lora_alpha": _int(p.get("lora_alpha"), lt.get("lora_alpha", 16), "lora_alpha", 1, 4096),
             "qa_path": str(qa) if use_qa and qa.is_file() else None, "threads": self._threads(p),
+            "device": self._train_device(p), "amp": self._train_amp(p),
         }
 
     def _train_lora(self, ctx, p):
@@ -586,12 +670,13 @@ class App:
             ctx.progress(0.0, "체크포인트에서 이어서 학습 준비 중")
             meta = self._resume_meta(ck["resume_checkpoint"])
             corpus = {"dir": str(Path(meta["train_path"]).parent), "resumed": True} if meta.get("train_path") else None
-            threads = self._threads(p)
+            threads, device, amp = self._threads(p), self._train_device(p), self._train_amp(p)
 
             def call(out):
                 return train_pc.train_lora(
                     None, None, out, None, max_steps=None, lr=None, seq_len=None, batch_size=None, grad_accum=None,
-                    lora_r=None, lora_alpha=None, qa_path=None, resume_from=None, threads=threads, **common)
+                    lora_r=None, lora_alpha=None, qa_path=None, resume_from=None, threads=threads, device=device,
+                    amp=amp, **common)
         else:
             plan = self.plan_lora(p)
             ctx.progress(0.0, "말뭉치 만드는 중")
@@ -603,7 +688,7 @@ class App:
                     max_steps=plan["max_steps"], lr=plan["lr"], seq_len=plan["seq_len"], batch_size=plan["batch_size"],
                     grad_accum=plan["grad_accum"], lora_r=plan["lora_r"], lora_alpha=plan["lora_alpha"],
                     qa_path=plan["qa_path"], resume_from=plan["resume"]["path"] if plan["resume"] else None,
-                    threads=plan["threads"], **common)
+                    threads=plan["threads"], device=plan["device"], amp=plan["amp"], **common)
         name, out, info = self._run_training(ctx, "lora", root, call)
         info["corpus"] = corpus
         if p.get("resumed_from_job") not in (None, ""):
@@ -679,11 +764,14 @@ class App:
                 return j
         return None
 
-    def restart_job(self, job_id, actor: str = "admin", enqueue: bool = True) -> int:
+    def restart_job(self, job_id, actor: str = "admin", enqueue: bool = True, device=None) -> int:
         """중단/실패한 학습 작업을 체크포인트에서 이어서 하는 새 작업을 만든다 -> 새 작업 번호.
 
         새 작업 params = 원래 params + resume_checkpoint(원래 root 그대로) + resumed_from_job.
+        장치(device)는 이어받지 않는다: 기본은 지금 장치(요청 → LEARNBOX_DEVICE → 설정)에서 재개하고,
+        device를 주면 그 장치로 (PRD 6.9). 정밀도(amp)는 이어받는다.
         enqueue=False면 줄에 넣지 않는다 (명령줄이 현재 스레드에서 직접 실행)."""
+        dev = device_value(device, "device")     # 잘못된 값이면 새 작업을 만들기 전에 ValueError
         with self._restart_lock:
             try:
                 job = self.db.get_job(int(job_id))
@@ -715,6 +803,9 @@ class App:
                 raise ValueError(f"작업 #{other['id']}이(가) 이미 이 체크포인트로 학습 중입니다.")
             params = {**(job.get("params") if isinstance(job.get("params"), dict) else {}),
                       "resume_checkpoint": str(root), "resumed_from_job": job["id"]}
+            params.pop("device", None)
+            if dev != "auto":
+                params["device"] = dev
             # 작업 목록의 요청자는 다른 작업처럼 역할만 ('admin@127.0.0.1' -> 'admin'); 감사 기록에는 그대로 남긴다
             owner = str(actor).split("@", 1)[0] or str(actor)
             new_id = self.jobs.submit(kind, params, owner) if enqueue else self.db.create_job(kind, params, owner)
@@ -724,7 +815,8 @@ class App:
             msg = (f"{base} · " if base else "") + f"작업 #{new_id}(으)로 이어서 재개함"
             self.db.update_job(job["id"], result=res, message=msg[:500])
         self.db.audit(actor, "job_restart", {"job_id": job["id"], "new_job_id": new_id, "step": got[0].get("step"),
-                                             "steps": got[0].get("steps")})
+                                             "steps": got[0].get("steps"),
+                                             **({"device": dev} if dev != "auto" else {})})
         return new_id
 
     def discard_checkpoint(self, job_id, actor: str = "admin") -> dict:

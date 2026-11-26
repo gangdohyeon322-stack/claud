@@ -50,6 +50,9 @@ DEFAULTS: dict = {
         "every_steps": 0,      # 이 단계마다 저장 (0이면 단계 기준 저장 안 함)
         "dir": "",             # 비우면 데이터 폴더/checkpoints. 외장 하드에서 학습할 때는 내장 드라이브 경로를 권장
     },
+    # 학습 장치: auto | cuda(NVIDIA·AMD ROCm) | tpu | xpu(Intel Arc) | mps(Mac) | cpu.
+    # 우선순위: 학습 요청의 device(웹 폼, --device) → 환경변수 LEARNBOX_DEVICE → 이 값 → auto (docs/PRD-tpu-training.md 6.1)
+    "training_device": "auto",
     # 공개 소형 언어모델에 LoRA 추가 학습 (PC)
     "lora_training": {
         "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
@@ -61,6 +64,9 @@ DEFAULTS: dict = {
         "lora_r": 8,
         "lora_alpha": 16,
         "use_qa": True,
+        # 정밀도: auto(bf16 가능하면 bf16, 아니면 fp16 혼합 정밀도) | fp16 | off(예전 방식) | fp32.
+        # 우선순위: 요청의 amp → 환경변수 LEARNBOX_AMP → 이 값 → auto
+        "amp": "auto",
     },
     # 온라인 모델 (Claude API). 검색된 자료 일부가 Anthropic API로 전송된다.
     "online": {
@@ -107,6 +113,37 @@ def _merge(base: dict, override: dict) -> dict:
         else:
             out[k] = v
     return out
+
+
+def device_value(value, name: str = "device") -> str:
+    """학습 장치 값 검사 -> 정식 이름 (auto|cuda|tpu|xpu|mps|cpu, 번호 붙은 cuda:1·xpu:0도 허용).
+
+    별칭(gpu·rocm→cuda, xla→tpu, arc→xpu, mac→mps)은 accel.normalize가 바꾼다. 빈 값은 auto.
+    잘못된 값이면 한국어 ValueError (서버는 400)."""
+    from . import accel   # torch를 불러오지 않는 가벼운 모듈
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "auto"
+    if not isinstance(value, str):
+        raise ValueError(f"'{name}' 값이 올바르지 않습니다: {value!r} (auto, cuda, tpu, xpu, mps, cpu 중 하나)")
+    n = accel.normalize(value)
+    base, sep, idx = n.partition(":")
+    if base in accel.DEVICES and (not sep or (idx.isdigit() and base in ("cuda", "xpu"))):
+        return n
+    raise ValueError(f"'{name}' 값이 올바르지 않습니다: {value!r} (auto, cuda, tpu, xpu, mps, cpu 중 하나)")
+
+
+def amp_value(value, name: str = "amp") -> str:
+    """LoRA 정밀도 모드 값 검사 -> auto|fp16|off|fp32 (float16·half→fp16, 0·false→off 등). 빈 값은 auto.
+    잘못된 값이면 한국어 ValueError."""
+    from . import accel
+
+    if value is None:
+        return "auto"
+    m = accel.normalize_amp(value) if isinstance(value, (str, int)) else None   # bool도 int (true→fp16, false→off)
+    if m is None:
+        raise ValueError(f"'{name}' 값이 올바르지 않습니다: {value!r} (auto, fp16, off, fp32 중 하나)")
+    return m
 
 
 def hash_pin(pin: str, salt: str) -> str:

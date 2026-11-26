@@ -22,6 +22,8 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import accel
+from .config import device_value
 from .db import now_iso
 from .timegate import describe, is_allowed
 
@@ -453,6 +455,11 @@ class AutoLearner:
         for k in ("lora_base_model", "lora_steps_per_cycle", "qa_chunks_per_cycle", "qa_per_chunk"):
             if ov.get(k) not in (None, ""):
                 conf[k] = ov[k] if k == "lora_base_model" else max(1, int(float(ov[k])))
+        # 학습 장치(선택): 세션 설정 → LEARNBOX_DEVICE → 설정 training_device → auto. auto·없음이면 저장하지 않는다
+        if ov.get("device") not in (None, ""):
+            dev = device_value(ov["device"], "자율 학습 장치(device)")
+            if dev != "auto":
+                conf["device"] = dev
         return conf
 
     def start_session(self, actor: str, overrides: dict | None = None) -> dict:
@@ -790,6 +797,11 @@ def _warn_once(db, session_id: int, target: str, msg: str) -> None:
                   {"session_id": session_id, "target": target, "kind": "autolearn_warning"})
 
 
+def _device(cfg, conf: dict) -> str:
+    """자율 학습 장치: 세션 설정 device → LEARNBOX_DEVICE → 설정 training_device → auto (PRD 6.1)."""
+    return accel.requested_device(conf.get("device"), cfg.get("training_device"))
+
+
 def _threads(conf: dict) -> int | None:
     try:
         t = int(conf.get("threads") or 0)
@@ -870,6 +882,7 @@ def run_autolearn_train(app, session_id: int, progress=_noop_progress, check_can
                                 batch_size=int(conf.get("tiny_batch_size") or 32),
                                 lr=float(conf.get("tiny_lr") or 3e-3),
                                 resume_from=parent["path"] if parent else None, threads=_threads(conf),
+                                device=_device(cfg, conf),     # 소형 AI에는 amp를 넘기지 않는다
                                 progress=_sub(progress, lo, hi), check_cancel=check_cancel)
             info = dict(info or {})
             info.update(kind="tiny", session_id=sid, autolearn=True, corpus=corpus)
@@ -928,6 +941,7 @@ def run_autolearn_train(app, session_id: int, progress=_noop_progress, check_can
                 batch_size=int(lt.get("batch_size") or 2), grad_accum=int(lt.get("grad_accum") or 4),
                 lora_r=int(lt.get("lora_r") or 8), lora_alpha=int(lt.get("lora_alpha") or 16), qa_path=qa_path,
                 resume_from=parent["path"] if parent else None, threads=_threads(conf),
+                device=_device(cfg, conf), amp=accel.requested_amp(None, lt.get("amp")),
                 progress=_sub(progress, lo, hi), check_cancel=check_cancel)
             info = dict(info or {})
             info.update(kind="lora", session_id=sid, autolearn=True, corpus=corpus)

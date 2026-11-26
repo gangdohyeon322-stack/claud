@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import ingest, results, search, tinylm
 from .app import App, LbwInvalid
-from .config import MASK
+from .config import MASK, amp_value, device_value
 from .db import now_iso
 from .export import list_drives, validate_target
 from .jobs import missing_package_message
@@ -382,7 +382,9 @@ def make_handler(app: App, sessions: Sessions):
             need_pkgs("torch")
         elif job["kind"] in ("train_lora", "train_pc"):
             need_pkgs("torch", "transformers", "peft")
-        return {"job_id": app.restart_job(job["id"], actor(h, role))}
+        # device(선택): 이어서 할 장치. 없으면 지금 장치에서 재개 (원래 작업의 device는 이어받지 않음, PRD 6.9)
+        dev = body.get("device") if isinstance(body, dict) else None
+        return {"job_id": app.restart_job(job["id"], actor(h, role), device=dev)}
 
     @route("POST", r"/api/jobs/(\d+)/discard-checkpoint", "admin")
     def job_discard_checkpoint(h, m, body, role):
@@ -408,12 +410,20 @@ def make_handler(app: App, sessions: Sessions):
                 raise HttpError(400, "중간 저장 간격(checkpoint_minutes)은 0 이상이어야 합니다.")
         return p
 
+    def store_normalized(p: dict, keys: tuple[str, ...]) -> None:
+        """요청에 들어 있던 device/amp만 정식 이름으로 바꿔 작업 params에 남긴다 (주지 않았으면 params 그대로)."""
+        if "device" in keys and "device" in p:
+            p["device"] = device_value(p["device"], "device")
+        if "amp" in keys and "amp" in p:
+            p["amp"] = amp_value(p["amp"], "amp")
+
     @route("POST", "/api/train/mobile", "admin")   # 이전 이름
     @route("POST", "/api/train/tiny", "admin")
     def train_tiny(h, m, body, role):
         need_pkgs("torch")
         p = train_params(body)
         app.plan_tiny(p)            # 잘못된 값은 작업을 만들기 전에 바로 알려 준다
+        store_normalized(p, ("device",))
         return {"job_id": app.jobs.submit("train_tiny", p, role)}
 
     @route("POST", "/api/train/pc", "admin")       # 이전 이름
@@ -422,6 +432,7 @@ def make_handler(app: App, sessions: Sessions):
         need_pkgs("torch", "transformers", "peft")
         p = train_params(body)
         app.plan_lora(p)
+        store_normalized(p, ("device", "amp"))
         return {"job_id": app.jobs.submit("train_lora", p, role)}
 
     @route("POST", "/api/index/embeddings", "admin")
@@ -600,6 +611,12 @@ def make_handler(app: App, sessions: Sessions):
             validate_target(app.cfg, str(target))    # 없는 경로/데이터 폴더 안은 저장 전에 알려 준다
         if "training_checkpoint" in body:
             body["training_checkpoint"] = checkpoint_settings(body["training_checkpoint"])
+        # 학습 장치·LoRA 정밀도: 정식 이름으로 저장, 잘못된 값은 저장 전에 400 (PRD 6.1, 6.4)
+        if "training_device" in body:
+            body["training_device"] = device_value(body["training_device"], "학습 장치(training_device)")
+        lt = body.get("lora_training")
+        if isinstance(lt, dict) and "amp" in lt:
+            lt["amp"] = amp_value(lt["amp"], "LoRA 정밀도(lora_training.amp)")
         app.cfg.update(body)
         app.db.audit(role, "settings", _scrub_settings(body))
         return app.cfg.public()

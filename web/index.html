@@ -381,6 +381,9 @@
             <label>한 번에 수집할 페이지 <input id="al-pages" type="number" min="1" step="1"></label>
             <label>시간당 최대 페이지 <input id="al-maxhour" type="number" min="1" step="1"></label>
           </div>
+          <label>학습 장치
+            <select id="al-device"><option value="auto">자동</option><option value="cuda">GPU</option><option value="tpu">TPU</option><option value="xpu">Intel Arc</option><option value="mps">Mac</option><option value="cpu">CPU</option></select>
+          </label>
           <label class="inline"><input type="checkbox" id="al-outside"> 허용 시간 밖에서도 학습 (수집은 허용 시간에만)</label>
           <div class="row wrap gap">
             <button type="submit" id="auto-start">자율 학습 시작</button>
@@ -407,6 +410,9 @@
           <label>학습 단계 <input id="tiny-steps" type="number" min="1" step="1" inputmode="numeric"></label>
           <label>배치 크기 <input id="tiny-batch" type="number" min="1" max="512" step="1"></label>
         </div>
+        <label>장치
+          <select id="tiny-device"><option value="auto">자동</option><option value="cuda">GPU</option><option value="tpu">TPU</option><option value="xpu">Intel Arc</option><option value="mps">Mac</option><option value="cpu">CPU</option></select>
+        </label>
         <label>이어서 학습
           <select id="tiny-resume"><option value="">새로 학습</option></select>
         </label>
@@ -417,7 +423,7 @@
 
     <div class="card admin-only" id="lora-card">
       <h3>LoRA 학습</h3>
-      <p class="muted small">공개 소형 언어모델(Qwen2.5)에 모은 자료를 추가 학습합니다. 답변할 때 검색한 자료를 함께 넣습니다. GPU가 있으면 자동으로 쓰고, CPU만 있으면 매우 느립니다.</p>
+      <p class="muted small">공개 소형 언어모델(Qwen2.5)에 모은 자료를 추가 학습합니다. 답변할 때 검색한 자료를 함께 넣습니다. GPU나 TPU가 있으면 자동으로 쓰고, CPU만 있으면 매우 느립니다.</p>
       <p class="small ckpt-note" id="lora-ckpt" hidden>
         <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M5 4h11l3 3v13H5z"/><path d="M8 4v5h7V4"/><path d="M8 20v-6h8v6"/></svg>
         <span class="ckpt-text"></span>
@@ -437,6 +443,15 @@
           <label>학습 단계 <input id="lora-steps" type="number" min="1" step="1" inputmode="numeric"></label>
           <label>배치 크기 <input id="lora-batch" type="number" min="1" max="64" step="1"></label>
         </div>
+        <div class="grid2">
+          <label>장치
+            <select id="lora-device"><option value="auto">자동</option><option value="cuda">GPU</option><option value="tpu">TPU</option><option value="xpu">Intel Arc</option><option value="mps">Mac</option><option value="cpu">CPU</option></select>
+          </label>
+          <label>정밀도
+            <select id="lora-amp"><option value="auto">자동</option><option value="fp16">fp16</option><option value="off">끄기 (예전 방식)</option><option value="fp32">fp32</option></select>
+          </label>
+        </div>
+        <p id="lora-amp-note" class="muted small" hidden></p>
         <label class="inline"><input type="checkbox" id="lora-qa" checked> Q&amp;A 학습 데이터도 사용 (있으면)</label>
         <label>이어서 학습
           <select id="lora-resume"><option value="">새로 학습</option></select>

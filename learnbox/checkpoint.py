@@ -113,13 +113,15 @@ def load(root: str | os.PathLike | None) -> tuple[dict, Path] | None:
 
 
 def summary(root: str | os.PathLike | None) -> dict | None:
-    """작업 목록/화면에 보여 줄 짧은 정보: {"path","kind","step","steps","saved_at","bytes"} 또는 None."""
+    """작업 목록/화면에 보여 줄 짧은 정보: {"path","kind","step","steps","saved_at","bytes","device"} 또는 None.
+
+    device: 저장한 학습 장치의 정식 이름(tpu 등). 예전 체크포인트에는 없어서 None."""
     got = load(root)
     if not got:
         return None
     meta, d = got
     return {"path": str(Path(root)), "kind": meta.get("kind"), "step": meta.get("step"), "steps": meta.get("steps"),
-            "saved_at": meta.get("saved_at"), "bytes": dir_size(d)}
+            "saved_at": meta.get("saved_at"), "bytes": dir_size(d), "device": meta.get("device")}
 
 
 def remove(root: str | os.PathLike | None) -> None:

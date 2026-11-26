@@ -19,13 +19,15 @@ CACHE_SEC = 60.0
 _LOCK = threading.Lock()
 _CACHE: dict = {"t": 0.0, "v": None}
 
-MODULES = ("torch", "transformers", "peft", "onnx", "onnxruntime", "anthropic", "pypdf")
+MODULES = ("torch", "transformers", "peft", "onnx", "onnxruntime", "anthropic", "pypdf", "torch_xla")
 
 LORA_MODELS = {
     "0.5B": "Qwen/Qwen2.5-0.5B-Instruct",
     "1.5B": "Qwen/Qwen2.5-1.5B-Instruct",
+    "3B": "Qwen/Qwen2.5-3B-Instruct",
     "7B": "Qwen/Qwen2.5-7B-Instruct",
 }
+TPU_HBM_DEFAULT_GB = 16.0     # 코랩 TPU v5e-1 칩 1개 (메모리를 알 수 없을 때)
 
 
 def _has(mod: str) -> bool:
@@ -136,9 +138,15 @@ def _gpu_info(ram_gb: float | None) -> tuple[dict, str | None]:
             props = torch.cuda.get_device_properties(0)
             gpu = {"type": "cuda", "name": torch.cuda.get_device_name(0),
                    "vram_gb": round(props.total_memory / 1024 ** 3, 1), "count": torch.cuda.device_count()}
+            hip = getattr(torch.version, "hip", None)
+            if hip:   # AMD ROCm용 PyTorch도 장치 이름은 cuda (PRD 6.1)
+                gpu.update(vendor="amd", rocm=str(hip))
         else:
+            xpu = _xpu_info(torch)
             mps = getattr(torch.backends, "mps", None)
-            if mps is not None and mps.is_available():
+            if xpu is not None:
+                gpu = xpu
+            elif mps is not None and mps.is_available():
                 # Apple Silicon은 CPU와 메모리를 함께 쓴다: 전체 RAM의 약 60%를 GPU용으로 본다.
                 gpu = {"type": "mps", "name": "Apple Silicon GPU",
                        "vram_gb": round(ram_gb * 0.6, 1) if ram_gb else None, "unified_memory": True}
@@ -148,18 +156,60 @@ def _gpu_info(ram_gb: float | None) -> tuple[dict, str | None]:
         return gpu, None
 
 
+def _xpu_info(torch) -> dict | None:
+    """Intel GPU(xpu) 정보. xpu용 PyTorch가 아니거나 확인 중 오류가 나면 None (다른 장치 확인을 막지 않는다)."""
+    try:
+        x = getattr(torch, "xpu", None)
+        if x is None or not x.is_available():
+            return None
+        out = {"type": "xpu", "name": None, "vram_gb": None, "count": None}
+        try:
+            out["name"] = x.get_device_name(0)
+            out["vram_gb"] = round(x.get_device_properties(0).total_memory / 1024 ** 3, 1)
+            out["count"] = x.device_count()
+        except Exception:
+            pass
+        out["name"] = out["name"] or "Intel GPU"
+        return out
+    except Exception:
+        return None
+
+
 def tier_of(gpu: dict | None) -> str:
     g = gpu or {}
     vram = g.get("vram_gb") or 0
-    if g.get("type") in ("cuda", "mps") and vram >= 16:
+    if g.get("type") == "tpu":       # pc["gpu"]에는 TPU가 들어가지 않지만, 넘겨받은 값이 TPU면 TPU 등급
+        return "tpu"
+    if g.get("type") in ("cuda", "mps", "xpu") and vram >= 16:
         return "pc-gpu-high"
-    if g.get("type") in ("cuda", "mps") and vram >= 6:
+    if g.get("type") in ("cuda", "mps", "xpu") and vram >= 6:
         return "pc-gpu"
     return "pc-cpu"
 
 
 def _tier_label(tier: str) -> str:
-    return {"pc-cpu": "PC (CPU)", "pc-gpu": "PC (GPU)", "pc-gpu-high": "PC (고성능 GPU)"}.get(tier, tier)
+    return {"pc-cpu": "PC (CPU)", "pc-gpu": "PC (GPU)", "pc-gpu-high": "PC (고성능 GPU)",
+            "tpu": "TPU"}.get(tier, tier)
+
+
+def _accel_info() -> dict:
+    """설치된 가속 패키지와 장치 (accel.info). TPU는 실제로 열지 않고 설치 여부와 런타임 신호만 본다."""
+    try:
+        from . import accel
+
+        return accel.info(probe_tpu=False)
+    except Exception as e:  # 감지 실패는 조용히 넘어간다 (PRD 6.11)
+        return {"error": f"{type(e).__name__}: {e}"[:200]}
+
+
+def tpu_usable(profile: dict | None) -> tuple[bool, dict]:
+    """프로필의 accel 정보로 TPU 학습이 가능해 보이는가 -> (가능, TPU 정보). torch_xla가 설치돼 있고
+    TPU 런타임 신호가 있거나(짐작) 이미 열어 본 경우만 참. torch_xla를 불러오지 않는다."""
+    acc = (profile or {}).get("accel")
+    acc = acc if isinstance(acc, dict) else {}
+    t = acc.get("tpu") if isinstance(acc.get("tpu"), dict) else {}
+    avail = acc.get("available") if isinstance(acc.get("available"), dict) else {}
+    return bool(avail.get("tpu") or t.get("ok")), t
 
 
 def pc_profile(refresh: bool = False) -> dict:
@@ -184,6 +234,7 @@ def pc_profile(refresh: bool = False) -> dict:
     for m in MODULES:
         prof[m] = _has(m)
     prof["torch_version"] = torch_version
+    prof["accel"] = _accel_info()   # torch_xla·ROCm·xpu·TPU 런타임 신호 (PRD 6.11). gpu·tier의 뜻은 그대로
     prof["tier"] = tier_of(gpu)
     prof["tier_label"] = _tier_label(prof["tier"])
     prof["checked_at"] = time.time()
@@ -208,15 +259,35 @@ def recommend(profile: dict | None = None) -> dict:
     p = profile if profile is not None else pc_profile()
     gpu = p.get("gpu") or {}
     tier = p.get("tier") or tier_of(gpu)
-    if tier not in ("pc-cpu", "pc-gpu", "pc-gpu-high"):
+    if tier not in ("pc-cpu", "pc-gpu", "pc-gpu-high", "tpu"):
         tier = tier_of(gpu)
     cpu = int(p.get("cpu_count") or 1)
     threads = max(1, cpu - 1)
     ram = p.get("ram_gb")
     vram = gpu.get("vram_gb")
     notes: list[str] = []
+    tpu_ok, tpu = tpu_usable(p)
+    if not gpu.get("type") and tier == "pc-cpu":
+        if tpu_ok:         # GPU가 없고 TPU를 쓸 수 있어 보이면 TPU 등급 (PRD 6.8). accel 정보가 없으면 예전 그대로
+            tier = "tpu"
+        elif tpu.get("likely") and not tpu.get("installed"):
+            notes.append("TPU 런타임으로 보이지만 TPU 패키지(torch_xla)가 없어 CPU 기준으로 추천합니다. "
+                         "python -m learnbox.setup_accel 로 설치하세요.")
 
-    if tier == "pc-gpu-high":
+    if tier == "tpu":
+        try:
+            hbm = float(tpu.get("hbm_gb") or tpu.get("total_gb") or 0) or None
+        except (TypeError, ValueError):
+            hbm = None
+        mem = hbm or TPU_HBM_DEFAULT_GB
+        preset, steps = ("large", 1000) if mem >= 16 else ("base", 500)
+        lora, lora_steps = LORA_MODELS["1.5B"], 300
+        kind = tpu.get("accelerator_type") or "TPU"
+        notes.append(f"TPU({kind}, 메모리 {f'{hbm:g}GB' if hbm else f'약 {mem:g}GB로 가정'})로 학습합니다.")
+        notes.append("TPU는 처음 학습할 때 컴파일하느라 첫 단계가 몇 분 걸릴 수 있습니다 (그 뒤로는 빠릅니다).")
+        notes.append("LoRA는 측정 전까지 1.5B 모델을 권장합니다. 3B는 메모리가 빠듯할 수 있습니다.")
+        budget = mem * 1024 * 0.75
+    elif tier == "pc-gpu-high":
         preset, steps, lora, lora_steps = "large", 1000, LORA_MODELS["7B"], 300
         notes.append(f"고성능 GPU({gpu.get('name') or 'GPU'}, VRAM {vram or '?'}GB)가 있어 큰 모델 학습을 권장합니다.")
         if vram and vram < 20:

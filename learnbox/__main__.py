@@ -12,6 +12,8 @@ ARCH_FLAGS = (("d_model", "--d-model"), ("n_layer", "--n-layer"), ("n_head", "--
               ("vocab_size", "--vocab-size"))
 FIT_LABELS = (("phone-low", "휴대폰 저사양"), ("phone-high", "휴대폰 고사양"), ("pc-cpu", "PC CPU"),
               ("pc-gpu", "PC GPU"), ("pc-gpu-high", "고성능 GPU"))
+DEVICE_CHOICES = ("auto", "cuda", "tpu", "xpu", "mps", "cpu")
+AMP_CHOICES = ("auto", "fp16", "off", "fp32")
 
 
 def _app(args):
@@ -60,6 +62,31 @@ def _add_checkpoint_flag(s) -> None:
                    help="학습 중 N분마다 중간 저장 (기본: 설정값, 0이면 시간 기준 저장을 끄고 Ctrl+C 때만 저장)")
 
 
+def _device_arg(value: str) -> str:
+    """--device 값 정리 (GPU→cuda, TPU→tpu 같은 별칭과 대소문자). 고를 수 있는 값은 DEVICE_CHOICES가 검사한다."""
+    from . import accel
+
+    return accel.normalize(value)
+
+
+def _amp_arg(value: str) -> str:
+    from . import accel
+
+    return accel.normalize_amp(value) or value
+
+
+def _add_device_flag(s) -> None:
+    s.add_argument("--device", type=_device_arg, choices=DEVICE_CHOICES,
+                   help="학습 장치 (기본: 환경변수 LEARNBOX_DEVICE → 설정 training_device → auto). "
+                        "auto는 cuda → tpu → xpu → mps → cpu 순서")
+
+
+def _add_amp_flag(s) -> None:
+    s.add_argument("--amp", type=_amp_arg, choices=AMP_CHOICES,
+                   help="LoRA 정밀도: auto(bf16 가능하면 bf16, 아니면 fp16 혼합 정밀도) | fp16 | off(예전 방식) | fp32 "
+                        "(기본: 환경변수 LEARNBOX_AMP → 설정 lora_training.amp → auto)")
+
+
 def _add_start_flags(s) -> None:
     s.add_argument("--targets", help="학습 대상 (쉼표로): tiny,lora,embeddings,qa")
     s.add_argument("--tiny-preset", help="소형 AI 모델 크기 (auto | nano | mini | small | base | large | custom)")
@@ -73,6 +100,7 @@ def _add_start_flags(s) -> None:
     s.add_argument("--max-pages-per-hour", type=int, help="1시간에 수집할 최대 페이지 수")
     s.add_argument("--outside-window", action="store_true", help="허용 시간이 아니어도 학습")
     s.add_argument("--results-target", help="학습 종료 시 결과를 복사할 외장 저장장치 경로")
+    _add_device_flag(s)
 
 
 def _start_overrides(args) -> dict:
@@ -96,6 +124,8 @@ def _start_overrides(args) -> dict:
             ov[key] = getattr(args, opt)
     if args.outside_window:
         ov["train_outside_window"] = True
+    if getattr(args, "device", None):
+        ov["device"] = args.device
     return ov
 
 
@@ -147,6 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--lr", type=float)
     s.add_argument("--resume", type=int, metavar="MODEL_ID", help="이 소형 AI 모델에서 이어서 학습")
     _add_checkpoint_flag(s)
+    _add_device_flag(s)
 
     s = sub.add_parser("train-lora", aliases=["train-pc"], help="PC용 LoRA 학습")
     s.add_argument("--base-model")
@@ -157,12 +188,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-qa", action="store_true", help="Q&A 학습 데이터(qa.jsonl)를 섞지 않기")
     s.add_argument("--resume", type=int, metavar="MODEL_ID", help="이 LoRA 모델에서 이어서 학습")
     _add_checkpoint_flag(s)
+    _add_device_flag(s)
+    _add_amp_flag(s)
 
     s = sub.add_parser("jobs", help="최근 작업 목록 (번호, 종류, 상태, 체크포인트 단계)")
     s.add_argument("--limit", type=int, default=20)
 
     s = sub.add_parser("resume-job", help="중단/실패한 학습 작업을 체크포인트에서 이어서 하기 (Ctrl+C로 저장하고 멈춤)")
     s.add_argument("job_id", type=int, help="이어서 할 작업 번호 (`jobs`로 확인)")
+    s.add_argument("--device", type=_device_arg, choices=DEVICE_CHOICES,
+                   help="이어서 할 장치 (기본: 원래 작업의 장치가 아니라 지금 장치 = LEARNBOX_DEVICE → 설정 → auto)")
 
     sub.add_parser("index-embeddings", help="의미 검색 색인 만들기")
 
@@ -192,6 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--batch-size", type=int)
     s.add_argument("--base-model")
     s.add_argument("--lora-r", type=int)
+    _add_device_flag(s)
     s.add_argument("--json", action="store_true")
 
     s = sub.add_parser("device", help="이 PC의 성능과 학습 추천")
@@ -260,6 +296,8 @@ def cmd_ask(app, args) -> int:
 
 def cmd_estimate(app, args) -> int:
     body = {"kind": args.kind, "batch_size": args.batch_size}
+    if getattr(args, "device", None):
+        body["device"] = args.device
     if args.kind == "lora":
         body.update(base_model=args.base_model, lora_r=args.lora_r, seq_len=getattr(args, "seq_len", None))
         r = app.estimate(body)
@@ -288,7 +326,35 @@ def cmd_estimate(app, args) -> int:
           f"학습 메모리 {e['train_ram_mb']}MB (배치 {e.get('batch_size')}) · 실행 메모리 {e['infer_ram_mb']}MB")
     print("실행/학습 가능: " + ", ".join(f"{label} {'예' if e['fits'].get(k) else '아니오'}"
                                    for k, label in FIT_LABELS if k in e["fits"]))
+    fit = r.get("device_fit")
+    if fit:          # --device tpu일 때만 (PRD 6.8)
+        mem = f" (메모리 {fit['mem_gb']:g}GB)" if fit.get("mem_gb") else ""
+        verdict = {True: "예", False: "아니오"}.get(fit.get("fits"), "측정 필요")
+        print(f"TPU 학습 가능: {verdict}{mem}")
     return 0
+
+
+def _accel_line(acc: dict, pc: dict) -> str:
+    """명령줄 device의 '가속:' 줄 (PRD 6.11): torch · torch_xla · ROCm · xpu · TPU 런타임 신호."""
+    devs = acc.get("devices") or {}
+    tpu = acc.get("tpu") or {}
+    tv = acc.get("torch_version") or pc.get("torch_version")
+    xv = acc.get("torch_xla_version")
+    rocm = acc.get("rocm")
+    parts = [f"torch {tv or '없음'}", f"torch_xla {xv or '없음'}",
+             f"ROCm {rocm if isinstance(rocm, str) else ('있음' if rocm else '없음')}",
+             "xpu " + ("있음" + (f" ({devs['xpu']['name']})" if (devs.get("xpu") or {}).get("name") else "")
+                       if (devs.get("xpu") or {}).get("available") else "없음")]
+    if (devs.get("tpu") or {}).get("available"):
+        t = "TPU " + (tpu.get("accelerator_type") or "사용 가능")
+    elif tpu.get("likely"):
+        t = f"TPU {tpu.get('accelerator_type') or ''} 감지 (torch_xla 필요: python -m learnbox.setup_accel)".replace("  ", " ")
+    else:
+        t = "TPU 없음"
+    parts.append(t)
+    if acc.get("auto"):
+        parts.append(f"자동 선택 {acc['auto']}")
+    return " · ".join(parts)
 
 
 def cmd_device(app, args) -> int:
@@ -300,9 +366,12 @@ def cmd_device(app, args) -> int:
     gpu = pc.get("gpu") or {}
     print(f"운영체제: {pc.get('os')} {pc.get('os_version') or ''} · CPU {pc.get('cpu_count')}코어 · "
           f"메모리 {pc.get('ram_gb') if pc.get('ram_gb') is not None else '알 수 없음'}GB")
-    print("GPU: " + (f"{gpu.get('name') or gpu.get('type')} (VRAM {gpu.get('vram_gb')}GB)" if gpu.get("type") else "없음"))
+    amd = " · AMD ROCm" if gpu.get("vendor") == "amd" else ""
+    print("GPU: " + (f"{gpu.get('name') or gpu.get('type')} (VRAM {gpu.get('vram_gb')}GB){amd}" if gpu.get("type")
+                     else "없음"))
     pk = ("torch", "transformers", "peft", "onnxruntime", "anthropic", "pypdf")
     print("패키지: " + ", ".join(f"{k} {'있음' if pc.get(k) else '없음'}" for k in pk))
+    print("가속: " + _accel_line(info.get("accel") or {}, pc))
     print(f"등급: {pc.get('tier_label') or pc.get('tier')}")
     print(f"\n추천: 소형 AI 모델 '{rec['tiny_preset']}' · 주기당 {rec['tiny_steps_per_cycle']}단계 · 배치 {rec['tiny_batch_size']} · "
           f"스레드 {rec['threads']} · LoRA {rec['lora_base_model'] or '권장 안 함'}")
@@ -446,7 +515,7 @@ def _cli_stop(app, args, job_id: int, t) -> int:
 
 
 def cmd_resume_job(app, args) -> int:
-    new_id = app.restart_job(args.job_id, "cli", enqueue=False)
+    new_id = app.restart_job(args.job_id, "cli", enqueue=False, device=getattr(args, "device", None))
     ck = (app.db.get_job(new_id)["params"] or {}).get("resume_checkpoint")
     print(f"작업 #{args.job_id}의 체크포인트에서 이어서 학습합니다 (새 작업 #{new_id}, 체크포인트 {ck}).")
     print("멈추려면 Ctrl+C (지금 단계를 마치고 저장한 뒤 멈춥니다).", flush=True)
@@ -638,13 +707,14 @@ def _dispatch(app, args) -> int:
         return _print_job(jobs.run_inline("ingest_path", {"path": args.path, "actor": "cli"}))
     if cmd in ("train-tiny", "train-mobile"):
         params = {k: v for k, v in {"preset": args.preset, "steps": args.steps, "batch_size": args.batch_size,
-                                    "lr": args.lr, "resume_from_model_id": args.resume,
+                                    "lr": args.lr, "resume_from_model_id": args.resume, "device": args.device,
                                     **{k: getattr(args, k) for k, _ in ARCH_FLAGS}}.items() if v}
         return _train_cli(app, args, "train_tiny", params)
     if cmd in ("train-lora", "train-pc"):
         params = {k: v for k, v in {"base_model": args.base_model, "lora_r": args.lora_r, "max_steps": args.max_steps,
                                     "seq_len": args.seq_len, "batch_size": args.batch_size,
-                                    "resume_from_model_id": args.resume}.items() if v}
+                                    "resume_from_model_id": args.resume, "device": args.device,
+                                    "amp": args.amp}.items() if v}
         if args.no_qa:
             params["use_qa"] = False
         return _train_cli(app, args, "train_lora", params)
