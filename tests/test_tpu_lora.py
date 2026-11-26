@@ -485,6 +485,63 @@ class RetieTest(_Data, unittest.TestCase):
         self.assertEqual(info["total_params"], n0 + info["trainable_params"])
 
 
+class TorchTpuDropoutTest(_Data, unittest.TestCase):
+    """TorchTPU 알려진 문제(#6966): 체크포인팅 + dropout이면 기울기가 틀리므로 dropout을 끈다. 다른 경우는 그대로."""
+
+    @classmethod
+    def setUpClass(cls):
+        _need_tiny_model()
+        cls.make_data("lb-tpu-lora-drop-")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.drop_data()
+
+    def test_disable_dropout_helper(self):
+        import torch
+
+        m = torch.nn.Sequential(torch.nn.Dropout(0.1), torch.nn.Linear(2, 2), torch.nn.Dropout(0.0))
+        m[1].attention_dropout = 0.2
+        self.assertEqual(train_pc._disable_dropout(m), 2)
+        self.assertEqual(m[0].p, 0.0)
+        self.assertEqual(m[1].attention_dropout, 0.0)
+        self.assertEqual(train_pc._disable_dropout(m), 0)
+
+    def run_fake_tpu(self, backend, ckpt):
+        import torch
+
+        kw = dict(max_steps=1, lr=1e-3, seq_len=SEQ, batch_size=2, grad_accum=1, lora_r=4, lora_alpha=8, threads=1,
+                  seed=6, gradient_checkpointing=ckpt)
+        seen = {}
+        real = train_pc._disable_dropout
+
+        def spy(model):
+            n = real(model)
+            seen["n"] = n
+            seen["ps"] = [m.p for m in model.modules() if isinstance(m, torch.nn.Dropout)]
+            return n
+
+        with mock.patch.object(accel, "pick", return_value=("tpu", torch.device("cpu"), None)), \
+                mock.patch.object(accel, "tpu_backend", return_value=backend), \
+                mock.patch.object(accel, "step_end"), \
+                mock.patch.object(accel, "mem_total_gb", return_value=16.0), \
+                mock.patch.object(train_pc, "_disable_dropout", side_effect=spy):
+            info = train_pc.train_lora(str(self.train), str(self.eval), self.tmp / f"{backend}-{ckpt}", TINY, **kw)
+        return info, seen
+
+    def test_torch_tpu_with_checkpointing_disables_dropout(self):
+        info, seen = self.run_fake_tpu("torch_tpu", True)
+        self.assertGreater(seen["n"], 0)
+        self.assertTrue(all(p == 0.0 for p in seen["ps"]))
+        self.assertTrue(any("dropout을 끄고" in n for n in info["notes"]))
+
+    def test_other_cases_keep_dropout(self):
+        for backend, ckpt in (("torch_tpu", False), ("torch_xla", True)):
+            info, seen = self.run_fake_tpu(backend, ckpt)
+            self.assertNotIn("n", seen, (backend, ckpt))
+            self.assertFalse(any("dropout을 끄고" in n for n in info["notes"]))
+
+
 # ---------------------------------------------------------------------------
 # 실제 CPU 학습: 정밀도 모드·장치 지정은 CPU 결과를 바꾸지 않는다, 체크포인트 키
 # ---------------------------------------------------------------------------

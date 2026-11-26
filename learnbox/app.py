@@ -231,14 +231,20 @@ class App:
                 "accel": self._accel_devices(pc), "defaults": self.training_defaults()}
 
     def training_defaults(self) -> dict:
-        """학습 폼의 기본 선택: 설정 training_device, lora_training.amp (잘못 저장된 값은 auto로 본다)."""
+        """학습 폼의 '자동'이 실제로 쓸 값: 환경변수(LEARNBOX_DEVICE, LEARNBOX_AMP) → 설정 training_device,
+        lora_training.amp → auto. 학습 요청에서 device/amp를 빼면 서버가 이 순서로 정한다(잘못된 값은 auto)."""
         out = {}
-        for key, raw, check in (("training_device", self.cfg.get("training_device"), device_value),
-                                ("amp", (self.cfg["lora_training"] or {}).get("amp"), amp_value)):
+        for key, raw, check, resolve in (
+                ("training_device", self.cfg.get("training_device"), device_value, accel.requested_device),
+                ("amp", (self.cfg["lora_training"] or {}).get("amp"), amp_value, accel.requested_amp)):
             try:
-                out[key] = check(raw)
+                cfg_value = check(raw)
             except ValueError:
-                out[key] = "auto"
+                cfg_value = "auto"
+            try:
+                out[key] = check(resolve(None, cfg_value))
+            except ValueError:
+                out[key] = cfg_value
         return out
 
     @staticmethod
@@ -268,7 +274,7 @@ class App:
         for d in accel.DEVICES:
             out[d] = {"available": bool(avail.get(d, d in ("auto", "cpu"))), "label": labels[d], "name": names.get(d)}
         if tpu.get("likely") and not tpu.get("installed"):
-            out["tpu"]["note"] = "TPU 패키지(torch_xla)가 없습니다: python -m learnbox.setup_accel"
+            out["tpu"]["note"] = "TPU 패키지(torch_tpu)가 없습니다: python -m learnbox.setup_accel"
         elif tpu.get("likely") and mismatch and not out["tpu"]["available"]:
             out["tpu"]["note"] = mismatch
         auto = next((d for d in ("cuda", "tpu", "xpu", "mps") if out[d]["available"]), "cpu")
@@ -281,7 +287,8 @@ class App:
         return {"auto": auto, "devices": out, "cuda_bf16": cuda_bf16, "rocm": rocm,
                 "torch_version": acc.get("torch_version") or pc.get("torch_version"),
                 "torch_xla_version": acc.get("torch_xla_version"),
-                "tpu": {**{k: tpu.get(k) for k in ("installed", "likely", "ok", "accelerator_type", "hbm_gb")},
+                "torch_tpu_version": acc.get("torch_tpu_version"),
+                "tpu": {**{k: tpu.get(k) for k in ("installed", "likely", "ok", "accelerator_type", "hbm_gb", "backend", "packages")},
                         "mismatch": mismatch or None}}
 
     def estimate(self, body: dict) -> dict:

@@ -340,8 +340,9 @@ def _accel_line(acc: dict, pc: dict) -> str:
     tpu = acc.get("tpu") or {}
     tv = acc.get("torch_version") or pc.get("torch_version")
     xv = acc.get("torch_xla_version")
+    ttv = acc.get("torch_tpu_version")
     rocm = acc.get("rocm")
-    parts = [f"torch {tv or '없음'}", f"torch_xla {xv or '없음'}",
+    parts = [f"torch {tv or '없음'}"] + ([f"torch_tpu {ttv}"] if ttv else []) + [f"torch_xla {xv or '없음'}",
              f"ROCm {rocm if isinstance(rocm, str) else ('있음' if rocm else '없음')}",
              "xpu " + ("있음" + (f" ({devs['xpu']['name']})" if (devs.get("xpu") or {}).get("name") else "")
                        if (devs.get("xpu") or {}).get("available") else "없음")]
@@ -351,7 +352,7 @@ def _accel_line(acc: dict, pc: dict) -> str:
         t = (f"TPU {tpu.get('accelerator_type') or ''} 감지 "
              f"(torch·torch_xla 버전 불일치: python -m learnbox.setup_accel)").replace("  ", " ")
     elif tpu.get("likely"):
-        t = f"TPU {tpu.get('accelerator_type') or ''} 감지 (torch_xla 필요: python -m learnbox.setup_accel)".replace("  ", " ")
+        t = f"TPU {tpu.get('accelerator_type') or ''} 감지 (TPU 패키지 필요: python -m learnbox.setup_accel)".replace("  ", " ")
     else:
         t = "TPU 없음"
     parts.append(t)

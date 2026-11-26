@@ -19,7 +19,7 @@ CACHE_SEC = 60.0
 _LOCK = threading.Lock()
 _CACHE: dict = {"t": 0.0, "v": None}
 
-MODULES = ("torch", "transformers", "peft", "onnx", "onnxruntime", "anthropic", "pypdf", "torch_xla")
+MODULES = ("torch", "transformers", "peft", "onnx", "onnxruntime", "anthropic", "pypdf", "torch_xla", "torch_tpu")
 
 LORA_MODELS = {
     "0.5B": "Qwen/Qwen2.5-0.5B-Instruct",
@@ -308,7 +308,7 @@ def recommend(profile: dict | None = None) -> dict:
         if tpu_ok:         # GPU가 없고 TPU를 쓸 수 있어 보이면 TPU 등급 (PRD 6.8). accel 정보가 없으면 예전 그대로
             tier = "tpu"
         elif tpu.get("likely") and not tpu.get("installed"):
-            notes.append("TPU 런타임으로 보이지만 TPU 패키지(torch_xla)가 없어 CPU 기준으로 추천합니다. "
+            notes.append("TPU 런타임으로 보이지만 TPU 패키지(torch_tpu)가 없어 CPU 기준으로 추천합니다. "
                          "python -m learnbox.setup_accel 로 설치하세요.")
         elif tpu.get("likely") and xla_mismatch(p.get("accel")):
             notes.append("TPU 런타임으로 보이지만 TPU를 열 수 없어 CPU 기준으로 추천합니다. "

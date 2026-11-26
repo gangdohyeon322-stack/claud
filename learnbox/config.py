@@ -126,6 +126,8 @@ def device_value(value, name: str = "device") -> str:
         return "auto"
     if not isinstance(value, str):
         raise ValueError(f"'{name}' 값이 올바르지 않습니다: {value!r} (auto, cuda, tpu, xpu, mps, cpu 중 하나)")
+    if value.strip().lower().startswith(("tpu:", "xla:")):  # TPU는 칩 1개(v5e-1)만 쓰므로 번호를 받지 않는다
+        raise ValueError(f"'{name}' 값이 올바르지 않습니다: {value!r} (auto, cuda, tpu, xpu, mps, cpu 중 하나)")
     n = accel.normalize(value)
     base, sep, idx = n.partition(":")
     if base in accel.DEVICES and (not sep or (idx.isdigit() and base in ("cuda", "xpu"))):

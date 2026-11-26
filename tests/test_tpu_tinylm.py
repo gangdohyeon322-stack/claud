@@ -222,7 +222,7 @@ class DevicePickTest(_EnvMixin, unittest.TestCase):
             os.environ["LEARNBOX_DEVICE"] = "tpu"
             name, dev, note = tinylm._pick_device(None)
             self.assertEqual((name, dev), ("cpu", torch.device("cpu")))
-            self.assertTrue(note.startswith("TPU 패키지(torch_xla)가 없어 CPU로 학습했습니다."), note)
+            self.assertTrue(note.startswith("TPU 패키지(torch_tpu 또는 torch_xla)가 없어 CPU로 학습했습니다."), note)
             self.assertIn("python -m learnbox.setup_accel", note)
             self.assertEqual(tinylm._pick_device("auto")[2], note)  # auto도 '지정 안 함'
             self.assertEqual(tinylm._pick_device("cpu"), ("cpu", torch.device("cpu"), None))  # 요청이 우선
@@ -235,7 +235,7 @@ class DevicePickTest(_EnvMixin, unittest.TestCase):
             for want in ("xla:0", "tpu:0", "XLA:1"):
                 name, dev, note = tinylm._pick_device(want)
                 self.assertEqual((name, dev), ("cpu", torch.device("cpu")), want)
-                self.assertTrue(note.startswith("TPU 패키지(torch_xla)가 없어 CPU로 학습했습니다."), note)
+                self.assertTrue(note.startswith("TPU 패키지(torch_tpu 또는 torch_xla)가 없어 CPU로 학습했습니다."), note)
             self.assertEqual(probe.call_count, 3)
             os.environ["LEARNBOX_DEVICE"] = "xla:0"
             self.assertEqual(tinylm._pick_device(None)[0], "cpu")
@@ -251,7 +251,7 @@ class DevicePickTest(_EnvMixin, unittest.TestCase):
             info = tinylm.train(tr, ev, tmp / "m", ARCH, steps=3, device="tpu", **KW)
         self.assertEqual(info["device"], "cpu")
         self.assertEqual(info["dtype"], "float32")
-        self.assertEqual(len([n for n in info["notes"] if n.startswith("TPU 패키지(torch_xla)가 없어")]), 1,
+        self.assertEqual(len([n for n in info["notes"] if n.startswith("TPU 패키지(torch_tpu 또는 torch_xla)가 없어")]), 1,
                          info["notes"])
         saved = json.loads((tmp / "m" / "info.json").read_text(encoding="utf-8"))
         self.assertEqual((saved["device"], saved["dtype"]), ("cpu", "float32"))

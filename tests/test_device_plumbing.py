@@ -270,6 +270,19 @@ class AppPlumbingTest(unittest.TestCase):
         self.app.cfg.data["lora_training"]["amp"] = "off"
         self.assertEqual(self.app.device_info()["defaults"], {"training_device": "tpu", "amp": "off"})
 
+    def test_training_defaults_follow_env_before_config(self):
+        """웹의 '자동'은 요청에서 빠지므로 서버가 환경변수 → 설정 순서로 정한다. 기본값 표시도 같은 순서."""
+        self.app.cfg.data["training_device"] = "cpu"
+        self.app.cfg.data["lora_training"]["amp"] = "off"
+        with mock.patch.dict(os.environ, {"LEARNBOX_DEVICE": "tpu", "LEARNBOX_AMP": "fp16"}):
+            self.assertEqual(self.app.training_defaults(), {"training_device": "tpu", "amp": "fp16"})
+        env = {k: v for k, v in os.environ.items() if k not in ("LEARNBOX_DEVICE", "LEARNBOX_AMP")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(self.app.training_defaults(), {"training_device": "cpu", "amp": "off"})
+        self.app.cfg.data["training_device"] = "warp-drive"  # 잘못 저장된 값
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(self.app.training_defaults()["training_device"], "auto")
+
     def test_capabilities_device_strings(self):
         self.app._profile_warm.set()
         base = {"tier": "pc-cpu", "gpu": {"type": None, "name": None, "vram_gb": None}}

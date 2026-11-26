@@ -61,6 +61,8 @@ class NamesTest(unittest.TestCase):
         self.assertEqual(accel.normalize("xla"), "tpu")
         self.assertEqual(accel.normalize("rocm"), "cuda")
         self.assertEqual(accel.normalize("cuda:1"), "cuda:1")
+        self.assertEqual(accel.normalize("xla:0"), "tpu")
+        self.assertEqual(accel.normalize("TPU:1"), "tpu")
         self.assertEqual(accel.name("xla:0"), "tpu")
         self.assertEqual(accel.label("tpu"), "TPU")
 

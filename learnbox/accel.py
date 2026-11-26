@@ -51,6 +51,8 @@ def normalize(device) -> str:
     if hasattr(device, "type") and not isinstance(device, str):  # torch.device
         return name(device)
     s = str(device).strip().lower()
+    if s.startswith(("xla:", "tpu:")):  # 번호 붙은 TPU 장치도 TPU 감지를 거친다
+        return "tpu"
     return _ALIASES.get(s, s)
 
 
@@ -348,7 +350,7 @@ def _mps_ok() -> bool:
 
 def _tpu_missing_note(reason: str | None) -> str:
     if reason == "not_installed":
-        return ("TPU 패키지(torch_xla)가 없어 CPU로 학습했습니다. "
+        return ("TPU 패키지(torch_tpu 또는 torch_xla)가 없어 CPU로 학습했습니다. "
                 "TPU 런타임에서 python -m learnbox.setup_accel 을 실행해 설치하세요.")
     return f"TPU를 찾지 못해 CPU로 학습했습니다 ({reason or '알 수 없음'})."
 

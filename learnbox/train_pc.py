@@ -587,6 +587,22 @@ def _embeddings_tied(model) -> bool:
     return w is not None and out is not None and getattr(out, "weight", None) is w
 
 
+def _disable_dropout(model) -> int:
+    """모든 dropout을 끈다(nn.Dropout p=0, 어텐션 dropout 값 0). 바꾼 개수를 돌려준다. TorchTPU 체크포인팅 전용."""
+    import torch
+
+    n = 0
+    for m in model.modules():
+        if isinstance(m, torch.nn.modules.dropout._DropoutNd) and m.p > 0:
+            m.p = 0.0
+            n += 1
+        v = getattr(m, "attention_dropout", None)
+        if isinstance(v, float) and v > 0:
+            m.attention_dropout = 0.0
+            n += 1
+    return n
+
+
 def _to_train_device(model, dev: str, tdev) -> None:
     """model.to(tdev). TPU(XLA)로 옮기면 Module._apply가 모듈마다 새 Parameter를 만들어 묶여 있던 입력·출력
     임베딩이 풀린다(HBM에 얼린 임베딩 사본이 하나 더 생기고 total_params도 틀어짐; HF Trainer도 다시 묶음).
@@ -1051,6 +1067,9 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
         model = get_peft_model(model, LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=0.05,
                                                  target_modules="all-linear", task_type="CAUSAL_LM"))
     _to_train_device(model, dev, tdev)
+    if use_ckpt and accel.tpu_backend(tdev) == "torch_tpu" and _disable_dropout(model):
+        # TorchTPU 알려진 문제(#6966): 즉시 실행 + 활성값 체크포인팅 + dropout이면 기울기가 조용히 틀린다.
+        notes.append("TPU(torch_tpu)에서 활성값 체크포인팅을 쓰므로 기울기 오류를 피하려고 dropout을 끄고 학습합니다.")
     pcfg = model.peft_config.get("default") if hasattr(model, "peft_config") else None
     if pcfg is not None:
         lora_r, lora_alpha = int(pcfg.r), int(pcfg.lora_alpha)
