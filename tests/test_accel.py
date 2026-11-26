@@ -1,0 +1,264 @@
+"""장치 계층(learnbox/accel.py) 단위 테스트. TPU가 없는 환경에서도 돌도록 torch_xla를 가짜 모듈로 흉내 낸다."""
+import importlib.util
+import os
+import subprocess
+import sys
+import types
+import unittest
+from collections import OrderedDict
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from learnbox import accel  # noqa: E402
+
+HAS_TORCH = importlib.util.find_spec("torch") is not None
+
+
+def _fake_xla(kind="TPU", calls=None, fail=None):
+    """가짜 torch_xla 패키지 (sys.modules에 넣을 dict)."""
+    import torch
+
+    calls = calls if calls is not None else []
+    txla = types.ModuleType("torch_xla")
+    xm = types.ModuleType("torch_xla.core.xla_model")
+    xr = types.ModuleType("torch_xla.runtime")
+    core = types.ModuleType("torch_xla.core")
+    dbg = types.ModuleType("torch_xla.debug")
+    met = types.ModuleType("torch_xla.debug.metrics")
+    dev = torch.device("xla:0")
+
+    def device():
+        calls.append("device")
+        if fail:
+            raise RuntimeError(fail)
+        return dev
+
+    txla.device = device
+    txla.sync = lambda: calls.append("sync")
+    xm.xla_device_hw = lambda d: kind
+    xm.set_rng_state = lambda seed, device=None: calls.append(("seed", seed))
+    xm.get_memory_info = lambda d: {"bytes_limit": 16 * 1024 ** 3, "bytes_used": 1024 ** 3}
+    xr.device_type = lambda: kind
+    met.metric_data = lambda name: (7, 1.0, []) if name == "CompileTime" else None
+    txla.core, core.xla_model, txla.runtime, txla.debug, dbg.metrics = core, xm, xr, dbg, met
+    return {"torch_xla": txla, "torch_xla.core": core, "torch_xla.core.xla_model": xm,
+            "torch_xla.runtime": xr, "torch_xla.debug": dbg, "torch_xla.debug.metrics": met}, dev
+
+
+class NamesTest(unittest.TestCase):
+    def test_import_does_not_load_torch(self):
+        code = "import sys; import learnbox.accel; print('torch' in sys.modules, 'torch_xla' in sys.modules)"
+        out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.stdout.strip(), "False False", out.stderr)
+
+    def test_normalize(self):
+        self.assertEqual(accel.normalize(None), "auto")
+        self.assertEqual(accel.normalize(""), "auto")
+        self.assertEqual(accel.normalize("GPU"), "cuda")
+        self.assertEqual(accel.normalize("xla"), "tpu")
+        self.assertEqual(accel.normalize("rocm"), "cuda")
+        self.assertEqual(accel.normalize("cuda:1"), "cuda:1")
+        self.assertEqual(accel.name("xla:0"), "tpu")
+        self.assertEqual(accel.label("tpu"), "TPU")
+
+    def test_requested_device_precedence(self):
+        with mock.patch.dict(os.environ, {"LEARNBOX_DEVICE": "tpu"}):
+            self.assertEqual(accel.requested_device("cpu", "cuda"), "cpu")
+            self.assertEqual(accel.requested_device("auto", "cuda"), "tpu")
+            self.assertEqual(accel.requested_device(None, "cuda"), "tpu")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LEARNBOX_DEVICE", None)
+            self.assertEqual(accel.requested_device(None, "cuda"), "cuda")
+            self.assertEqual(accel.requested_device("", "auto"), "auto")
+
+    def test_requested_amp_precedence(self):
+        with mock.patch.dict(os.environ, {"LEARNBOX_AMP": "1"}):
+            self.assertEqual(accel.requested_amp(None, "off"), "fp16")
+            self.assertEqual(accel.requested_amp("off", None), "off")
+            self.assertEqual(accel.requested_amp("auto", "off"), "fp16")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LEARNBOX_AMP", None)
+            self.assertEqual(accel.requested_amp(None, "off"), "off")
+            self.assertEqual(accel.requested_amp(None, None), "auto")
+            self.assertEqual(accel.requested_amp("garbage", None), "auto")
+        self.assertEqual(accel.normalize_amp("float32"), "fp32")
+        self.assertIsNone(accel.normalize_amp("bogus"))
+
+
+class PrecisionTest(unittest.TestCase):
+    def test_cpu_and_mps_keep_plan(self):
+        for d in ("cpu", "mps"):
+            self.assertEqual(accel.lora_precision(d, "fp16", plan_dtype="float32"), ("float32", False, None))
+            self.assertEqual(accel.lora_precision(d, "auto", plan_dtype="bfloat16"), ("bfloat16", False, None))
+
+    def test_cuda_policy(self):
+        with mock.patch.object(accel, "native_bf16", return_value=False):
+            dt, amp, note = accel.lora_precision("cuda", "auto", plan_dtype="bfloat16")
+            self.assertEqual((dt, amp), ("float16", True))
+            self.assertIn("LEARNBOX_AMP=off", note)
+            self.assertEqual(accel.lora_precision("cuda", "off", plan_dtype="bfloat16"), ("bfloat16", False, None))
+            self.assertEqual(accel.lora_precision("cuda", "off", plan_dtype="float32"), ("float32", False, None))
+            self.assertEqual(accel.lora_precision("cuda", "fp32", plan_dtype="bfloat16"), ("float32", False, None))
+            self.assertEqual(accel.lora_precision("cuda", "fp16")[:2], ("float16", True))
+            # 직접 준(또는 저장된) dtype이 우선. float16이면 혼합 정밀도를 켠다.
+            self.assertEqual(accel.lora_precision("cuda", "auto", requested_dtype="float16"), ("float16", True, None))
+            self.assertEqual(accel.lora_precision("cuda", "fp16", requested_dtype="float32"), ("float32", False, None))
+        with mock.patch.object(accel, "native_bf16", return_value=True):
+            self.assertEqual(accel.lora_precision("cuda", "auto", plan_dtype="bfloat16"), ("bfloat16", False, None))
+
+    def test_tpu_policy(self):
+        self.assertEqual(accel.lora_precision("tpu", "auto"), ("bfloat16", False, None))
+        dt, amp, note = accel.lora_precision("tpu", "fp16")
+        self.assertEqual((dt, amp), ("bfloat16", False))
+        self.assertTrue(note)
+        self.assertEqual(accel.lora_precision("tpu", "auto", requested_dtype="float16")[:2], ("bfloat16", False))
+        self.assertEqual(accel.lora_precision("tpu", "fp32"), ("float32", False, None))
+
+    def test_env_used_when_mode_none(self):
+        with mock.patch.dict(os.environ, {"LEARNBOX_AMP": "off"}), \
+                mock.patch.object(accel, "native_bf16", return_value=False):
+            self.assertEqual(accel.lora_precision("cuda", None, plan_dtype="float32"), ("float32", False, None))
+
+
+@unittest.skipUnless(HAS_TORCH, "torch 필요")
+class TorchPathsTest(unittest.TestCase):
+    def setUp(self):
+        accel._reset_tpu_probe()
+        self.addCleanup(accel._reset_tpu_probe)
+
+    def test_pick_cpu_paths_match_old_notes(self):
+        import torch
+
+        if torch.cuda.is_available():
+            self.skipTest("CUDA가 있는 환경")
+        self.assertEqual(accel.pick(None)[:2], ("cpu", torch.device("cpu")))
+        self.assertEqual(accel.pick("cuda")[2], "CUDA GPU를 찾지 못해 CPU로 학습했습니다.")
+        self.assertIn("알 수 없는 장치 'weird'", accel.pick("weird")[2])
+        with mock.patch.object(accel, "_has", side_effect=lambda m: m != "torch_xla"):
+            n, d, note = accel.pick("tpu")
+            self.assertEqual(n, "cpu")
+            self.assertIn("torch_xla", note)
+
+    def test_pick_tpu_with_fake_xla(self):
+        import torch
+
+        if torch.cuda.is_available():
+            self.skipTest("CUDA가 있는 환경")
+        calls = []
+        mods, dev = _fake_xla(calls=calls)
+        with mock.patch.dict(sys.modules, mods), mock.patch.object(accel, "_has", return_value=True):
+            self.assertEqual(accel.pick("auto"), ("tpu", dev, None))
+            self.assertEqual(accel.pick("tpu"), ("tpu", dev, None))
+            self.assertEqual(calls.count("device"), 1)  # 한 번만 연다
+            accel.step_end(dev)
+            self.assertIn("sync", calls)
+            accel.manual_seed(dev, 3)
+            self.assertIn(("seed", 3), calls)
+            self.assertEqual(accel.compile_count(), 7)
+            self.assertAlmostEqual(accel.mem_total_gb(dev), 16.0)
+            self.assertTrue(accel.available()["tpu"])
+            # 다른 장치는 아무것도 하지 않는다
+            n = len(calls)
+            accel.step_end("cpu")
+            accel.manual_seed("cpu", 1)
+            self.assertEqual(len(calls), n)
+            self.assertEqual(accel.pick("tpu", allow_tpu=False)[0], "cpu")
+            self.assertEqual(accel.pick("auto", allow_tpu=False)[0], "cpu")
+
+    def test_pick_rejects_xla_cpu(self):
+        mods, _ = _fake_xla(kind="CPU")
+        with mock.patch.dict(sys.modules, mods), mock.patch.object(accel, "_has", return_value=True):
+            n, d, note = accel.pick("tpu")
+            self.assertEqual(n, "cpu")
+            self.assertIn("TPU가 아닙니다", note)
+
+    def test_pick_survives_broken_xla(self):
+        mods, _ = _fake_xla(fail="version mismatch")
+        with mock.patch.dict(sys.modules, mods), mock.patch.object(accel, "_has", return_value=True):
+            self.assertEqual(accel.pick("auto")[0], "cpu")
+            n, _, note = accel.pick("tpu")
+            self.assertEqual(n, "cpu")
+            self.assertIn("version mismatch", note)
+
+    def test_autocast_and_scaler(self):
+        import contextlib
+
+        import torch
+
+        self.assertIsInstance(accel.autocast("cpu", None), contextlib.nullcontext)
+        self.assertIsInstance(accel.autocast("cpu", torch.float32), contextlib.nullcontext)
+        s = accel.make_scaler("cpu", True)
+        self.assertFalse(s.is_enabled())
+        self.assertFalse(accel.make_scaler("tpu", True).is_enabled())
+        self.assertIsNone(accel.tiny_amp_dtype("cpu"))
+        self.assertIsNone(accel.tiny_amp_dtype("mps"))
+        self.assertEqual(accel.tiny_amp_dtype("tpu"), torch.bfloat16)
+
+    def test_optimizer_step_disabled_scaler_is_plain_step(self):
+        import torch
+
+        torch.manual_seed(0)
+        p1 = torch.nn.Parameter(torch.randn(3))
+        p2 = torch.nn.Parameter(p1.detach().clone())
+        o1, o2 = torch.optim.AdamW([p1], lr=0.1), torch.optim.AdamW([p2], lr=0.1)
+        for p, o in ((p1, o1), (p2, o2)):
+            (p ** 2).sum().backward()
+        o1.step()
+        accel.optimizer_step(o2, accel.make_scaler("cpu", False), "cpu")
+        self.assertTrue(torch.equal(p1, p2))
+
+    def test_to_cpu(self):
+        import torch
+
+        sd = OrderedDict(a=torch.ones(2), b=[torch.zeros(1), (torch.ones(1), 3)])
+        sd._metadata = {"": {"version": 1}}
+        self.assertIs(accel.to_cpu(sd, "cpu"), sd)
+        self.assertIs(accel.to_cpu(sd, "cuda"), sd)
+        out = accel.to_cpu(sd, "tpu")
+        self.assertIsNot(out, sd)
+        self.assertIsInstance(out, OrderedDict)
+        self.assertEqual(out._metadata, sd._metadata)
+        self.assertTrue(torch.equal(out["a"], sd["a"]))
+        self.assertEqual(out["b"][1][1], 3)
+
+    def test_rng_and_cache_noops(self):
+        self.assertIsNone(accel.rng_state("cpu"))
+        self.assertIsNone(accel.rng_state("tpu"))
+        accel.empty_cache("tpu")
+        accel.empty_cache("cpu")
+        accel.empty_cache()
+        self.assertTrue(accel.is_oom(RuntimeError("CUDA out of memory. Tried")))
+        self.assertTrue(accel.is_oom(RuntimeError("RESOURCE_EXHAUSTED: Ran out of memory in memory space hbm")))
+        self.assertFalse(accel.is_oom(RuntimeError("shape mismatch")))
+
+    def test_info_without_probe(self):
+        with mock.patch.object(accel, "_probe_tpu", side_effect=AssertionError("열면 안 됨")):
+            info = accel.info()
+        self.assertIn("available", info)
+        self.assertTrue(info["available"]["cpu"])
+        self.assertIn("tpu", info)
+
+
+class HintTest(unittest.TestCase):
+    def test_hint_env(self):
+        with mock.patch.dict(os.environ, {"TPU_ACCELERATOR_TYPE": "v5litepod-1"}):
+            h = accel.tpu_hint()
+        self.assertTrue(h["likely"])
+        self.assertEqual(h["hbm_gb"], 16.0)
+        self.assertEqual(h["accelerator_type"], "v5litepod-1")
+
+    def test_hint_vfio_alone_is_not_enough(self):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("TPU_ACCELERATOR_TYPE", "TPU_NAME", "COLAB_TPU_ADDR", "TPU_WORKER_ID", "PJRT_DEVICE")}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(accel.glob, "glob", side_effect=lambda p: ["/dev/vfio/0"] if "vfio" in p else []):
+            h = accel.tpu_hint()
+        self.assertFalse(h["likely"])
+        self.assertIn("/dev/vfio/*", h["signals"])
+
+
+if __name__ == "__main__":
+    unittest.main()
