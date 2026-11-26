@@ -256,7 +256,8 @@ TPU는 PyTorch에서 `torch_xla`로 쓴다. GPU와 달리 다음 성질이 있�
 2. **`auto`의 우선순위**: GPU와 TPU가 둘 다 있을 때(드묾) GPU를 먼저 고를지.
 3. **자율 학습의 장치**: 자율 학습도 `training_device` 설정을 따를지, 항상 `auto`일지.
 4. **3B의 범위**: v5e-1에서 배치 2·문맥 512가 들어가지 않으면 배치 1로 낮춰 지원할지, 1.5B까지만 지원할지.
-5. **`torch_xla` 기본 포함 방식** (가장 중요): `torch_xla`(최신 2.9.0)와 `torch` 버전을 맞춰야 한다.
+5. ~~`torch_xla` 기본 포함 방식~~ → **결정: ②** (기본 구성에 포함하되 TPU 런타임에서만 설치). 아래는 검토했던 선택지.
+   `torch_xla`(최신 2.9.0)와 `torch` 버전을 맞춰야 한다.
    - ① `requirements-train.txt`에서 Linux일 때 `torch`와 `torch_xla`를 같은 버전(2.9)으로 고정 → 모든 Linux 사용자가 torch 2.9를 씀
    - ② `requirements-train.txt`에는 조건부로 넣되, 설치 스크립트가 TPU 런타임일 때만 설치(코랩 GPU·일반 PC는 영향 없음)
    - ③ 기본 파일에 넣지 않고 설치 스크립트가 자동으로 추가 설치
