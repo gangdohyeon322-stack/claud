@@ -1,0 +1,6 @@
+# TPU 런타임 전용 (코랩 TPU v5e 등). 직접 설치하지 말고 python -m learnbox.setup_accel 을 쓰세요.
+# TorchTPU(torch_tpu): torch 2.11 이상, Python 3.11 이상, Linux x86_64.
+# 코랩 TPU 런타임에는 이미 깔려 있어 setup_accel이 아무것도 하지 않습니다.
+# torch는 CPU용 빌드를 받습니다(TPU 계산은 torch_tpu가 함). 아래 줄이 없으면 수 GB짜리 CUDA 빌드를 받습니다.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch_tpu>=0.2.0; sys_platform == "linux" and platform_machine == "x86_64"

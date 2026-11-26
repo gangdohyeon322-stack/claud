@@ -38,19 +38,32 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [4/5] GPU용 PyTorch 설치 (CUDA 12.6, 실패하면 CUDA 12.1로 다시 시도)
-.venv\Scripts\python.exe -m pip uninstall -y torch >nul 2>&1
-.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu126 --retries 10 --resume-retries 10 --timeout 120
+rem GPU 종류 확인: NVIDIA가 없고 Intel Arc가 있으면 Intel GPU(XPU)용, 그 밖에는 예전처럼 CUDA용 PyTorch
+set "TORCH_BUILD=cuda"
+powershell -NoProfile -Command "(Get-CimInstance Win32_VideoController).Name" 2>nul | findstr /i "NVIDIA" >nul
 if errorlevel 1 (
-  echo CUDA 12.6 설치에 실패해서 CUDA 12.1로 다시 시도합니다.
-  .venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu121 --retries 10 --resume-retries 10 --timeout 120
+  powershell -NoProfile -Command "(Get-CimInstance Win32_VideoController).Name" 2>nul | findstr /i "Arc" >nul
+  if not errorlevel 1 set "TORCH_BUILD=xpu"
+)
+if "%TORCH_BUILD%"=="xpu" (
+  echo [4/5] Intel Arc GPU를 찾았습니다. Intel GPU^(XPU^)용 PyTorch를 설치합니다 ^(미검증^)
+  .venv\Scripts\python.exe -m pip uninstall -y torch >nul 2>&1
+  .venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/xpu --retries 10 --resume-retries 10 --timeout 120
+) else (
+  echo [4/5] GPU용 PyTorch 설치 ^(CUDA 12.6, 실패하면 CUDA 12.1로 다시 시도^)
+  .venv\Scripts\python.exe -m pip uninstall -y torch >nul 2>&1
+  .venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu126 --retries 10 --resume-retries 10 --timeout 120
+  if errorlevel 1 (
+    echo CUDA 12.6 설치에 실패해서 CUDA 12.1로 다시 시도합니다.
+    .venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu121 --retries 10 --resume-retries 10 --timeout 120
+  )
 )
 
 echo [5/5] 학습 패키지 설치와 확인
 .venv\Scripts\python.exe -m pip install -r requirements-train.txt --retries 10 --resume-retries 10 --timeout 120
-.venv\Scripts\python.exe -c "import torch; print('PyTorch', torch.__version__); print('GPU 사용 가능:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'GPU를 찾지 못했습니다 (CPU로 학습됩니다)')"
+.venv\Scripts\python.exe -c "import torch; print('PyTorch', torch.__version__); print('GPU 사용 가능:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NVIDIA GPU를 찾지 못했습니다'); x = getattr(torch, 'xpu', None); print('Intel GPU(XPU) 사용 가능:', bool(x and x.is_available()))"
 
 echo.
-echo 설치가 끝났습니다. 위에서 "GPU 사용 가능: True"가 나오면 정상입니다.
+echo 설치가 끝났습니다. 위에서 "GPU 사용 가능: True"(NVIDIA) 또는 "Intel GPU(XPU) 사용 가능: True"(Intel Arc)가 나오면 정상입니다.
 echo 이제 start-windows.bat 을 실행하면 서버가 켜집니다.
 pause

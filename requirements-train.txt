@@ -1,6 +1,9 @@
 # 학습 · 의미 검색 · 온라인 모델용 (용량 수 GB)
 # NVIDIA GPU가 있으면 먼저 https://pytorch.org 의 안내대로 CUDA용 torch를 설치한 뒤 이 파일을 설치하세요.
 -r requirements.txt
+# TPU(코랩 TPU v5e 등): TPU 백엔드(torch_tpu, 예전 런타임은 torch_xla)는 여기서 설치하지 않습니다.
+#   pip의 조건 표시로는 TPU를 알 수 없어서, TPU 런타임에서만 python -m learnbox.setup_accel 이 설치합니다(requirements-tpu.txt).
+# Intel Arc·AMD GPU: python -m learnbox.setup_accel --torch-build 가 맞는 torch 설치 명령을 알려 줍니다.
 # 소형 AI 모델 / LoRA 학습, 의미 검색(임베딩)
 torch>=2.2
 transformers>=4.56   # 5.x에서 시험했습니다 (모델을 불러올 때 dtype= 인자 사용)

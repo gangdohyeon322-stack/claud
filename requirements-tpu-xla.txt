@@ -1,0 +1,5 @@
+# 지원이 끝난 PyTorch/XLA(torch_xla 2.9, 마지막 버전) — torch_tpu를 쓸 수 없는 Python 3.10~3.12 TPU 런타임 전용.
+# python -m learnbox.setup_accel 이 필요할 때만 씁니다. torch를 2.9로 맞춥니다(GPU용 torch를 쓰는 PC에는 설치하지 마세요).
+# torch_xla는 torch 의존성을 선언하지 않으므로 torch 버전을 여기서 직접 고정합니다.
+torch==2.9.0; sys_platform == "linux" and platform_machine == "x86_64"
+torch_xla[tpu]==2.9.0; sys_platform == "linux" and platform_machine == "x86_64"

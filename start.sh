@@ -7,7 +7,11 @@ if [ ! -d .venv ]; then
   .venv/bin/pip install -q --upgrade pip
   .venv/bin/pip install -q -r requirements.txt
   read -r -p "학습 기능도 설치할까요? (용량 수 GB) [y/N] " yn
-  if [ "$yn" = "y" ] || [ "$yn" = "Y" ]; then .venv/bin/pip install -r requirements-train.txt; fi
+  if [ "$yn" = "y" ] || [ "$yn" = "Y" ]; then
+    .venv/bin/pip install -r requirements-train.txt
+    # TPU 런타임이면 TPU 백엔드(torch_tpu)를 설치하고, 아니면 아무것도 하지 않는다.
+    .venv/bin/python -m learnbox.setup_accel || true
+  fi
 fi
 if ! .venv/bin/python -c "import sys; from learnbox.config import Config; sys.exit(0 if Config('data').initialized else 1)"; then
   .venv/bin/python -m learnbox init
