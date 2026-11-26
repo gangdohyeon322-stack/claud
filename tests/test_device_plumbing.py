@@ -287,6 +287,31 @@ class AppPlumbingTest(unittest.TestCase):
             with mock.patch.object(devices, "pc_profile", return_value={**base, **extra}):
                 self.assertEqual(self.app.capabilities()["device"], want)
 
+    def test_xla_version_mismatch_is_not_tpu(self):
+        """torch와 torch_xla의 major.minor가 다르면 pick('auto')가 CPU를 고르므로 기기 카드·자동 선택도 TPU가 아니다."""
+        self.app._profile_warm.set()
+        acc = {"available": {"auto": True, "tpu": True, "cpu": True}, "torch_version": "2.15.0+cpu",
+               "torch_xla_version": "2.9.0",
+               "tpu": {"installed": True, "packages": ["torch_xla"], "likely": True, "ok": False,
+                       "backend": "torch_xla", "accelerator_type": "v5litepod-1", "hbm_gb": 16.0}}
+        pc = {"tier": "pc-cpu", "gpu": {"type": None, "name": None, "vram_gb": None}, "accel": acc}
+        with mock.patch.object(devices, "pc_profile", return_value=pc):
+            self.assertEqual(self.app.capabilities()["device"], "cpu")
+        a = self.app._accel_devices(pc)
+        self.assertEqual(a["auto"], "cpu")
+        self.assertFalse(a["devices"]["tpu"]["available"])
+        self.assertIn("setup_accel", a["devices"]["tpu"]["note"])
+        self.assertIn("setup_accel", a["tpu"]["mismatch"])
+        from learnbox.__main__ import _accel_line
+
+        self.assertIn("버전 불일치", _accel_line(a, pc))
+        ok = {**acc, "torch_xla_version": "2.15.1"}                              # 짝이 맞으면 예전처럼 TPU
+        a = self.app._accel_devices({**pc, "accel": ok})
+        self.assertEqual((a["auto"], a["tpu"]["mismatch"]), ("tpu", None))
+        self.assertNotIn("note", a["devices"]["tpu"])
+        with mock.patch.object(devices, "pc_profile", return_value={**pc, "accel": ok}):
+            self.assertEqual(self.app.capabilities()["device"], "tpu (v5litepod-1)")
+
     def test_estimate_device(self):
         lora = {"kind": "lora", "base_model": "Qwen/Qwen2.5-0.5B-Instruct"}
         plain = self.app.estimate(dict(lora))
@@ -567,6 +592,50 @@ class DevicesTest(unittest.TestCase):
         self.assertEqual(r["tier"], "pc-gpu")                                   # GPU가 있으면 예전 추천 그대로
         plain = {k: v for k, v in self.tpu_profile().items() if k != "accel"}
         self.assertEqual(devices.recommend(plain)["tier"], "pc-cpu")
+
+    def test_recommend_tpu_xla_version_mismatch(self):
+        def prof(tv, xv, packages=("torch_xla",)):
+            p = self.tpu_profile()
+            p["accel"].update(torch_version=tv, torch_xla_version=xv)
+            p["accel"]["tpu"].update(packages=list(packages), backend=packages[0])
+            return p
+
+        p = prof("2.15.0", "2.9.0")
+        self.assertEqual(devices.tpu_usable(p)[0], False)
+        r = devices.recommend(p)
+        self.assertEqual(r["tier"], "pc-cpu")                                   # pick('auto')처럼 CPU 기준
+        self.assertNotEqual(r["tiny_preset"], "large")
+        msg = devices.xla_mismatch(p["accel"])
+        self.assertIn("python -m learnbox.setup_accel", msg)
+        self.assertTrue(any(msg in n for n in r["notes"]))
+        self.assertFalse(any("TPU(" in n for n in r["notes"]))
+        for ok in (prof("2.9.0+cpu", "2.9.0"), prof("2.15.0", "2.15.1"),        # major.minor가 같으면 TPU
+                   prof("2.15.0", "2.9.0", ("torch_tpu", "torch_xla")),          # torch_tpu로 열 수 있음
+                   prof(None, "2.9.0")):                                         # 버전을 모르면 확인 생략
+            self.assertEqual(devices.recommend(ok)["tier"], "tpu")
+        p = prof("2.15.0", "2.9.0")
+        p["accel"]["tpu"]["ok"] = True                                          # 이미 열린 TPU는 그대로
+        self.assertEqual(devices.recommend(p)["tier"], "tpu")
+
+    def test_profile_marks_xla_version_mismatch(self):
+        hint = {"likely": True, "signals": ["TPU_ACCELERATOR_TYPE"], "accelerator_type": "v5litepod-1",
+                "chips": 0, "hbm_gb": 16.0}
+        vers = {"torch": "2.15.0", "torch_xla": "2.9.0", "torch_tpu": None}
+        with mock.patch.dict(devices._CACHE, {"t": 0.0, "v": None}), \
+                mock.patch.dict(accel._TPU, {"probed": False, "device": None, "reason": None, "backend": None}), \
+                mock.patch.object(accel, "_probe_tpu", side_effect=AssertionError("TPU를 열면 안 됨")), \
+                mock.patch.object(accel, "tpu_packages", return_value=["torch_xla"]), \
+                mock.patch.object(accel, "tpu_hint", return_value=hint), \
+                mock.patch.object(accel, "_version", side_effect=vers.get):
+            p = devices.pc_profile(refresh=True)
+            self.assertIn("setup_accel", p["accel"]["tpu"]["mismatch"])
+            self.assertFalse(p["accel"]["available"]["tpu"])
+            self.assertFalse(devices.tpu_usable(p)[0])
+            self.assertEqual(devices.recommend(p)["tier"], p["tier"])
+            vers["torch_xla"] = "2.15.0"                                         # 짝이 맞으면 표시하지 않는다
+            p = devices.pc_profile(refresh=True)
+            self.assertNotIn("mismatch", p["accel"]["tpu"])
+            self.assertTrue(p["accel"]["available"]["tpu"])
 
 
 # ---------------------------------------------------------------------------------------------------------------

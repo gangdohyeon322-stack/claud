@@ -181,7 +181,8 @@ class CpuIdentityTest(_EnvMixin, unittest.TestCase):
     def test_same_seed_same_history_and_auto_device(self):
         import torch
 
-        if torch.cuda.is_available() or accel.available()["xpu"] or accel.available()["mps"]:
+        avail = accel.available()  # TPU: torch_xla가 있는 코랩 TPU 런타임에서는 auto가 TPU를 고른다
+        if torch.cuda.is_available() or avail["xpu"] or avail["mps"] or avail["tpu"]:
             self.skipTest("가속기가 있는 환경에서는 auto가 CPU가 아니다")
         a, cka, _ = self._run("a", 12, device="cpu")
         b, ckb, _ = self._run("b", 12)  # device 없음 -> auto -> cpu
@@ -225,6 +226,22 @@ class DevicePickTest(_EnvMixin, unittest.TestCase):
             self.assertIn("python -m learnbox.setup_accel", note)
             self.assertEqual(tinylm._pick_device("auto")[2], note)  # auto도 '지정 안 함'
             self.assertEqual(tinylm._pick_device("cpu"), ("cpu", torch.device("cpu"), None))  # 요청이 우선
+
+    def test_indexed_tpu_names_check_tpu(self):
+        """'xla:0'·'tpu:0'도 TPU를 확인한다: 없으면 CPU와 'TPU 패키지 없음' 안내 (예전엔 'xla:0'이 그대로 통과해 죽었다)."""
+        import torch
+
+        with mock.patch.object(accel, "_probe_tpu", return_value=(None, "not_installed")) as probe:
+            for want in ("xla:0", "tpu:0", "XLA:1"):
+                name, dev, note = tinylm._pick_device(want)
+                self.assertEqual((name, dev), ("cpu", torch.device("cpu")), want)
+                self.assertTrue(note.startswith("TPU 패키지(torch_xla)가 없어 CPU로 학습했습니다."), note)
+            self.assertEqual(probe.call_count, 3)
+            os.environ["LEARNBOX_DEVICE"] = "xla:0"
+            self.assertEqual(tinylm._pick_device(None)[0], "cpu")
+        xla = torch.device("xla:0")
+        with mock.patch.object(accel, "_probe_tpu", return_value=(xla, None)):
+            self.assertEqual(tinylm._pick_device("xla:0"), ("tpu", xla, None))
 
     def test_train_on_missing_tpu_falls_back_to_cpu(self):
         tmp = Path(tempfile.mkdtemp(prefix="lb-tputiny-pick-"))
@@ -304,6 +321,7 @@ class FakeTpuTest(_EnvMixin, unittest.TestCase):
         self.clean_env()
         self.calls = []
         real_step_end, real_to_cpu, real_opt_step = accel.step_end, accel.to_cpu, accel.optimizer_step
+        self.real_to_cpu = real_to_cpu
 
         def step_end(dev):
             self.calls.append("step_end")
@@ -453,6 +471,116 @@ class FakeTpuTest(_EnvMixin, unittest.TestCase):
         ck = tinylm._read_tiny_checkpoint(root)
         self.assertEqual(len(ck["state"]["opt"]["state"]), len(list(ref.parameters())))
         self.assertTrue(torch.equal(ck["state"]["model"]["head.weight"], ck["state"]["model"]["tok.weight"]))
+
+    def track_losses(self, oom_on_read: bool = False):
+        """F.cross_entropy가 만든 손실 텐서를 모으고, 그 텐서(또는 detach 사본)의 .item()을 calls에 'loss_item'으로 기록.
+
+        -> 학습 손실 목록(기울기 있는 것; 평가 손실 제외)을 돌려주는 함수. oom_on_read면 학습 중 손실을 읽을 때 OOM.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        real_ce, real_item = F.cross_entropy, torch.Tensor.item
+        made = []
+
+        def ce(*a, **k):
+            out = real_ce(*a, **k)
+            made.append(out)  # 살려 두어 data_ptr가 다른 텐서에 재사용되지 않게 한다
+            return out
+
+        def item(t):
+            if any(t.data_ptr() == m.data_ptr() for m in made):
+                if oom_on_read and "optimizer_step" in self.calls:
+                    raise RuntimeError("RESOURCE_EXHAUSTED: Ran out of memory in memory space hbm")
+                self.calls.append("loss_item")
+            return real_item(t)
+
+        for obj, name, new in ((F, "cross_entropy", ce), (torch.Tensor, "item", item)):
+            p = mock.patch.object(obj, name, new)
+            p.start()
+            self.addCleanup(p.stop)
+        return lambda: [real_item(m) for m in made if m.requires_grad]
+
+    def test_losses_read_only_at_report_interval(self):
+        """TPU: 단계마다 .item()을 부르지 않고 진행 표시 간격(steps//200)·저장 때만 순서대로 읽는다 (PRD 6.2)."""
+        train_losses = self.track_losses()
+        root = self.tmp / "defer-ck"
+        info, _ = self._train("defer", 400, checkpoint_dir=str(root), checkpoint_every_steps=0,
+                              checkpoint_every_sec=0,
+                              stop_requested=lambda: self.calls.count("optimizer_step") >= 5)
+        self.assertEqual(info["steps"], 5)
+        opt_idx = [k for k, c in enumerate(self.calls) if c == "optimizer_step"]
+        self.assertEqual(len(opt_idx), 5)
+        # 진행 표시 간격 = 400 // 200 = 2: 짝수 단계 뒤에만 2개씩 읽는다
+        per_step = [self.calls[opt_idx[i]:opt_idx[i + 1]].count("loss_item") for i in range(4)]
+        self.assertEqual(per_step, [0, 2, 0, 2])
+        # 5단계: 끝내기 전 저장(save)에서 남은 1개를 읽은 뒤 상태를 CPU로 옮긴다
+        first_save = next(k for k, c in enumerate(self.calls) if isinstance(c, tuple))
+        self.assertEqual(self.calls[opt_idx[4]:first_save].count("loss_item"), 1)
+        losses = train_losses()
+        self.assertEqual(len(losses), 5)
+        ck = tinylm._read_tiny_checkpoint(root)
+        self.assertEqual(ck["state"]["recent"], losses)  # 순서·값 그대로
+        self.assertEqual(info["train_loss"], tinylm._num(sum(losses) / len(losses)))
+
+    def test_pending_losses_flushed_when_stopping_without_checkpoint(self):
+        train_losses = self.track_losses()
+        info, _ = self._train("defer-stop", 400, stop_requested=lambda: self.calls.count("optimizer_step") >= 3)
+        self.assertEqual(info["steps"], 3)
+        losses = train_losses()
+        self.assertEqual(len(losses), 3)
+        self.assertEqual(info["train_loss"], tinylm._num(sum(losses) / len(losses)))  # 3단계 손실도 들어간다
+
+    def test_oom_on_tpu_is_fatal_without_batch_retry(self):
+        """TPU 메모리 부족은 배치를 줄여 다시 하지 않고 안내와 함께 실패한다 (PRD 6.10)."""
+        n = {"step_end": 0}
+
+        def step_end(dev):
+            n["step_end"] += 1
+            if n["step_end"] == 2:
+                raise RuntimeError("RESOURCE_EXHAUSTED: XLA:TPU compile permanent error. "
+                                   "Ran out of memory in memory space hbm.")
+
+        with mock.patch.object(accel, "step_end", step_end):
+            with self.assertRaises(RuntimeError) as cm:
+                self._train("oom", 6)
+        msg = str(cm.exception)
+        self.assertIn("TPU 메모리가 부족해 학습을 멈췄습니다", msg)
+        self.assertIn("배치 크기·문맥 길이·모델 크기를 줄이세요", msg)
+        self.assertTrue(accel.is_oom(cm.exception))  # 원래 오류 문구가 남아 메모리 부족으로 알아볼 수 있다
+        self.assertIn("RESOURCE_EXHAUSTED", str(cm.exception.__cause__))
+        self.assertEqual(self.calls.count("optimizer_step"), 2)  # 같은 단계를 다시 하지 않았다
+        # 메모리 부족이 아닌 오류는 그대로
+        with mock.patch.object(accel, "step_end", side_effect=RuntimeError("boom")):
+            with self.assertRaisesRegex(RuntimeError, "^boom$"):
+                self._train("boom", 6)
+
+    def test_oom_surfacing_at_loss_read_is_fatal(self):
+        self.track_losses(oom_on_read=True)
+        with self.assertRaises(RuntimeError) as cm:
+            self._train("oom-read", 400)
+        self.assertIn("TPU 메모리가 부족해 학습을 멈췄습니다", str(cm.exception))
+        self.assertEqual(self.calls.count("optimizer_step"), 2)  # 첫 진행 표시(2단계)에서 읽다가 실패
+
+    def test_tied_weights_saved_once(self):
+        """TPU 체크포인트에서 묶인 tok/head 가중치는 CPU 사본 하나를 공유한다 (두 번 저장하지 않음)."""
+        import torch
+
+        real = self.real_to_cpu  # setUp에서 바꿔 끼우기 전의 accel.to_cpu
+        xla = torch.device("xla:0")
+
+        def to_cpu(obj, dev=None):  # 장치 → CPU 복사처럼 새 저장 공간을 만든다 (to_cpu의 같은 텐서 묶기는 진짜 함수)
+            with mock.patch.object(torch.Tensor, "cpu", lambda t, *a, **k: t.clone()):
+                return real(obj, xla)
+
+        root = self.tmp / "tied-ck"
+        with mock.patch.object(accel, "to_cpu", to_cpu):
+            self._train("tied", 4, checkpoint_dir=str(root), checkpoint_every_steps=4, checkpoint_every_sec=0)
+        sd = tinylm._read_tiny_checkpoint(root)["state"]["model"]
+        self.assertTrue(torch.equal(sd["head.weight"], sd["tok.weight"]))
+        self.assertEqual(sd["head.weight"].untyped_storage().data_ptr(),
+                         sd["tok.weight"].untyped_storage().data_ptr())
+        self.assertFalse(any(isinstance(v, torch.nn.Parameter) for v in sd.values()))
 
     def test_recompile_warning_only_with_xla_debug(self):
         counts = iter([5, 8])

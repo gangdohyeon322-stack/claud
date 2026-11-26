@@ -369,7 +369,17 @@ def _pick_device(device: str | None):
     '알 수 없는 장치' 안내에 사용자가 쓴 값이 그대로 보이게 한다.
     """
     req = device if accel.normalize(device) != "auto" else accel.requested_device(None)
+    if accel.normalize(req).startswith(("tpu:", "xla:")):
+        # 번호 붙은 TPU 이름('xla:0', 'tpu:0')도 TPU를 확인하게 한다 (accel.pick은 'xla:0'을 확인 없이 받아들여
+        # torch_xla가 없으면 model.to에서 죽는다). 쓸 수 없으면 CPU와 'TPU 패키지 없음' 안내.
+        req = "tpu"
     return accel.pick(req)
+
+
+def _tpu_oom_error(e: BaseException) -> RuntimeError:
+    """TPU 메모리 부족 오류 (TPU에서는 배치를 줄여 다시 하지 않는다: 실패한 단계의 연산이 남아 있어 복구가 안전하지 않다)."""
+    return RuntimeError("TPU 메모리가 부족해 학습을 멈췄습니다. 배치 크기·문맥 길이·모델 크기를 줄이세요. "
+                        f"({type(e).__name__}: {str(e)[:200]})")
 
 
 def _retie_head(model) -> bool:
@@ -814,6 +824,30 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
         min_lr = lr * 0.1
         report_every = max(1, steps // 200)
         cc_base = None  # LEARNBOX_XLA_DEBUG=1일 때 3단계 뒤의 XLA 컴파일 횟수
+        # TPU: 단계 손실(장치 텐서)을 모아 두었다가 진행 표시 간격·저장·끝에서만 읽는다(PRD 6.2). 단계마다
+        # .item()을 부르면 매 단계 장치를 기다려야 해 다음 단계 준비와 겹쳐 돌지 못한다. 다른 장치는 늘 비어 있다.
+        pending: list = []
+
+        def keep_loss(v: float) -> None:
+            if math.isfinite(v):
+                recent.append(v)
+                if len(recent) > 50:
+                    recent.pop(0)
+
+        def flush_losses() -> None:
+            """모아 둔 TPU 손실을 순서대로 읽어 recent에 넣는다. 하나씩 읽는다(이미 실행된 값을 옮기기만 하고,
+            torch.stack처럼 길이마다 새 그래프를 컴파일하지 않는다). 지연 실행 오류는 여기서 드러난다."""
+            if not pending:
+                return
+            vals = pending[:]
+            pending.clear()
+            try:
+                for t in vals:
+                    keep_loss(t.item())
+            except RuntimeError as e:
+                if accel.is_oom(e):
+                    raise _tpu_oom_error(e) from e
+                raise
 
         ck_steps = max(0, int(checkpoint_every_steps or 0))
         ck_sec = max(0.0, float(checkpoint_every_sec or 0.0))
@@ -832,9 +866,13 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
             if last_ck["step"] == step and last_ck["summary"] is not None:
                 return last_ck["summary"]
             accel.step_end(dev)  # TPU: 모아 둔 연산을 실행한 뒤 저장 (다른 장치는 아무것도 안 함)
+            flush_losses()  # TPU: recent를 저장하기 전에 남은 손실을 읽는다
             el, tr = clock()
             # TPU 텐서는 CPU 사본으로 저장한다 (TPU가 없는 곳에서도 읽히게). 다른 장치는 예전처럼 그대로.
-            state = {"model": accel.to_cpu(model.state_dict(), dev), "opt": accel.to_cpu(opt.state_dict(), dev),
+            # TPU는 keep_vars로 매개변수 객체를 그대로 넘겨, 묶인 가중치(tok/head)가 같은 CPU 사본 하나로 저장되게 한다
+            # (state_dict는 키마다 detach()로 새 객체를 만들어 to_cpu가 같은 텐서로 알아보지 못한다).
+            state = {"model": accel.to_cpu(model.state_dict(keep_vars=on_tpu), dev),
+                     "opt": accel.to_cpu(opt.state_dict(), dev),
                      "scaler": scaler.state_dict() if scaler.is_enabled() else None,
                      "gen": gen.get_state(), "torch_rng": torch.get_rng_state(),
                      "cuda_rng": accel.rng_state(dev),
@@ -883,8 +921,15 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
                 accel.optimizer_step(opt, scaler, dev)
                 scaler.update()
                 accel.step_end(dev)  # TPU: 이 단계의 연산을 실행 (실행·컴파일 오류도 여기서 잡힌다)
-                lv = loss.item()
+                if on_tpu:  # 손실은 진행 표시 간격에서만 읽는다 (flush_losses)
+                    pending.append(loss.detach())
+                else:
+                    lv = loss.item()
             except RuntimeError as e:  # 장치 메모리 부족 -> 배치를 절반으로 줄여 같은 단계를 다시
+                if on_tpu and accel.is_oom(e):
+                    # TPU: 실패한 큰 배치의 갱신이 이미 기록돼(AdamW step도 늘어남) 다시 시도하면 그 연산 위에
+                    # 더 큰 그래프를 다시 컴파일하거나 갱신이 두 번 들어간다. 오류로 끝낸다(체크포인트로 재개 가능).
+                    raise _tpu_oom_error(e) from e
                 if not accel.is_oom(e) or B <= 1:
                     raise
                 x = y = loss = None
@@ -894,14 +939,13 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
                 notes.append(f"메모리가 부족해 배치 크기를 {B}(으)로 줄였습니다.")
                 step -= 1
                 continue
-            if math.isfinite(lv):
-                recent.append(lv)
-                if len(recent) > 50:
-                    recent.pop(0)
+            if not on_tpu:
+                keep_loss(lv)
             done = step
             if xla_debug and step - start_step == 3:
                 cc_base = accel.compile_count()
             if step % report_every == 0 or step == steps:
+                flush_losses()  # TPU: 여기서만 손실을 읽는다 (다른 장치는 아무것도 안 함)
                 el = max(1e-6, time.time() - t0 - paused)
                 avg = sum(recent) / len(recent) if recent else float("nan")
                 ran = max(1, step - start_step)
@@ -936,6 +980,7 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
                 stopped_early = True
                 notes.append(f"시간 제한({max_seconds:.0f}초)으로 {step}/{steps}단계에서 멈췄습니다.")
                 break
+        flush_losses()  # TPU: 끝내기·시간 제한으로 멈췄을 때 남은 손실 (다른 장치는 아무것도 안 함)
         if xla_debug and cc_base is not None:  # LEARNBOX_XLA_DEBUG=1 (TPU만): 3단계 뒤에도 다시 컴파일했는지
             cc_end = accel.compile_count()
             if cc_end is not None and cc_end > cc_base:

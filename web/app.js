@@ -1217,8 +1217,10 @@ function accelSummary(dev) {
   const known = Object.keys(devs).length > 0 || Object.keys(pavail).length > 0;
   const tpuAvail = has("tpu") || tpu.ok === true;
   const tpuInstalled = tpu.installed != null ? !!tpu.installed : !!(pc.torch_xla || pa.torch_xla_version || ax.torch_xla_version);
+  const tpuPkgs = Array.isArray(tpu.packages) ? tpu.packages : [];
   const accelOk = known ? ["cuda", "tpu", "xpu", "mps"].some(has) || tpuAvail : !!gpu.type;
   return { ax, pa, devs, tpu, tpuAvail, tpuLikely: !!tpu.likely, tpuInstalled, accelOk,
+    torchTpu: tpuPkgs.includes("torch_tpu") || !!pa.torch_tpu_version,
     rocm: !!(gpu.vendor === "amd" || gpu.rocm || ax.rocm || pa.rocm),
     torchVer: pa.torch_version || ax.torch_version || pc.torch_version || null,
     xlaVer: pa.torch_xla_version || ax.torch_xla_version || null };
@@ -1233,8 +1235,11 @@ function pcCardHtml(dev) {
   const A = accelSummary(dev), tpu = A.tpu;
   const showTpu = A.tpuAvail || A.tpuLikely;
   const pk = ["torch", "transformers", "peft", "onnxruntime", "anthropic", "pypdf"];
-  if (A.tpuInstalled || showTpu) pk.push("torch_xla"); // TPU와 관계없는 PC에서는 예전 그대로
-  const has = (k) => (k === "torch_xla" ? !!(pc.torch_xla || A.tpuInstalled) : !!pc[k]);
+  // TPU 백엔드 패키지: 설치된 것만, TPU가 보이는데 하나도 없으면 torch_xla 없음. TPU와 관계없는 PC에서는 예전 그대로
+  const hasXla = !!(pc.torch_xla || A.xlaVer);
+  if (A.torchTpu) pk.push("torch_tpu");
+  if (hasXla || (showTpu && !A.torchTpu)) pk.push("torch_xla");
+  const has = (k) => (k === "torch_xla" ? hasXla : k === "torch_tpu" ? A.torchTpu : !!pc[k]);
   const tier = rec.tier && String(rec.tier).startsWith("tpu") ? rec.tier : pc.tier;
   const gpuTag = gpu.type === "xpu" ? " · Intel Arc (미검증)" : gpu.type === "cuda" && A.rocm ? " · AMD (ROCm)" : "";
   const gpuText = gpu.type ? esc(gpu.name || gpu.type) + (gpu.vram_gb ? ` · VRAM ${esc(gpu.vram_gb)}GB` : "") + gpuTag
@@ -1318,10 +1323,6 @@ function initTrainForms() {
     onLoraBaseChange(true);
   }
   if (S.settings && !S.defaultsApplied) applySettingsDefaults(S.settings);
-  else if (!S.defaultsApplied && S.device && S.device.defaults && !S.device.defaultsUsed) {
-    S.device.defaultsUsed = true; // 관리자 설정을 아직 못 읽었으면 /api/device 의 기본 선택(설정 값)을 쓴다
-    applyDeviceDefaults(S.device.defaults.training_device, S.device.defaults.amp);
-  }
   fillDeviceSelects();
   renderCkptNotes();
 }
@@ -1341,12 +1342,38 @@ function deviceText(v) {
 }
 // 고른 장치 ("자동"이면 null: 요청에 넣지 않는다)
 function selDevice(sel) { const el = $(sel); return el && el.value && el.value !== "auto" ? el.value : null; }
-// 실제로 쓸 장치: 고른 장치, "자동"이면 서버가 알려 준 자동 선택 결과 (모르면 null)
+// 기본값: 요청에 장치·정밀도가 없을 때 서버가 쓰는 값 (/api/device defaults: 환경변수 LEARNBOX_DEVICE·LEARNBOX_AMP → 설정).
+// 폼에 복사하지 않는다(복사하면 요청 값이 되어 환경변수보다 앞선다). "auto"·모르는 값이면 null.
+function defaultDevice() {
+  const v = String(obj(S.device && S.device.defaults).training_device || "").trim().toLowerCase().split(":")[0];
+  return ["cuda", "tpu", "xpu", "mps", "cpu"].includes(v) ? v : null;
+}
+function defaultAmp() {
+  const v = String(obj(S.device && S.device.defaults).amp || "").trim().toLowerCase();
+  return ["fp16", "off", "fp32"].includes(v) ? v : null;
+}
+// "자동"일 때 서버가 쓸 장치: 기본값이 있으면 그것(못 쓰는 장치면 CPU), 없으면 서버의 자동 선택. 모르면 null.
+function autoTarget() {
+  const ax = accelOf(), c = defaultDevice();
+  if (c) {
+    const devs = ax ? obj(ax.devices) : {};
+    const ok = Object.keys(devs).length === 0 || c === "cpu" || !!obj(devs[c]).available;
+    return { id: ok ? c : "cpu", cfg: c, ok };
+  }
+  return ax && typeof ax.auto === "string" && ax.auto !== "auto" ? { id: ax.auto, cfg: null, ok: true } : null;
+}
+function autoDeviceLabel() {
+  const t = autoTarget(), lb = (id) => DEVICE_LABEL[id] || devLabel(id);
+  if (!t) return "자동";
+  if (!t.cfg) return `자동 (${lb(t.id)})`;
+  return t.ok ? `자동 (설정: ${lb(t.cfg)})` : `자동 (설정: ${lb(t.cfg)} 없음 → CPU)`;
+}
+// 실제로 쓸 장치: 고른 장치, "자동"이면 autoTarget (모르면 null)
 function resolvedDevice(sel) {
   const v = selDevice(sel);
   if (v) return v;
-  const ax = accelOf();
-  return ax && typeof ax.auto === "string" && ax.auto !== "auto" ? ax.auto : null;
+  const t = autoTarget();
+  return t ? t.id : null;
 }
 function tpuHbmGb() {
   const ax = accelOf() || {}, pc = (S.device && S.device.pc) || {};
@@ -1355,16 +1382,6 @@ function tpuHbmGb() {
     if (v != null && v !== "" && Number.isFinite(n) && n > 0) return n;
   }
   return null;
-}
-function applyDeviceDefaults(device, amp) {
-  if (device) {
-    const v = String(device);
-    for (const id of DEVICE_SELECTS) if ($(id) && $(`${id} option[value="${CSS.escape(v)}"]`)) $(id).value = v;
-  }
-  if (amp && $(`#lora-amp option[value="${CSS.escape(String(amp))}"]`)) {
-    const sel = $("#lora-amp");
-    if (sel.disabled) sel.dataset.keep = String(amp); else sel.value = String(amp);
-  }
 }
 // 장치 선택지: 못 쓰는 장치는 비활성, "자동" 옆에 자동이 고를 장치. 장치 정보가 없으면(예전 서버) 막지 않는다
 // (못 쓰는 장치를 고르면 서버가 CPU로 학습하고 이유를 남긴다).
@@ -1376,14 +1393,15 @@ function fillDeviceSelects() {
     if (!sel) continue;
     for (const o of sel.options) {
       if (o.value === "auto") {
-        o.textContent = ax && typeof ax.auto === "string" && ax.auto !== "auto" ? `자동 (${DEVICE_LABEL[ax.auto] || devLabel(ax.auto)})` : "자동";
+        o.textContent = autoDeviceLabel();
         continue;
       }
       const d = obj(devs[o.value]);
       const ok = !known || !!d.available;
       o.disabled = !ok;
       const nm = ok && known && ["cuda", "tpu", "xpu"].includes(o.value) && typeof d.name === "string" && d.name ? ` · ${d.name}` : "";
-      o.textContent = devLabel(o.value) + (ok ? nm : o.value === "tpu" && d.note ? " (torch_xla 설치 필요)" : " (없음)");
+      o.textContent = devLabel(o.value) + (ok ? nm : o.value === "tpu" && d.note
+        ? (obj(ax && ax.tpu).mismatch ? " (torch_xla 버전 불일치)" : " (torch_xla 설치 필요)") : " (없음)");
     }
     const cur = sel.options[sel.selectedIndex];
     if (!cur || cur.disabled) sel.value = "auto";
@@ -1394,10 +1412,13 @@ function fillDeviceSelects() {
 function syncAmp() {
   const sel = $("#lora-amp"), note = $("#lora-amp-note");
   if (!sel) return;
-  const ax = accelOf(), dev = resolvedDevice("#lora-device");
+  const ax = accelOf(), dev = resolvedDevice("#lora-device"), ca = defaultAmp();
+  const autoOpt = $('option[value="auto"]', sel);
+  if (autoOpt) autoOpt.textContent = ca ? `자동 (설정: ${AMP_LABEL[ca]})` : "자동";
   let hint = "", lock = false;
-  if (dev === "tpu") { hint = "TPU는 bf16 고정"; lock = true; }
+  if (dev === "tpu") { hint = ca === "fp32" ? "TPU · 설정한 fp32로 학습" : "TPU는 bf16 고정"; lock = true; }
   else if (dev === "mps" || dev === "cpu") { hint = "정밀도 설정을 쓰지 않음"; lock = true; }
+  else if ((dev === "cuda" || dev === "xpu") && ca) hint = `자동 = 설정한 ${AMP_LABEL[ca]}`;
   else if (dev === "cuda") hint = ax && ax.cuda_bf16 ? "자동 = bf16" : "자동 = fp16 (bf16 미지원 GPU)";
   else if (dev === "xpu") hint = "자동 = bf16 (지원하면), 아니면 fp16";
   if (lock && !sel.disabled) { sel.dataset.keep = sel.value; sel.value = "auto"; }
@@ -1407,6 +1428,8 @@ function syncAmp() {
 }
 // 요청에 넣을 정밀도 ("자동"이거나 이 장치에서 쓰지 않으면 null)
 function selAmp() { const el = $("#lora-amp"); return el && !el.disabled && el.value && el.value !== "auto" ? el.value : null; }
+// 실제로 쓸 정밀도 모드: 고른 값, "자동"이면 기본값(환경변수 → 설정). 이 장치에서 쓰지 않거나 모르면 null
+function effectiveAmp() { const el = $("#lora-amp"); return selAmp() || (el && !el.disabled ? defaultAmp() : null); }
 // 소형 AI / LoRA 카드의 '중간 저장' 한 줄 (관리 > 설정 > 학습 중간 저장 값을 그대로 보여 준다)
 function ckptSettings() {
   return { ...DEFAULTS.training_checkpoint, ...((S.settings && S.settings.training_checkpoint) || {}) };
@@ -1450,7 +1473,6 @@ function applySettingsDefaults(s) {
   setVal("#lora-steps", lt.max_steps); setVal("#lora-seq", lt.seq_len); setVal("#lora-batch", lt.batch_size);
   if (lt.lora_r && $(`#lora-r option[value="${CSS.escape(String(lt.lora_r))}"]`)) $("#lora-r").value = String(lt.lora_r);
   if (lt.use_qa != null) $("#lora-qa").checked = !!lt.use_qa;
-  applyDeviceDefaults(s.training_device, lt.amp);
   if (lt.base_model) {
     if ($(`#lora-base option[value="${CSS.escape(lt.base_model)}"]`)) $("#lora-base").value = lt.base_model;
     else { $("#lora-base").value = LORA_CUSTOM; $("#lora-custom").value = lt.base_model; }
@@ -1537,7 +1559,7 @@ async function doEstimate(prefix) {
     const r = await post("/api/estimate", body);
     if (seq !== S.est[prefix]) return;
     const rdev = resolvedDevice(devSel);
-    box.innerHTML = prefix === "lora" ? loraEstimateHtml(r, rdev, selAmp()) : tinyEstimateHtml(r, prefix === "al", rdev);
+    box.innerHTML = prefix === "lora" ? loraEstimateHtml(r, rdev, effectiveAmp()) : tinyEstimateHtml(r, prefix === "al", rdev);
     $(btn).disabled = false;
   } catch (e) {
     if (seq !== S.est[prefix]) return;
@@ -1572,7 +1594,7 @@ function tinyEstimateHtml(r, compact, dev) {
     ${compact ? "" : `<div class="small">학습 메모리 약 ${fmtMB(e.train_ram_mb)} · 실행 메모리 약 ${fmtMB(e.infer_ram_mb)}</div>`}
     <div>${fitBadges(e.fits)}${dev === "tpu" ? tinyTpuBadge(r, e) : ""}</div>`;
 }
-// dev: 실제로 쓸 장치(고른 장치 또는 자동 결과, 모르면 null). amp: 고른 정밀도(자동이면 null)
+// dev: 실제로 쓸 장치(고른 장치 또는 자동 결과, 모르면 null). amp: 실제로 쓸 정밀도 모드(자동·모르면 null)
 function loraEstimateHtml(e, dev, amp) {
   const pc = (S.device && S.device.pc) || {}, gpu = pc.gpu || {};
   const ramOk = pc.ram_gb != null ? pc.ram_gb >= e.ram_gb_est : null;

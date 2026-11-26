@@ -347,6 +347,9 @@ def _accel_line(acc: dict, pc: dict) -> str:
                        if (devs.get("xpu") or {}).get("available") else "없음")]
     if (devs.get("tpu") or {}).get("available"):
         t = "TPU " + (tpu.get("accelerator_type") or "사용 가능")
+    elif tpu.get("likely") and tpu.get("mismatch"):
+        t = (f"TPU {tpu.get('accelerator_type') or ''} 감지 "
+             f"(torch·torch_xla 버전 불일치: python -m learnbox.setup_accel)").replace("  ", " ")
     elif tpu.get("likely"):
         t = f"TPU {tpu.get('accelerator_type') or ''} 감지 (torch_xla 필요: python -m learnbox.setup_accel)".replace("  ", " ")
     else:

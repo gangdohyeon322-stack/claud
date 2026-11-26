@@ -328,6 +328,14 @@ class PrecisionTest(unittest.TestCase):
         self.assertFalse(train_pc._ckpt_moved({"device": "xla:0"}, "tpu"))
         self.assertFalse(train_pc._ckpt_moved(None, "cpu"))
 
+    def test_cpu_mps_resume_fp16_ignores_amp_mode(self):
+        # cpu/mps에서 float16은 fp16 혼합 정밀도가 아니다: off/fp32로 재개해도 저장된 dtype 그대로, 새 안내 없음(예전과 같음)
+        with mock.patch.object(train_pc, "_mem_available_gb", return_value=64.0):
+            for dev, mode in (("cpu", "off"), ("cpu", "fp32"), ("mps", "off"), ("mps", "fp32")):
+                got = train_pc._train_precision(dev, "float16", EST, mode, ck_meta={"device": dev})
+                self.assertEqual(got, ("float16", False, False, []), (dev, mode))
+                self.assertEqual(got, train_pc._train_precision(dev, "float16", EST, mode))  # 새로 시작할 때와 같다
+
 
 # ---------------------------------------------------------------------------
 # 고정 모양 패딩 (_collate pad_to)
@@ -407,6 +415,74 @@ class SaveAdapterTest(unittest.TestCase):
         for k in a:
             self.assertTrue(torch.equal(a[k], b[k]), k)
         self.assertTrue((tmp / "tpu" / "adapter_config.json").is_file())
+
+
+@contextlib.contextmanager
+def _xla_like_move():
+    """XLA 장치로 옮길 때처럼 Module._apply가 set_data 대신 모듈마다 새 Parameter를 만들게 한다(CPU에서 흉내)."""
+    import torch
+
+    old = torch.__future__.get_overwrite_module_params_on_conversion()
+    torch.__future__.set_overwrite_module_params_on_conversion(True)
+    try:
+        yield
+    finally:
+        torch.__future__.set_overwrite_module_params_on_conversion(old)
+
+
+class RetieTest(_Data, unittest.TestCase):
+    """TPU로 옮기면 풀리는 묶인 임베딩(tie_word_embeddings)을 다시 묶는다. 다른 장치는 model.to만(예전 그대로)."""
+
+    @classmethod
+    def setUpClass(cls):
+        _need_tiny_model()
+        cls.make_data("lb-tpu-lora-tie-")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.drop_data()
+
+    @staticmethod
+    def count(model) -> int:
+        return sum(p.numel() for p in model.parameters())
+
+    def test_move_reties_only_on_tpu(self):
+        import torch
+        from peft import LoraConfig, get_peft_model
+        from transformers import AutoModelForCausalLM
+
+        cpu = torch.device("cpu")
+        base = train_pc._from_pretrained(AutoModelForCausalLM, TINY)
+        self.assertTrue(train_pc._embeddings_tied(base))
+        n0 = self.count(base)
+        with _xla_like_move():
+            plain = train_pc._from_pretrained(AutoModelForCausalLM, TINY)
+            train_pc._to_train_device(plain, "cpu", cpu)  # 흉내가 실제로 묶음을 푸는지(= TPU에서 일어나는 일)
+            self.assertFalse(train_pc._embeddings_tied(plain))
+            self.assertGreater(self.count(plain), n0)
+            train_pc._to_train_device(base, "tpu", cpu)
+            self.assertTrue(train_pc._embeddings_tied(base))
+            self.assertEqual(self.count(base), n0)
+            model = get_peft_model(base, LoraConfig(r=2, lora_alpha=4, target_modules="all-linear",
+                                                    task_type="CAUSAL_LM"))
+            train_pc._to_train_device(model, "tpu", cpu)  # PEFT를 씌운 뒤 두 번째 이동
+            self.assertTrue(train_pc._embeddings_tied(model))
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            self.assertEqual(self.count(model), n0 + trainable)
+
+    def test_fake_tpu_training_keeps_one_embedding(self):
+        import torch
+        from transformers import AutoModelForCausalLM
+
+        n0 = self.count(train_pc._from_pretrained(AutoModelForCausalLM, TINY))
+        kw = dict(max_steps=1, lr=1e-3, seq_len=SEQ, batch_size=2, grad_accum=1, lora_r=4, lora_alpha=8, threads=1,
+                  seed=6)
+        with _xla_like_move(), \
+                mock.patch.object(accel, "pick", return_value=("tpu", torch.device("cpu"), None)), \
+                mock.patch.object(accel, "mem_total_gb", return_value=16.0):
+            info = train_pc.train_lora(str(self.train), str(self.eval), self.tmp / "tpu", TINY, **kw)
+        self.assertEqual(info["device"], "tpu")
+        self.assertEqual(info["total_params"], n0 + info["trainable_params"])
 
 
 # ---------------------------------------------------------------------------

@@ -192,24 +192,61 @@ def _tier_label(tier: str) -> str:
             "tpu": "TPU"}.get(tier, tier)
 
 
+def _mm(v: str) -> tuple:
+    return tuple(v.split("+")[0].split(".")[:2])      # accel._mm과 같은 규칙 (major.minor)
+
+
+def xla_mismatch(acc: dict | None) -> str | None:
+    """TPU를 torch_xla로만 열 수 있는데 torch와 torch_xla의 major.minor가 다르면 안내 문구, 아니면 None.
+
+    accel._probe_tpu는 이 경우 torch_xla를 불러오지 않고 실패하므로 pick('auto')는 CPU를, pick('tpu')는 CPU와
+    안내를 돌려준다. 이미 TPU를 열었거나, torch_tpu가 있거나, 버전을 모르면 None (accel._xla_version_mismatch와 같은 규칙)."""
+    acc = acc if isinstance(acc, dict) else {}
+    t = acc.get("tpu") if isinstance(acc.get("tpu"), dict) else {}
+    if t.get("ok"):
+        return None
+    pk = t.get("packages")
+    if isinstance(pk, list):
+        if "torch_tpu" in pk or "torch_xla" not in pk:
+            return None
+    elif t.get("backend") != "torch_xla":
+        return None
+    tv, xv = acc.get("torch_version"), acc.get("torch_xla_version")
+    if not (isinstance(tv, str) and isinstance(xv, str) and tv and xv) or _mm(tv) == _mm(xv):
+        return None
+    return f"torch {tv}와 torch_xla {xv}의 버전이 맞지 않습니다. python -m learnbox.setup_accel 로 맞는 짝을 설치하세요."
+
+
 def _accel_info() -> dict:
-    """설치된 가속 패키지와 장치 (accel.info). TPU는 실제로 열지 않고 설치 여부와 런타임 신호만 본다."""
+    """설치된 가속 패키지와 장치 (accel.info). TPU는 실제로 열지 않고 설치 여부와 런타임 신호만 본다.
+
+    torch와 torch_xla 버전이 맞지 않으면 TPU를 열 수 없으므로 available.tpu를 False로 두고 tpu.mismatch에 안내를 적는다."""
     try:
         from . import accel
 
-        return accel.info(probe_tpu=False)
+        info = accel.info(probe_tpu=False)
     except Exception as e:  # 감지 실패는 조용히 넘어간다 (PRD 6.11)
         return {"error": f"{type(e).__name__}: {e}"[:200]}
+    msg = xla_mismatch(info)
+    if msg:
+        if isinstance(info.get("available"), dict):
+            info["available"]["tpu"] = False
+        if isinstance(info.get("tpu"), dict):
+            info["tpu"]["mismatch"] = msg
+    return info
 
 
 def tpu_usable(profile: dict | None) -> tuple[bool, dict]:
     """프로필의 accel 정보로 TPU 학습이 가능해 보이는가 -> (가능, TPU 정보). torch_xla가 설치돼 있고
-    TPU 런타임 신호가 있거나(짐작) 이미 열어 본 경우만 참. torch_xla를 불러오지 않는다."""
+    TPU 런타임 신호가 있거나(짐작) 이미 열어 본 경우만 참. torch와 torch_xla 버전이 맞지 않으면 거짓
+    (accel.pick이 CPU를 고르므로). torch_xla를 불러오지 않는다."""
     acc = (profile or {}).get("accel")
     acc = acc if isinstance(acc, dict) else {}
     t = acc.get("tpu") if isinstance(acc.get("tpu"), dict) else {}
     avail = acc.get("available") if isinstance(acc.get("available"), dict) else {}
-    return bool(avail.get("tpu") or t.get("ok")), t
+    if t.get("ok"):
+        return True, t
+    return bool(avail.get("tpu")) and not xla_mismatch(acc), t
 
 
 def pc_profile(refresh: bool = False) -> dict:
@@ -273,6 +310,9 @@ def recommend(profile: dict | None = None) -> dict:
         elif tpu.get("likely") and not tpu.get("installed"):
             notes.append("TPU 런타임으로 보이지만 TPU 패키지(torch_xla)가 없어 CPU 기준으로 추천합니다. "
                          "python -m learnbox.setup_accel 로 설치하세요.")
+        elif tpu.get("likely") and xla_mismatch(p.get("accel")):
+            notes.append("TPU 런타임으로 보이지만 TPU를 열 수 없어 CPU 기준으로 추천합니다. "
+                         + xla_mismatch(p.get("accel")))
 
     if tier == "tpu":
         try:

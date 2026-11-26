@@ -244,6 +244,7 @@ class App:
     @staticmethod
     def _accel_devices(pc: dict) -> dict:
         """학습 폼의 장치 선택용: 장치별 사용 가능 여부·이름, '자동'이 고를 장치 (TPU는 열지 않고 짐작만)."""
+        devices = _mod("devices")
         acc = pc.get("accel") if isinstance(pc.get("accel"), dict) else {}
         avail = acc.get("available") if isinstance(acc.get("available"), dict) else None
         if avail is None:
@@ -253,6 +254,9 @@ class App:
                 avail = {"auto": True, "cpu": True}
         gpu = pc.get("gpu") or {}
         tpu = acc.get("tpu") if isinstance(acc.get("tpu"), dict) else {}
+        mismatch = tpu.get("mismatch") or devices.xla_mismatch(acc)
+        if mismatch and avail.get("tpu") and not tpu.get("ok"):     # torch·torch_xla 버전 불일치: pick이 CPU를 고른다
+            avail = {**avail, "tpu": False}
         rocm = gpu.get("rocm") or (True if acc.get("rocm") else None)
         names = {"cuda": gpu.get("name") if gpu.get("type") == "cuda" else None,
                  "xpu": acc.get("xpu_name") or (gpu.get("name") if gpu.get("type") == "xpu" else None),
@@ -265,6 +269,8 @@ class App:
             out[d] = {"available": bool(avail.get(d, d in ("auto", "cpu"))), "label": labels[d], "name": names.get(d)}
         if tpu.get("likely") and not tpu.get("installed"):
             out["tpu"]["note"] = "TPU 패키지(torch_xla)가 없습니다: python -m learnbox.setup_accel"
+        elif tpu.get("likely") and mismatch and not out["tpu"]["available"]:
+            out["tpu"]["note"] = mismatch
         auto = next((d for d in ("cuda", "tpu", "xpu", "mps") if out[d]["available"]), "cpu")
         cuda_bf16 = None
         if out["cuda"]["available"]:
@@ -275,7 +281,8 @@ class App:
         return {"auto": auto, "devices": out, "cuda_bf16": cuda_bf16, "rocm": rocm,
                 "torch_version": acc.get("torch_version") or pc.get("torch_version"),
                 "torch_xla_version": acc.get("torch_xla_version"),
-                "tpu": {k: tpu.get(k) for k in ("installed", "likely", "ok", "accelerator_type", "hbm_gb")}}
+                "tpu": {**{k: tpu.get(k) for k in ("installed", "likely", "ok", "accelerator_type", "hbm_gb")},
+                        "mismatch": mismatch or None}}
 
     def estimate(self, body: dict) -> dict:
         """모델 크기/메모리 예상. body: {"kind":"tiny", preset, d_model…, batch_size} 또는 {"kind":"lora", ...}

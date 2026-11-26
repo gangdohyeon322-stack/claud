@@ -439,12 +439,14 @@ def _train_precision(dev: str, dtype: str | None, est: dict, amp_mode: str | Non
       - 저장했던 장치가 지금 장치와 다르면 저장된 dtype을 쓰지 않고 auto로 다시 고른다
         (TPU bf16 → T4, T4 fp16 → CPU 같은 경우).
       - 저장된 dtype이 float16(fp16 혼합 정밀도)인데 amp_mode가 off/fp32면 그 설정으로 다시 고른다
-        (nan으로 멈춘 fp16 학습을 LEARNBOX_AMP=off로 이어서 할 수 있게).
+        (nan으로 멈춘 fp16 학습을 LEARNBOX_AMP=off로 이어서 할 수 있게). cuda/xpu에서만.
     cpu/mps에서 저장 장치가 같으면 _plan 결과 그대로라 예전과 같다.
     """
     stored = _DTYPE_NAMES.get(str(dtype or "").lower())
     moved = _ckpt_moved(ck_meta, dev)
-    amp_off = ck_meta is not None and not moved and stored == "float16" and amp_mode in ("off", "fp32")
+    # float16이 fp16 혼합 정밀도를 뜻하는 장치(cuda/xpu)에서만. cpu/mps는 amp 모드를 무시하고 저장된 dtype 그대로(예전과 같음).
+    amp_off = (ck_meta is not None and not moved and dev in ("cuda", "xpu") and stored == "float16"
+               and amp_mode in ("off", "fp32"))
     replan = moved or amp_off
     plan_dtype, auto_ckpt, notes = _plan(dev, "auto" if replan else dtype, est, training=True, tdev=tdev)
     dtype_name, use_amp, note = accel.lora_precision(dev, amp_mode or "auto", requested_dtype=None if replan else stored,
@@ -573,6 +575,31 @@ def _enable_checkpointing(model) -> None:
             model.enable_input_require_grads()
     except (ValueError, NotImplementedError, AttributeError):
         pass  # 체크포인팅을 지원하지 않는 모델: 그냥 진행
+
+
+def _embeddings_tied(model) -> bool:
+    """입력 임베딩과 출력(lm_head) 가중치가 같은 Parameter 객체인가."""
+    try:
+        inp, out = model.get_input_embeddings(), model.get_output_embeddings()
+    except (AttributeError, NotImplementedError):
+        return False
+    w = getattr(inp, "weight", None) if inp is not None else None
+    return w is not None and out is not None and getattr(out, "weight", None) is w
+
+
+def _to_train_device(model, dev: str, tdev) -> None:
+    """model.to(tdev). TPU(XLA)로 옮기면 Module._apply가 모듈마다 새 Parameter를 만들어 묶여 있던 입력·출력
+    임베딩이 풀린다(HBM에 얼린 임베딩 사본이 하나 더 생기고 total_params도 틀어짐; HF Trainer도 다시 묶음).
+    TPU에서만, 옮기기 전에 묶여 있었으면 옮긴 뒤 다시 묶는다. 다른 장치는 예전처럼 model.to만 한다."""
+    if not accel.is_tpu(dev):
+        model.to(tdev)
+        return
+    tied = _embeddings_tied(model)
+    model.to(tdev)
+    if tied and not _embeddings_tied(model):
+        model.tie_weights()
+        if not _embeddings_tied(model):  # 설정상 묶지 않는 모델인데 가중치가 묶여 있던 경우: 옮기기 전 상태로
+            model.get_output_embeddings().weight = model.get_input_embeddings().weight
 
 
 # ---------------------------------------------------------------------------
@@ -1009,7 +1036,7 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
         model.config.use_cache = False
     except AttributeError:
         pass
-    model.to(tdev)
+    _to_train_device(model, dev, tdev)
     if use_ckpt:
         _enable_checkpointing(model)
     check_cancel()
@@ -1023,7 +1050,7 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     else:
         model = get_peft_model(model, LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=0.05,
                                                  target_modules="all-linear", task_type="CAUSAL_LM"))
-    model.to(tdev)
+    _to_train_device(model, dev, tdev)
     pcfg = model.peft_config.get("default") if hasattr(model, "peft_config") else None
     if pcfg is not None:
         lora_r, lora_alpha = int(pcfg.r), int(pcfg.lora_alpha)
