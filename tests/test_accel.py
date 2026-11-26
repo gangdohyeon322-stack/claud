@@ -137,7 +137,7 @@ class TorchPathsTest(unittest.TestCase):
         self.assertEqual(accel.pick(None)[:2], ("cpu", torch.device("cpu")))
         self.assertEqual(accel.pick("cuda")[2], "CUDA GPU를 찾지 못해 CPU로 학습했습니다.")
         self.assertIn("알 수 없는 장치 'weird'", accel.pick("weird")[2])
-        with mock.patch.object(accel, "_has", side_effect=lambda m: m != "torch_xla"):
+        with mock.patch.object(accel, "_has", side_effect=lambda m: m not in accel.TPU_BACKENDS):
             n, d, note = accel.pick("tpu")
             self.assertEqual(n, "cpu")
             self.assertIn("torch_xla", note)
@@ -181,6 +181,48 @@ class TorchPathsTest(unittest.TestCase):
             n, d, note = accel.pick("tpu")
             self.assertEqual(n, "cpu")
             self.assertIn("TPU가 아닙니다", note)
+
+    def test_torch_tpu_backend_preferred(self):
+        """torch_tpu(즉시 실행)가 있으면 그것을 쓰고, 단계 마무리·장치 seed는 아무것도 하지 않는다."""
+        import torch
+
+        if torch.cuda.is_available():
+            self.skipTest("CUDA가 있는 환경")
+        tdev = types.SimpleNamespace(type="tpu")
+        mods, _ = _fake_xla(calls=[])
+        hint = {"likely": True, "signals": ["pci:v5ex1"], "accelerator_type": "v5e", "chips": 1, "hbm_gb": 16.0}
+        with mock.patch.dict(sys.modules, mods), \
+                mock.patch.object(accel, "_has", side_effect=lambda m: m == "torch_tpu"), \
+                mock.patch.object(accel, "_open_torch_tpu", return_value=tdev), \
+                mock.patch.object(accel, "tpu_hint", return_value=hint):
+            self.assertEqual(accel.pick("auto"), ("tpu", tdev, None))
+            self.assertEqual(accel.tpu_backend(tdev), "torch_tpu")
+            self.assertEqual(accel.tpu_backend("tpu"), "torch_tpu")
+            with mock.patch.dict(sys.modules, {"torch_xla": None}):  # torch_xla를 부르면 ImportError
+                accel.step_end(tdev)
+                accel.manual_seed(tdev, 1)
+            self.assertIsNone(accel.compile_count())
+            self.assertTrue(accel.info()["tpu"]["ok"])
+            self.assertEqual(accel.info()["tpu"]["backend"], "torch_tpu")
+
+    def test_torch_tpu_failure_falls_back_to_xla(self):
+        import torch
+
+        if torch.cuda.is_available():
+            self.skipTest("CUDA가 있는 환경")
+        mods, dev = _fake_xla(calls=[])
+        with mock.patch.dict(sys.modules, mods), mock.patch.object(accel, "_has", return_value=True), \
+                mock.patch.object(accel, "_open_torch_tpu", side_effect=RuntimeError("no chip")):
+            self.assertEqual(accel.pick("tpu"), ("tpu", dev, None))
+            self.assertEqual(accel.tpu_backend(dev), "torch_xla")
+
+    def test_torch_tpu_busy_note(self):
+        msg = "[TorchTPU] Failed to acquire a TPU device node '/dev/vfio/0' because it is already opened by another process"
+        with mock.patch.object(accel, "_has", side_effect=lambda m: m == "torch_tpu"), \
+                mock.patch.object(accel, "_open_torch_tpu", side_effect=RuntimeError(msg)):
+            n, _, note = accel.pick("tpu")
+        self.assertEqual(n, "cpu")
+        self.assertIn("다른 프로세스가 TPU를 쓰고 있습니다", note)
 
     def test_version_mismatch_blocks_import(self):
         mods, _ = _fake_xla()

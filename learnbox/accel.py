@@ -35,7 +35,9 @@ _AMP_ALIASES = {"": "auto", "auto": "auto", "default": "auto",
 _TPU_HBM_GB = {"v5litepod": 16, "v5lite": 16, "v5e": 16, "v6e": 32, "v5p": 95, "v4": 32, "v3": 16, "v2": 8}
 
 _TPU_LOCK = threading.Lock()
-_TPU: dict = {"probed": False, "device": None, "reason": None}
+_TPU: dict = {"probed": False, "device": None, "reason": None, "backend": None}
+# TPU 백엔드: torch_tpu(TorchTPU, 코랩 v5e 기본 설치, 즉시 실행) 우선, torch_xla(지원 종료, 지연 실행)는 예전 런타임용.
+TPU_BACKENDS = ("torch_tpu", "torch_xla")
 
 GB = 1024 ** 3
 
@@ -93,6 +95,18 @@ def label(dev) -> str:
 
 def is_tpu(dev) -> bool:
     return name(dev) == "tpu"
+
+
+def tpu_backend(dev=None) -> str | None:
+    """이 TPU 장치를 다루는 백엔드: 'torch_tpu'(torch.device 'tpu') 또는 'torch_xla'(torch.device 'xla'). TPU가 아니면 None."""
+    if dev is not None and not is_tpu(dev):
+        return None
+    t = getattr(dev, "type", None) if dev is not None and not isinstance(dev, str) else None
+    if t == "xla":
+        return "torch_xla"
+    if t == "tpu":
+        return "torch_tpu"
+    return _TPU["backend"] or (tpu_packages() or [None])[0]
 
 
 def fixed_shapes(dev) -> bool:
@@ -224,17 +238,60 @@ def _undo_xla_patches() -> None:
         pass
 
 
+def tpu_packages() -> list[str]:
+    """설치된 TPU 백엔드 패키지 (우선순위 순)."""
+    return [m for m in TPU_BACKENDS if _has(m)]
+
+
+def _busy_note(msg: str) -> str:
+    return ("다른 프로세스가 TPU를 쓰고 있습니다(코랩 노트북 셀이 TPU를 열었거나 다른 학습 명령이 돌고 있는지 "
+            "확인하세요). " + msg[:160])
+
+
+def _open_torch_tpu():
+    """torch_tpu로 TPU를 연다. 실제로 작은 연산을 해서 칩을 잡아 본다(다른 프로세스가 쓰고 있으면 여기서 오류)."""
+    import torch
+
+    accel_mod = getattr(torch, "accelerator", None)
+    cur = accel_mod.current_accelerator() if accel_mod is not None else None
+    if cur is None or cur.type != "tpu":
+        # TORCH_DEVICE_BACKEND_AUTOLOAD=0 등으로 백엔드가 안 올라왔으면 직접 올려 본다.
+        with contextlib.suppress(Exception):
+            from torch_tpu import _loader  # type: ignore
+
+            _loader.load()
+        cur = accel_mod.current_accelerator() if accel_mod is not None else None
+    if cur is None or cur.type != "tpu":
+        raise RuntimeError("torch_tpu 백엔드가 올라오지 않았습니다(TPU 칩이 없거나 TORCH_DEVICE_BACKEND_AUTOLOAD=0)")
+    if not accel_mod.is_available():
+        raise RuntimeError("torch_tpu가 TPU 칩을 찾지 못했습니다")
+    d = torch.device("tpu")
+    (torch.ones(1, device=d) + 1).cpu()  # 런타임 시작 + 칩 확보 확인
+    return d
+
+
 def _probe_tpu():
-    """TPU 장치를 연다. 성공하면 torch.device(xla), 실패하면 None과 이유. 한 번만 시도하고 결과를 기억한다."""
+    """TPU 장치를 연다. 성공하면 torch.device(tpu 또는 xla), 실패하면 None과 이유. 한 번만 시도하고 결과를 기억한다.
+
+    torch_tpu(즉시 실행)를 먼저, 안 되면 torch_xla(지연 실행)를 쓴다. 둘 다 없으면 이유는 'not_installed'.
+    """
     with _TPU_LOCK:
         if _TPU["probed"]:
             return _TPU["device"], _TPU["reason"]
-        dev, reason = None, None
-        if not _has("torch_xla"):
-            reason = "not_installed"
-        elif _xla_version_mismatch():
-            reason = _xla_version_mismatch()
-        else:
+        dev, reason, backend = None, None, None
+        if _has("torch_tpu"):
+            try:
+                dev, backend = _open_torch_tpu(), "torch_tpu"
+            except Exception as e:
+                msg = str(e)
+                reason = (_busy_note(msg) if "already opened by another process" in msg or "already in use" in msg
+                          else f"torch_tpu: {type(e).__name__}: {msg}"[:240])
+        if dev is None and not _has("torch_xla"):
+            reason = reason or "not_installed"
+        elif dev is None and _xla_version_mismatch():
+            reason = _xla_version_mismatch() if reason is None else f"{reason} / {_xla_version_mismatch()}"
+        elif dev is None:
+            reason = None
             try:
                 if not os.environ.get("PJRT_DEVICE") and tpu_hint()["likely"]:
                     os.environ["PJRT_DEVICE"] = "TPU"
@@ -254,23 +311,22 @@ def _probe_tpu():
                     with contextlib.suppress(Exception):
                         kind = xr.device_type()
                 if str(kind or "").upper() == "TPU":
-                    dev = d
+                    dev, backend = d, "torch_xla"
                 else:
                     reason = f"XLA 장치가 TPU가 아닙니다 ({kind or '알 수 없음'})"
             except Exception as e:  # 버전 불일치, 런타임 초기화 실패 등
                 msg = str(e)
                 if "already in use" in msg or "libtpu_lockfile" in msg:
-                    reason = ("다른 프로세스가 TPU를 쓰고 있습니다(코랩 노트북 셀이 TPU를 열었는지 확인하세요). "
-                              + msg[:120])
+                    reason = _busy_note(msg)
                 else:
                     reason = f"{type(e).__name__}: {msg}"[:200]
-        _TPU.update(probed=True, device=dev, reason=reason)
-        return dev, reason
+        _TPU.update(probed=True, device=dev, reason=None if dev is not None else reason, backend=backend)
+        return _TPU["device"], _TPU["reason"]
 
 
 def _reset_tpu_probe() -> None:  # 테스트용
     with _TPU_LOCK:
-        _TPU.update(probed=False, device=None, reason=None)
+        _TPU.update(probed=False, device=None, reason=None, backend=None)
 
 
 def _xpu_ok() -> bool:
@@ -309,7 +365,7 @@ def pick(device=None, *, allow_tpu: bool = True):
         if torch.cuda.is_available():
             return "cuda", torch.device("cuda"), None
         # 자동 선택은 TPU 신호가 있을 때만 TPU 패키지를 불러온다(아니면 import 부작용 없이 넘어감).
-        if allow_tpu and _has("torch_xla") and (_TPU["probed"] or tpu_hint()["likely"]):
+        if allow_tpu and tpu_packages() and (_TPU["probed"] or tpu_hint()["likely"]):
             d, _ = _probe_tpu()
             if d is not None:
                 return "tpu", d, None
@@ -366,7 +422,7 @@ def available(probe_tpu: bool = False) -> dict:
     out["xpu"] = _xpu_ok()
     with contextlib.suppress(Exception):
         out["mps"] = _mps_ok()
-    if _has("torch_xla"):
+    if tpu_packages():
         if probe_tpu or _TPU["probed"]:
             out["tpu"] = _probe_tpu()[0] is not None
         else:
@@ -463,8 +519,8 @@ def autocast(dev, dtype):
     if dtype is None or dtype == torch.float32:
         return contextlib.nullcontext()
     n = name(dev)
-    device_type = {"tpu": "xla"}.get(n, n)
-    return torch.autocast(device_type=device_type, dtype=dtype)
+    device_type = ("xla" if tpu_backend(dev) == "torch_xla" else "tpu") if n == "tpu" else n
+    return torch.autocast(device_type=device_type, dtype=dtype)  # dtype은 항상 지정(torch_tpu 기본은 fp16)
 
 
 def make_scaler(dev, enabled: bool):
@@ -489,8 +545,8 @@ def optimizer_step(opt, scaler, dev=None):
 
 
 def step_end(dev) -> None:
-    """한 단계 마무리. TPU: 모아 둔 연산을 실행(sync). 다른 장치: 아무것도 안 함."""
-    if not is_tpu(dev):
+    """한 단계 마무리. torch_xla: 모아 둔 연산을 실행(sync). torch_tpu(즉시 실행)와 다른 장치: 아무것도 안 함."""
+    if tpu_backend(dev) != "torch_xla":
         return
     import torch_xla
 
@@ -503,8 +559,11 @@ def step_end(dev) -> None:
 
 
 def manual_seed(dev, seed: int) -> None:
-    """장치 난수 seed. TPU만 해당(LoRA 초기화·dropout이 장치 난수를 쓴다). 다른 장치는 아무것도 안 함."""
-    if not is_tpu(dev):
+    """장치 난수 seed. torch_xla만 해당(torch.manual_seed가 XLA 난수를 정하지 않음).
+
+    torch_tpu는 torch.manual_seed가 TPU 난수도 정하므로 여기서는 아무것도 안 한다. 다른 장치도 마찬가지.
+    """
+    if tpu_backend(dev) != "torch_xla":
         return
     with contextlib.suppress(Exception):
         import torch_xla.core.xla_model as xm
@@ -584,6 +643,13 @@ def mem_total_gb(dev) -> float | None:
         if n == "xpu":
             return torch.xpu.get_device_properties(0).total_memory / GB
         if n == "tpu":
+            if tpu_backend(dev) == "torch_tpu":
+                with contextlib.suppress(Exception):  # PCI 정보에서 읽음(런타임을 시작하지 않음)
+                    p = torch.tpu.get_device_properties()
+                    b = (getattr(p, "hbm_bytes_per_device", None) or getattr(p, "hbm_bytes_per_chip", None)
+                         or getattr(p, "total_memory", None))
+                    if b:
+                        return b / GB
             info = tpu_memory_info(dev)
             if info.get("total_gb"):
                 return info["total_gb"]
@@ -594,7 +660,15 @@ def mem_total_gb(dev) -> float | None:
 
 
 def tpu_memory_info(dev=None) -> dict:
-    """TPU 메모리 사용량 {'total_gb','used_gb'} (읽지 못하면 빈 dict). 버전마다 키 이름이 달라 둘 다 본다."""
+    """TPU 메모리 사용량 {'total_gb','used_gb'} (읽지 못하면 빈 dict). torch_xla는 버전마다 키 이름이 달라 둘 다 본다."""
+    if tpu_backend(dev) == "torch_tpu":
+        try:
+            import torch
+
+            free, total = torch.accelerator.get_memory_info()
+            return {"total_gb": total / GB, "used_gb": (total - free) / GB} if total else {}
+        except Exception:
+            return {}
     try:
         import torch_xla.core.xla_model as xm
 
@@ -614,8 +688,8 @@ def tpu_memory_info(dev=None) -> dict:
 
 def compile_count() -> int | None:
     """지금까지 XLA 컴파일 횟수 (재컴파일 경고용). TPU가 아니거나 읽지 못하면 None."""
-    if not _TPU["probed"] or _TPU["device"] is None:
-        return None
+    if not _TPU["probed"] or _TPU["device"] is None or _TPU["backend"] != "torch_xla":
+        return None  # torch_tpu는 연산마다 모양별로 컴파일해 캐시하므로 이 값을 쓰지 않는다
     try:
         import torch_xla.debug.metrics as met
 
@@ -640,8 +714,10 @@ def info(probe_tpu: bool = False) -> dict:
     """장치 정보 (명령줄 device, 웹 기기 카드용). TPU는 probe_tpu=True일 때만 실제로 연다."""
     out = {"available": available(probe_tpu=probe_tpu), "torch_version": _version("torch"),
            "torch_xla_version": _version("torch_xla"), "rocm": False, "xpu_name": None,
-           "tpu": {"installed": _has("torch_xla"), **tpu_hint(), "probed": _TPU["probed"],
-                   "ok": _TPU["device"] is not None, "reason": _TPU["reason"]}}
+           "torch_tpu_version": _version("torch_tpu"),
+           "tpu": {"installed": bool(tpu_packages()), "packages": tpu_packages(), **tpu_hint(),
+                   "probed": _TPU["probed"], "ok": _TPU["device"] is not None, "reason": _TPU["reason"],
+                   "backend": _TPU["backend"] or (tpu_packages() or [None])[0]}}
     if _has("torch"):
         try:
             import torch
