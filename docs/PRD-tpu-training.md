@@ -4,6 +4,7 @@
 - 관련 문서: `docs/PRD.md`(제품 전체), `docs/SPEC.md`(구현 계약), `docs/SPEC-pause-resume.md`(중간 저장·재개), `docs/COLAB_MANUAL.md`(코랩 사용법)
 - 대상 장치: **코랩 TPU v5e-1** (TPU v5e 칩 1개, 칩당 HBM 16GB, bf16 기본)
 - 한 줄 요약: 코랩 등에서 **TPU로 소형 AI 모델과 LoRA를 학습**할 수 있게 하되, **지금 되는 GPU·CPU·Mac 학습과 모든 부가 기능은 그대로** 둔다.
+- 기본 정책 (개정): **`torch_xla`와 다른 가속 기능(Intel Arc `xpu`, AMD ROCm 감지)을 기본 구성에 포함**하고, **fp16 혼합 정밀도를 기본값**으로 한다. 따로 옵션을 켜지 않아도 쓸 수 있는 가속기를 자동으로 쓴다.
 
 ---
 
@@ -33,13 +34,15 @@ TPU는 PyTorch에서 `torch_xla`로 쓴다. GPU와 달리 다음 성질이 있�
 3. **기존 기능은 바뀌지 않는다.** TPU가 없거나 TPU를 고르지 않으면 지금과 똑같이 동작한다(7장의 유지 원칙).
 4. TPU에서 저장한 체크포인트를 **GPU·CPU에서 이어서** 할 수 있고, 그 반대도 된다.
 5. 장치는 **자동 감지**가 기본이고, 사용자가 **직접 고를 수도** 있다.
+6. **가속 패키지를 기본 설치**에 넣는다. `requirements-train.txt`만 설치하면 그 PC·런타임에서 쓸 수 있는 가속기(NVIDIA·TPU·Intel Arc·AMD·Mac)를 따로 설치 없이 쓴다(6.11).
+7. **fp16을 기본값**으로 한다. bf16을 지원하지 않는 GPU(T4 등)에서 LoRA를 학습하면 `LEARNBOX_AMP`를 주지 않아도 fp16 혼합 정밀도로 학습한다(6.4).
 
 **비목표 (이번 범위 밖)**
 - 여러 TPU 칩을 동시에 쓰는 분산 학습(SPMD/FSDP). 대상인 v5e-1은 **칩이 1개**라서 분산 학습이 필요 없다. 더 큰 TPU(v5e-4 이상 등)를 쓰게 되면 별도 PRD.
 - TPU에서 답변 생성(LoRA 답변, 소형 AI 이어 쓰기). 답변은 지금처럼 GPU/CPU에서 한다.
 - JAX/Flax로 다시 쓰기.
 - 휴대폰(브라우저) 학습. TPU와 관계없다.
-- Intel Arc(`xpu`), AMD Radeon(ROCm) 지원. 이번에 만드는 **장치 계층**(8장)이 나중에 이들을 넣을 자리를 마련하지만, 검증은 별도로 한다.
+- Intel Arc(`xpu`)·AMD Radeon(ROCm)의 **성능 최적화와 실기기 보증**. 이번에는 **감지와 기본 학습 경로**까지만 넣고(6.1, 6.11), 실기기 검증은 장비가 있을 때 한다.
 - 대화형(다턴) 학습 데이터와 대화 화면. 별도 작업.
 
 ## 3. 사용 시나리오
@@ -57,7 +60,8 @@ TPU는 PyTorch에서 `torch_xla`로 쓴다. GPU와 달리 다음 성질이 있�
 | 학습 종류 | 소형 AI(처음부터·이어서), LoRA(새로·이어서·재개) | 자율 학습도 장치 설정을 따름 |
 | 정밀도 | bf16 (가중치 bf16, LoRA 어댑터 fp32 유지) | fp16 스케일러 없음 |
 | LoRA 기반 모델 | 0.5B → 1.5B → 3B 순서로 검증 | 3B는 bf16 가중치 약 6GB라 16GB에 들어갈 것으로 예상, 측정으로 확정 |
-| 설치 | `torch_xla`는 **선택 패키지** (`requirements-tpu.txt`) | 기본 설치에는 추가하지 않음 |
+| 설치 | `torch_xla`를 **기본 패키지**(`requirements-train.txt`)에 포함, 설치 가능한 환경(Linux x86_64)에서만 설치되도록 조건 지정 | 6.11 |
+| 기본 정밀도 | CUDA: bf16 가능하면 bf16, 아니면 **fp16(기본)** / TPU: bf16 / Arc: bf16 가능하면 bf16, 아니면 fp16 | 6.4 |
 | 환경 | 코랩 TPU 런타임 **v5e-1** | 다른 TPU 종류·Cloud TPU VM은 문서만 |
 
 ## 5. 예상 성능 (추정치, 측정으로 확인 필요)
@@ -74,8 +78,8 @@ TPU는 PyTorch에서 `torch_xla`로 쓴다. GPU와 달리 다음 성질이 있�
 ## 6. 기능 요구사항
 
 ### 6.1 장치 감지와 선택
-- 선택 값: `auto`(기본) · `cuda` · `mps` · `tpu` · `cpu`.
-- `auto` 순서: `cuda` → `tpu` → `mps` → `cpu`. TPU 감지는 `torch_xla`가 **설치돼 있고** 실제 장치를 열 수 있을 때만 참이다. 감지 중 오류가 나면 조용히 다음 후보로 넘어간다.
+- 선택 값: `auto`(기본) · `cuda` · `tpu` · `xpu`(Intel Arc) · `mps` · `cpu`. AMD ROCm용 PyTorch는 `cuda`로 잡히므로 따로 값을 두지 않고, 장치 정보에 "AMD(ROCm)"로 표시한다.
+- `auto` 순서: `cuda`(NVIDIA·AMD ROCm) → `tpu` → `xpu` → `mps` → `cpu`. TPU 감지는 `torch_xla`가 **설치돼 있고** 실제 장치를 열 수 있을 때만 참이다. 감지 중 오류가 나면 조용히 다음 후보로 넘어간다.
 - 지정 방법 (우선순위 높은 것부터): 학습 요청의 `device` 값(웹 폼, `--device`) → 환경변수 `LEARNBOX_DEVICE` → 설정 `training_device` → `auto`.
 - 고른 장치를 쓸 수 없으면 CPU로 학습하고 이유를 안내 문구(`notes`)에 남긴다. 지금 `tinylm._pick_device`의 동작("CUDA GPU를 찾지 못해 CPU로 학습했습니다")과 같은 방식.
 - `python -m learnbox device`와 [학습] 탭 기기 카드에 TPU 정보(종류, 코어 수, 메모리를 알 수 있으면)를 보여 준다. 등급(`tier`)에 `tpu`를 추가한다.
@@ -89,15 +93,20 @@ TPU는 PyTorch에서 `torch_xla`로 쓴다. GPU와 달리 다음 성질이 있�
 ### 6.3 LoRA 학습 (TPU)
 - 지금 학습 루프(`train_pc.train_lora`)를 그대로 쓴다.
 - 기반 모델은 bf16으로 불러오고, LoRA 어댑터는 fp32로 둔다.
-- `LEARNBOX_AMP=fp16`은 CUDA 전용으로 유지한다. TPU에서는 무시하고 안내 문구에 남긴다.
+- CUDA에서 bf16을 지원하지 않으면 **fp16 혼합 정밀도가 기본**이다. 끄려면 `LEARNBOX_AMP=off`(float32로 학습)를 준다. `LEARNBOX_AMP=fp16`은 지금처럼 동작한다(기본과 같음). TPU에서는 이 값을 무시하고 안내 문구에 남긴다.
 - 메모리 부족 시 지금처럼 오류로 끝내고, 안내 문구에 "배치·문맥 길이·모델 크기를 줄이세요"를 보여 준다.
 
 ### 6.4 정밀도
 | 장치 | 소형 AI | LoRA |
 |---|---|---|
-| cuda | 지금 그대로 (bf16 가능하면 bf16, 아니면 fp16 + 스케일러) | 지금 그대로 (기본 자동, `LEARNBOX_AMP=fp16`이면 fp16) |
+| cuda | 지금 그대로 (bf16 가능하면 bf16, 아니면 fp16 + 스케일러) | bf16 가능하면 지금 그대로 bf16, 아니면 **fp16 + 스케일러가 기본** (`LEARNBOX_AMP=off`면 float32) |
 | tpu | bf16 자동 혼합 정밀도, 스케일러 없음 | 기반 모델 bf16, 어댑터 fp32 |
+| xpu | bf16 가능하면 bf16, 아니면 fp16 + 스케일러 | 같은 규칙 |
 | mps / cpu | 지금 그대로 | 지금 그대로 |
+
+- 기본값을 바꿔도 설정·명령으로 되돌릴 수 있어야 한다: 환경변수 `LEARNBOX_AMP=off`, 설정 `lora_training.amp`(`auto`/`fp16`/`off`), 웹 LoRA 폼의 "정밀도" 선택.
+- fp16에서 손실이 `nan`이면 스케일러가 그 단계를 건너뛴다. 같은 일이 연속 N번(기본 20) 일어나면 학습을 멈추고 "`LEARNBOX_AMP=off` 또는 학습률을 낮추세요"라고 안내한다.
+- 모델 정보(`info.json`)에 실제 쓴 정밀도를 기록한다.
 
 ### 6.5 입력 모양 고정 (재컴파일 방지)
 - 학습 배치는 항상 `[batch_size, seq_len]` 모양이어야 한다.
@@ -137,14 +146,29 @@ TPU는 PyTorch에서 `torch_xla`로 쓴다. GPU와 달리 다음 성질이 있�
 | TPU 메모리 부족 | 학습 실패, 체크포인트가 있으면 재개 가능 표시 유지 |
 | 같은 TPU를 다른 작업이 쓰는 중 | 작업 대기열(학습은 한 번에 하나)로 이미 막힘. 다른 프로세스가 쓰는 경우 실패 안내 |
 
+### 6.11 기본 패키지 구성
+
+| 패키지 | 들어가는 곳 | 설치 조건 | 없을 때 |
+|---|---|---|---|
+| `torch`, `transformers`, `peft` 등 | `requirements-train.txt` (지금과 같음) | 모든 환경 | 학습 불가 (지금과 같음) |
+| `torch_xla[tpu]` | `requirements-train.txt` | `sys_platform == "linux" and platform_machine == "x86_64"` (PyPI 휠이 이 환경만 있음, cp310~cp313 확인) | TPU 대신 다른 장치로 학습, 안내 문구 |
+| Intel Arc(`xpu`) 지원 | PyTorch 본체에 포함(xpu 빌드). 별도 파이썬 패키지는 넣지 않음 | xpu용 PyTorch를 설치한 경우 | CPU로 학습 |
+| AMD ROCm 지원 | PyTorch 본체에 포함(ROCm 빌드) | ROCm용 PyTorch를 설치한 경우 | CPU로 학습 |
+
+- **`torch_xla`와 `torch`는 버전이 짝이 맞아야 한다.** 확인 시점(2026-11) PyPI 최신 `torch_xla`는 **2.9.0**이고, 이 저장소의 개발 환경 `torch`는 2.15.0이다. 기본 설치에 넣으면 Linux에서 `torch`가 2.9로 맞춰지거나 설치가 충돌할 수 있다. 이 문제의 처리 방식은 13장 결정 항목이다.
+- Intel Arc·AMD는 파이썬 패키지 하나로 해결되지 않고 **PyTorch를 어느 빌드로 설치하느냐**로 정해진다. 그래서 설치 스크립트(`start.sh`, `start-windows.bat`, 윈도 GPU 설치 스크립트)가 장치를 감지해 맞는 PyTorch 빌드(CUDA/ROCm/xpu/CPU)를 고르도록 한다.
+- 어떤 가속 패키지가 없거나 깨져 있어도 **import 단계에서 오류로 멈추지 않는다.** 장치 감지에서 빠지고 안내 문구만 남긴다.
+- `python -m learnbox device`에 설치된 가속 패키지와 버전(`torch`, `torch_xla`, xpu/ROCm 여부)을 보여 준다.
+
 ## 7. 기존 기능 유지 원칙 (회귀 금지)
 
 이 PRD에서 가장 중요한 조건이다.
 
 1. **TPU 경로는 장치가 `tpu`일 때만 실행된다.** 그 밖의 장치에서는 학습 루프의 연산 순서, 정밀도, 난수 사용이 지금과 같아야 한다.
-2. **`torch_xla`는 필요할 때만 불러온다(지연 import).** 설치돼 있지 않아도 import 오류가 나지 않는다. 기본 설치(`requirements.txt`, `requirements-train.txt`)는 바뀌지 않는다.
+2. **`torch_xla`는 필요할 때만 불러온다(지연 import).** 기본 패키지에 들어가더라도, 설치돼 있지 않거나 깨져 있어도 import 오류로 멈추지 않는다. `requirements.txt`(학습 없는 기본 설치)는 바뀌지 않는다.
 3. 다음 기능은 동작과 결과가 바뀌지 않아야 한다.
-   - CUDA: 소형 AI 자동 혼합 정밀도, LoRA `LEARNBOX_AMP=fp16`, 자동 활성값 체크포인팅
+   - CUDA: 소형 AI 자동 혼합 정밀도, bf16 지원 GPU의 LoRA, `LEARNBOX_AMP=fp16`, 자동 활성값 체크포인팅
+   - **의도한 변경 (예외)**: bf16을 지원하지 않는 CUDA GPU의 LoRA 기본 정밀도가 float32 → **fp16**으로 바뀐다. `LEARNBOX_AMP=off`로 이전 동작을 그대로 얻을 수 있어야 한다.
    - MPS, CPU 학습과 스레드 설정
    - 중간 저장·일시정지·재개·지금까지 저장하고 끝내기·취소, 장치가 바뀐 재개
    - 자율 학습, 학습 종료 결과 파일, 외장 저장 내보내기
@@ -168,7 +192,8 @@ TPU는 PyTorch에서 `torch_xla`로 쓴다. GPU와 달리 다음 성질이 있�
 
 | 함수 (안) | 역할 | cuda/mps/cpu에서 | tpu에서 |
 |---|---|---|---|
-| `pick(device)` | 장치 고르기, 안내 문구 | 지금 `_pick_device`/`_device`와 같음 | `torch_xla` 장치 |
+| `pick(device)` | 장치 고르기, 안내 문구 | 지금 `_pick_device`/`_device`와 같음 (+`xpu`) | `torch_xla` 장치 |
+| `amp_policy(dev, kind)` | 정밀도 결정 (`LEARNBOX_AMP`, 설정) | bf16 가능하면 bf16, 아니면 fp16 기본, `off`면 float32 | bf16 |
 | `autocast(dev, dtype)` | 혼합 정밀도 문맥 | 지금과 같음 | bf16 |
 | `make_scaler(dev, dtype)` | 기울기 스케일러 | 지금과 같음 | 꺼진 스케일러 |
 | `optimizer_step(opt, scaler)` | 갱신 | `scaler.step(opt)` 또는 `opt.step()` | TPU용 갱신 |
@@ -180,13 +205,14 @@ TPU는 PyTorch에서 `torch_xla`로 쓴다. GPU와 달리 다음 성질이 있�
 
 - `torch_xla` API는 버전마다 이름이 다르다(예: `torch_xla.sync()`와 이전의 `xm.mark_step()`, `torch_xla.device()`와 이전의 `xm.xla_device()`). `accel.py` 안에서만 버전 차이를 흡수한다.
 - 다중 코어용 `xmp.spawn`은 서버의 작업 스레드 구조와 맞지 않으므로 1단계에서 쓰지 않는다.
-- 이 계층은 나중에 Intel Arc(`xpu`), AMD(ROCm) 같은 장치를 넣을 자리로도 쓴다.
+- 이 계층이 Intel Arc(`xpu`)와 AMD(ROCm) 감지도 맡는다. `xpu`는 `torch.xpu`가 있으면 쓰고, ROCm은 `torch.version.hip`으로 구분한다.
 
 ## 9. 단계별 진행
 
 | 단계 | 내용 | 완료 조건 |
 |---|---|---|
 | P0 | `accel.py` 추가, 두 학습 루프를 장치 계층 호출로 교체 (동작 변화 없음) | 기존 테스트 전부 통과, CPU 손실 기록 비트 단위 동일 |
+| P0.5 | fp16 기본값(`amp_policy`), `LEARNBOX_AMP=off`·설정·웹 정밀도 선택, `requirements-train.txt`에 `torch_xla` 조건부 추가, `xpu`·ROCm 감지, `device` 출력 | T4에서 옵션 없이 3B LoRA가 fp16으로 학습됨, `off`로 이전 동작 재현, Windows·Mac에서 기본 설치가 깨지지 않음 |
 | P1 | TPU 장치 감지·선택, 소형 AI TPU 학습 | 코랩 TPU에서 나노·미니 200단계 완료, 3단계 이후 재컴파일 0회 |
 | P2 | 체크포인트 CPU 저장, 장치 간 재개 | TPU→CPU, TPU→T4, T4→TPU 재개 성공 |
 | P3 | LoRA TPU 학습 (0.5B → 1.5B → 3B), 고정 모양 패딩 | v5e-1에서 0.5B·1.5B·3B(r 16, 문맥 512, 배치 2) 300단계 완료 |
@@ -198,6 +224,8 @@ TPU는 PyTorch에서 `torch_xla`로 쓴다. GPU와 달리 다음 성질이 있�
 - **기존 테스트**: 단계마다 전부 실행. 고치지 않고 통과해야 한다.
 - **장치 계층 단위 테스트**: TPU가 없는 환경에서도 돌도록 `torch_xla`를 흉내 내는 가짜 모듈로 `pick`, `optimizer_step`, `step_end`, `to_cpu` 호출 순서를 검사한다.
 - **CPU 동일성 테스트**: 같은 seed로 변경 전후 손실 기록이 같은지 비교한다.
+- **정밀도 정책 테스트**: 가짜 장치 정보로 `amp_policy`가 (bf16 가능 GPU → bf16), (불가 GPU → fp16), (`LEARNBOX_AMP=off` → float32), (TPU → bf16)을 고르는지 검사한다.
+- **설치 검증**: 깨끗한 가상환경에서 Linux·Windows·Mac 각각 `requirements-train.txt` 설치가 끝나는지 확인한다(조건 지정이 맞는지).
 - **TPU 실측 (코랩)**: 이 저장소의 CI에는 TPU가 없으므로, 코랩에서 돌리는 짧은 확인 셀(10단계 학습 → 저장 → 재개 → 재컴파일 횟수 출력)을 `docs/`에 남기고 결과를 기록한다.
 
 ## 11. 성공 지표
@@ -212,7 +240,9 @@ TPU는 PyTorch에서 `torch_xla`로 쓴다. GPU와 달리 다음 성질이 있�
 
 | 리스크 | 영향 | 대응 |
 |---|---|---|
-| `torch_xla`와 `torch`, `transformers`, `peft` 버전 조합이 맞지 않음 | 설치·실행 실패 | `requirements-tpu.txt`에 검증한 조합을 고정, 감지 실패 시 CPU로 안내 |
+| `torch_xla`를 기본 패키지로 넣으면 Linux에서 `torch`가 `torch_xla`와 같은 버전(2.9)으로 내려가거나 충돌 | **GPU 사용자의 torch가 바뀌고 설치가 실패할 수 있음** (가장 큰 위험) | 13장 결정에 따라 ① torch를 `torch_xla`와 같은 버전으로 고정, ② TPU 런타임에서만 설치하는 설치 스크립트 분기, ③ 별도 줄로 분리 중 선택. 감지 실패 시 CPU로 안내 |
+| fp16 기본값으로 바뀐 뒤 일부 모델에서 `nan` 발생 | 학습 실패·품질 저하 | 연속 `nan` 감지 후 멈춤·안내, `LEARNBOX_AMP=off`로 즉시 되돌림 |
+| Intel Arc·AMD 실기기 없음 | 감지만 되고 학습 경로 미검증 | 장치 정보에 "미검증" 표시, 장비 확보 시 검증 |
 | 입력 모양이 바뀌어 재컴파일 반복 | GPU보다 느려짐 | 6.5 고정 모양 규칙, 재컴파일 수 경고 |
 | 3B가 v5e-1 메모리(16GB)에 빠듯함 | 3B TPU 학습 불가 또는 배치 축소 | 활성값 체크포인팅을 TPU에서도 자동 적용, 그래도 안 되면 배치 1 또는 문맥 384 안내 |
 | 서버 작업 스레드에서 TPU 장치 사용 문제 | 웹 학습 실패 | P1에서 웹 경로를 먼저 검증, 문제 시 학습만 별도 프로세스로 실행하는 방안 검토 |
@@ -226,7 +256,12 @@ TPU는 PyTorch에서 `torch_xla`로 쓴다. GPU와 달리 다음 성질이 있�
 2. **`auto`의 우선순위**: GPU와 TPU가 둘 다 있을 때(드묾) GPU를 먼저 고를지.
 3. **자율 학습의 장치**: 자율 학습도 `training_device` 설정을 따를지, 항상 `auto`일지.
 4. **3B의 범위**: v5e-1에서 배치 2·문맥 512가 들어가지 않으면 배치 1로 낮춰 지원할지, 1.5B까지만 지원할지.
-5. **`torch_xla` 버전 고정 방식**: 코랩 런타임에 미리 깔린 버전을 쓸지, 검증한 버전을 설치할지.
+5. **`torch_xla` 기본 포함 방식** (가장 중요): `torch_xla`(최신 2.9.0)와 `torch` 버전을 맞춰야 한다.
+   - ① `requirements-train.txt`에서 Linux일 때 `torch`와 `torch_xla`를 같은 버전(2.9)으로 고정 → 모든 Linux 사용자가 torch 2.9를 씀
+   - ② `requirements-train.txt`에는 조건부로 넣되, 설치 스크립트가 TPU 런타임일 때만 설치(코랩 GPU·일반 PC는 영향 없음)
+   - ③ 기본 파일에 넣지 않고 설치 스크립트가 자동으로 추가 설치
+   - 추천: ② (요구대로 기본 구성에 포함하면서 GPU 사용자의 torch는 건드리지 않음)
+6. **fp16 기본 적용 범위**: LoRA만 바꿀지, 웹 화면에 정밀도 선택을 노출할지(추천: 둘 다).
 
 ## 14. 용어
 
