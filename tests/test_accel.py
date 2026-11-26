@@ -149,7 +149,14 @@ class TorchPathsTest(unittest.TestCase):
             self.skipTest("CUDA가 있는 환경")
         calls = []
         mods, dev = _fake_xla(calls=calls)
-        with mock.patch.dict(sys.modules, mods), mock.patch.object(accel, "_has", return_value=True):
+        # TPU 신호가 없으면 자동 선택은 TPU 패키지를 불러오지 않는다
+        with mock.patch.dict(sys.modules, mods), mock.patch.object(accel, "_has", return_value=True), \
+                mock.patch.object(accel, "tpu_hint", return_value={"likely": False}):
+            self.assertEqual(accel.pick("auto")[0], "cpu")
+            self.assertEqual(calls, [])
+        hint = {"likely": True, "signals": ["pci:v5ex1"], "accelerator_type": "v5e", "chips": 1, "hbm_gb": 16.0}
+        with mock.patch.dict(sys.modules, mods), mock.patch.object(accel, "_has", return_value=True), \
+                mock.patch.object(accel, "tpu_hint", return_value=hint):
             self.assertEqual(accel.pick("auto"), ("tpu", dev, None))
             self.assertEqual(accel.pick("tpu"), ("tpu", dev, None))
             self.assertEqual(calls.count("device"), 1)  # 한 번만 연다
@@ -174,6 +181,39 @@ class TorchPathsTest(unittest.TestCase):
             n, d, note = accel.pick("tpu")
             self.assertEqual(n, "cpu")
             self.assertIn("TPU가 아닙니다", note)
+
+    def test_version_mismatch_blocks_import(self):
+        mods, _ = _fake_xla()
+        calls = []
+        mods["torch_xla"].device = lambda: calls.append("opened")
+        vers = {"torch": "2.14.1+cpu", "torch_xla": "2.9.0"}
+        with mock.patch.dict(sys.modules, mods), mock.patch.object(accel, "_has", return_value=True), \
+                mock.patch.object(accel, "_version", side_effect=lambda p: vers.get(p)):
+            n, _, note = accel.pick("tpu")
+        self.assertEqual(n, "cpu")
+        self.assertIn("버전이 맞지 않습니다", note)
+        self.assertEqual(calls, [])
+
+    def test_undo_xla_patches(self):
+        import torch.nn as nn
+
+        orig_clip, orig_gru = nn.utils.clip_grad_norm_, nn.GRU
+
+        def patched(*a, **k):
+            return None
+
+        patched._orig = orig_clip
+
+        class PatchedGRU(nn.GRU):
+            _orig = orig_gru
+
+        try:
+            nn.utils.clip_grad_norm_, nn.GRU = patched, PatchedGRU
+            accel._undo_xla_patches()
+            self.assertIs(nn.utils.clip_grad_norm_, orig_clip)
+            self.assertIs(nn.GRU, orig_gru)
+        finally:
+            nn.utils.clip_grad_norm_, nn.GRU = orig_clip, orig_gru
 
     def test_pick_survives_broken_xla(self):
         mods, _ = _fake_xla(fail="version mismatch")
@@ -243,6 +283,27 @@ class TorchPathsTest(unittest.TestCase):
 
 
 class HintTest(unittest.TestCase):
+    def test_pci_scan(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            for i, (ven, dev) in enumerate([("0x1ae0", "0x0063"), ("0x10de", "0x1eb8"), ("0x1ae0", "0x9999")]):
+                d = Path(td) / f"0000:00:0{i}.0"
+                d.mkdir()
+                (d / "vendor").write_text(ven + "\n")
+                (d / "device").write_text(dev + "\n")
+            real_glob = accel.glob.glob
+            with mock.patch.object(accel.glob, "glob",
+                                   side_effect=lambda p: real_glob(f"{td}/*/vendor") if p.startswith("/sys/bus/pci")
+                                   else []):
+                self.assertEqual(accel.pci_tpu_chips(), (1, "v5e"))
+                env = {k: v for k, v in os.environ.items() if not k.startswith(("TPU_", "COLAB_TPU", "PJRT"))}
+                with mock.patch.dict(os.environ, env, clear=True):
+                    h = accel.tpu_hint()
+        self.assertTrue(h["likely"])
+        self.assertEqual(h["hbm_gb"], 16.0)
+        self.assertEqual(h["accelerator_type"], "v5e")
+
     def test_hint_env(self):
         with mock.patch.dict(os.environ, {"TPU_ACCELERATOR_TYPE": "v5litepod-1"}):
             h = accel.tpu_hint()

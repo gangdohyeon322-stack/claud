@@ -109,12 +109,42 @@ def _has(mod: str) -> bool:
         return False
 
 
-def tpu_hint() -> dict:
-    """torch_xla를 불러오지 않고 TPU 런타임인지 짐작한다 (설치 스크립트·장치 카드용).
+# Google TPU PCI 장치 번호 (torch_xla 2.9 _internal/tpu.py와 같은 목록). 공급자 번호 0x1ae0.
+_TPU_PCI = {"0x0027": "v2/v3", "0x005e": "v4", "0x0063": "v5e", "0x0062": "v5p", "0x006f": "v6e",
+            "0x0076": "7x", "0x0056": "test"}
+_TPU_PCI_HBM = {"v5e": 16, "v6e": 32, "v4": 32, "v5p": 95}
 
-    확실한 감지는 pick('tpu')가 한다. 여기 신호는 '그럴 가능성'일 뿐이다.
+
+def pci_tpu_chips() -> tuple[int, str | None]:
+    """/sys/bus/pci를 읽어 TPU 칩 수와 종류를 센다. 아무것도 불러오지 않고 멈추지도 않는다. (Linux 외: 0)"""
+    n, kind = 0, None
+    try:
+        for v in glob.glob("/sys/bus/pci/devices/*/vendor"):
+            try:
+                with open(v, encoding="ascii") as f:
+                    if f.read().strip().lower() != "0x1ae0":
+                        continue
+                with open(os.path.join(os.path.dirname(v), "device"), encoding="ascii") as f:
+                    dev = f.read().strip().lower()
+            except OSError:
+                continue
+            if dev in _TPU_PCI:
+                n += 1
+                kind = kind or _TPU_PCI[dev]
+    except Exception:
+        return 0, None
+    return n, kind
+
+
+def tpu_hint() -> dict:
+    """TPU 패키지를 불러오지 않고 TPU 런타임인지 짐작한다 (설치 스크립트·장치 카드·자동 선택 전 확인용).
+
+    확실한 감지는 pick('tpu')가 한다. 가장 믿을 만한 신호는 PCI의 TPU 칩(v5e는 /dev/accel 대신 /dev/vfio를 쓴다).
     """
     signals = []
+    chips, kind = pci_tpu_chips()
+    if chips:
+        signals.append(f"pci:{kind}x{chips}")
     for key in ("TPU_ACCELERATOR_TYPE", "TPU_NAME", "COLAB_TPU_ADDR", "TPU_WORKER_ID"):
         if os.environ.get(key):
             signals.append(key)
@@ -130,8 +160,11 @@ def tpu_hint() -> dict:
         pass
     acc = os.environ.get("TPU_ACCELERATOR_TYPE") or None
     strong = [s for s in signals if s != "/dev/vfio/*"]
+    hbm = _hbm_from_type(acc)
+    if hbm is None and kind in _TPU_PCI_HBM:
+        hbm = float(_TPU_PCI_HBM[kind])
     return {"likely": bool(strong) or (bool(signals) and bool(acc)), "signals": signals,
-            "accelerator_type": acc, "hbm_gb": _hbm_from_type(acc)}
+            "accelerator_type": acc or kind, "chips": chips, "hbm_gb": hbm}
 
 
 def _hbm_from_type(acc: str | None) -> float | None:
@@ -158,6 +191,39 @@ def _xla_modules():
     return torch_xla, xm, xr
 
 
+def _mm(v: str) -> tuple:
+    return tuple(v.split("+")[0].split(".")[:2])
+
+
+def _xla_version_mismatch() -> str | None:
+    """설치된 torch와 torch_xla의 major.minor가 다르면 안내 문구. 버전을 알 수 없으면 None(확인 생략).
+
+    torch_xla는 torch 의존성을 선언하지 않아서 pip가 짝이 안 맞는 버전을 그냥 설치한다. import 전에 막는다.
+    """
+    t, x = _version("torch"), _version("torch_xla")
+    if t and x and _mm(t) != _mm(x):
+        return (f"torch {t}와 torch_xla {x}의 버전이 맞지 않습니다. "
+                f"python -m learnbox.setup_accel 로 맞는 짝을 설치하세요.")
+    return None
+
+
+def _undo_xla_patches() -> None:
+    """torch_xla import가 프로세스 전체에 덮어쓰는 함수를 원래대로 돌린다(같은 서버의 다른 장치 학습을 예전과 같게).
+
+    torch_xla 2.9는 torch.nn.utils.clip_grad_norm_과 nn.GRU를 바꾸고 원본을 ._orig에 둔다.
+    torch의 원래 clip_grad_norm_은 XLA에서도 동작한다.
+    """
+    try:
+        import torch.nn as nn
+
+        for owner, attr in ((nn.utils, "clip_grad_norm_"), (nn, "GRU")):
+            orig = getattr(getattr(owner, attr, None), "_orig", None)
+            if orig is not None:
+                setattr(owner, attr, orig)
+    except Exception:
+        pass
+
+
 def _probe_tpu():
     """TPU 장치를 연다. 성공하면 torch.device(xla), 실패하면 None과 이유. 한 번만 시도하고 결과를 기억한다."""
     with _TPU_LOCK:
@@ -166,11 +232,14 @@ def _probe_tpu():
         dev, reason = None, None
         if not _has("torch_xla"):
             reason = "not_installed"
+        elif _xla_version_mismatch():
+            reason = _xla_version_mismatch()
         else:
             try:
                 if not os.environ.get("PJRT_DEVICE") and tpu_hint()["likely"]:
                     os.environ["PJRT_DEVICE"] = "TPU"
                 txla, xm, xr = _xla_modules()
+                _undo_xla_patches()
                 if hasattr(txla, "device"):
                     d = txla.device()
                 elif xm is not None:
@@ -189,7 +258,12 @@ def _probe_tpu():
                 else:
                     reason = f"XLA 장치가 TPU가 아닙니다 ({kind or '알 수 없음'})"
             except Exception as e:  # 버전 불일치, 런타임 초기화 실패 등
-                reason = f"{type(e).__name__}: {e}"[:200]
+                msg = str(e)
+                if "already in use" in msg or "libtpu_lockfile" in msg:
+                    reason = ("다른 프로세스가 TPU를 쓰고 있습니다(코랩 노트북 셀이 TPU를 열었는지 확인하세요). "
+                              + msg[:120])
+                else:
+                    reason = f"{type(e).__name__}: {msg}"[:200]
         _TPU.update(probed=True, device=dev, reason=reason)
         return dev, reason
 
@@ -234,8 +308,9 @@ def pick(device=None, *, allow_tpu: bool = True):
     if want == "auto":
         if torch.cuda.is_available():
             return "cuda", torch.device("cuda"), None
-        if allow_tpu:
-            d, _ = _probe_tpu() if _has("torch_xla") else (None, None)
+        # 자동 선택은 TPU 신호가 있을 때만 TPU 패키지를 불러온다(아니면 import 부작용 없이 넘어감).
+        if allow_tpu and _has("torch_xla") and (_TPU["probed"] or tpu_hint()["likely"]):
+            d, _ = _probe_tpu()
             if d is not None:
                 return "tpu", d, None
         if _xpu_ok():
@@ -538,7 +613,9 @@ def compile_count() -> int | None:
         import torch_xla.debug.metrics as met
 
         d = met.metric_data("CompileTime")
-        return int(d[0]) if d else 0
+        if d:
+            return int(d[0])
+        return int(getattr(met, "counter_value", lambda _n: 0)("UncachedCompile") or 0)
     except Exception:
         return None
 

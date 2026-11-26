@@ -2,10 +2,13 @@
 
 - 학습: 말뭉치를 seq_len 토큰 블록으로 묶어 이어 학습(continued pretraining)하고, Q&A 파일이 있으면
   대화 형식 예시를 섞는다. 기존 어댑터 폴더(resume_from)에서 이어 학습할 수 있다(total_steps 누적).
-- PC 성능 차이 고려: CUDA > Apple MPS > CPU 자동 선택, 메모리가 모자라면 bf16 / 활성값 체크포인팅을
-  자동으로 켜고, CPU 스레드 수를 지정할 수 있다. estimate_lora()로 필요한 메모리를 미리 계산한다.
+- PC 성능 차이 고려: 학습 장치는 장치 계층(learnbox/accel.py)이 고른다(CUDA > TPU > Intel GPU > Apple MPS > CPU,
+  요청 device → LEARNBOX_DEVICE → auto). 메모리가 모자라면 bf16 / 활성값 체크포인팅을 자동으로 켜고,
+  CPU 스레드 수를 지정할 수 있다. estimate_lora()로 필요한 메모리를 미리 계산한다.
+  답변(추론)은 TPU를 쓰지 않는다(CUDA > Apple MPS > CPU, 예전 그대로).
+- 정밀도: accel.lora_precision (bf16을 하드웨어로 지원하지 않는 GPU는 fp16 혼합 정밀도가 기본, LEARNBOX_AMP=off면 예전 방식).
 - 기반 모델은 먼저 로컬 캐시에서 찾고(인터넷 없이 동작), 없을 때만 내려받는다.
-- 무거운 라이브러리(torch, transformers, peft)는 함수 안에서만 불러온다.
+- 무거운 라이브러리(torch, transformers, peft, torch_xla)는 함수 안에서만 불러온다.
 """
 from __future__ import annotations
 
@@ -20,6 +23,8 @@ import time
 from array import array
 from datetime import datetime, timezone
 from pathlib import Path
+
+from . import accel
 
 GB = 1024 ** 3
 MB = 1024 ** 2
@@ -201,12 +206,16 @@ def _resolve_size(base_model: str) -> tuple[float | None, dict | None, str | Non
 
 
 def estimate_lora(base_model: str, lora_r: int = 8, seq_len: int = 512, batch_size: int = 2,
-                  profile: dict | None = None) -> dict:
+                  profile: dict | None = None, device: str | None = None) -> dict:
     """LoRA 학습에 필요한 메모리·어댑터 크기 추정.
 
     RAM(CPU 학습, fp32) ≈ 기반 모델 params×4B + LoRA 가중치/기울기/AdamW 상태 + 활성값 + 로짓 + 1GB.
-    VRAM(GPU, bf16) ≈ params×2B + LoRA/옵티마이저 + 활성값 + 로짓 + CUDA 컨텍스트.
+    VRAM(GPU·TPU, bf16/fp16 가중치) ≈ params×2B + LoRA/옵티마이저 + 활성값 + 로짓 + 장치 컨텍스트.
     profile(devices.pc_profile 결과)을 주면 이 PC에서 가능한지(fits)와 권장 문구를 덧붙인다.
+    device("tpu", 선택): TPU 기준으로 판단한다(profile이 없어도). TPU 메모리(HBM)를 알면 fits["tpu"]에
+    들어감/안 들어감, 모르면 None과 "측정 필요" 문구. device를 주지 않아도 profile["accel"](accel.info())에서
+    TPU가 보이고 CUDA GPU가 없으면 TPU 기준으로 판단한다. profile["gpu"]["type"]=="xpu"(Intel GPU)는 CUDA처럼
+    전용 메모리로 판단한다. cuda/mps/CPU만 있는 profile의 결과는 예전과 같다.
     """
     base_model = str(base_model or "").strip()
     r = max(1, int(lora_r or 8))
@@ -249,21 +258,63 @@ def estimate_lora(base_model: str, lora_r: int = 8, seq_len: int = 512, batch_si
             "모델 크기를 알 수 없어 기반 모델 가중치를 뺀 최소 추정치입니다. "
             "모델 이름에 크기(예: 1.5B)가 있거나 한 번 내려받으면 더 정확해집니다."),
     }
-    if profile:
-        out.update(_fit(out, profile))
+    if profile or (device and accel.normalize(device) == "tpu"):
+        out.update(_fit(out, profile or {}, device))
     return out
 
 
-def _fit(est: dict, profile: dict) -> dict:
+def _tpu_fit_target(profile: dict, want: str) -> tuple[bool, float | None]:
+    """(TPU 기준으로 판단할지, TPU 메모리 GB 또는 None). torch_xla를 불러오지 않는다."""
+    gpu = profile.get("gpu") or {}
+    acc = profile.get("accel") if isinstance(profile.get("accel"), dict) else {}
+    tinfo = acc.get("tpu") if isinstance(acc.get("tpu"), dict) else {}
+    avail = acc.get("available") if isinstance(acc.get("available"), dict) else {}
+    if want == "tpu":
+        use = True
+    elif want == "auto":  # auto 순서: cuda → tpu. CUDA GPU가 있으면 예전 판단 그대로.
+        use = gpu.get("type") != "cuda" and bool(avail.get("tpu") or tinfo.get("ok"))
+    else:
+        use = False
+    if not use:
+        return False, None
+    hbm = tinfo.get("hbm_gb") or tinfo.get("total_gb")
+    if not hbm and want == "tpu":
+        hbm = accel.tpu_hint().get("hbm_gb")
+    try:
+        hbm = float(hbm) if hbm else None
+    except (TypeError, ValueError):
+        hbm = None
+    return True, hbm
+
+
+def _fit(est: dict, profile: dict, device: str | None = None) -> dict:
     ram = profile.get("ram_gb")
     gpu = profile.get("gpu") or {}
     vram = gpu.get("vram_gb")
+    want = accel.normalize(device).split(":")[0] if device else "auto"
     fits_cpu = None if not ram else ram >= est["ram_gb_est"]
     fits_cpu_bf16 = None if not ram else ram >= est["ram_gb_est_bf16"]
     fits_gpu = None if not (gpu.get("type") == "cuda" and vram) else vram >= est["vram_gb_est"]
     if gpu.get("type") == "mps" and ram:
         fits_gpu = ram * 0.7 >= est["ram_gb_est"]  # Apple 통합 메모리
-    if fits_gpu:
+    if gpu.get("type") == "xpu":  # Intel GPU: 전용 메모리 기준 (CUDA와 같은 식)
+        fits_gpu = None if not vram else vram >= est["vram_gb_est"]
+    fits = {"cpu": fits_cpu, "cpu_bf16": fits_cpu_bf16, "gpu": fits_gpu}
+    use_tpu, hbm = _tpu_fit_target(profile, want)  # TPU가 관계없으면 아래 TPU 줄은 하나도 실행되지 않는다
+    rec = None
+    if use_tpu:
+        fits["tpu"] = None if not hbm else hbm >= est["vram_gb_est"]
+        if want == "tpu" or not fits_gpu:
+            if fits["tpu"]:
+                rec, device = "TPU로 학습할 수 있습니다.", "tpu"
+            elif fits["tpu"] is None:
+                rec, device = "TPU 메모리 크기를 알 수 없어 들어가는지 측정이 필요합니다(측정 필요).", "tpu"
+            elif want == "tpu":
+                rec, device = (f"TPU 메모리({hbm:g}GB)에 들어가지 않을 것 같습니다. "
+                               "배치·문맥 길이·모델 크기를 줄이세요."), None
+    if rec is not None:
+        pass
+    elif fits_gpu:
         rec, device = "GPU로 학습할 수 있습니다.", gpu.get("type")
     elif fits_cpu:
         rec, device = "CPU로 학습할 수 있지만 느립니다. 단계 수를 줄이거나 작은 모델을 쓰세요.", "cpu"
@@ -274,14 +325,17 @@ def _fit(est: dict, profile: dict) -> dict:
     else:
         rec, device = ("이 PC에는 너무 큰 설정입니다. 더 작은 모델(0.5B)을 고르거나 seq_len·batch를 줄이세요.",
                        None)
-    return {"fits": {"cpu": fits_cpu, "cpu_bf16": fits_cpu_bf16, "gpu": fits_gpu},
-            "recommended_device": device, "recommendation": rec}
+    out = {"fits": fits, "recommended_device": device, "recommendation": rec}
+    if use_tpu:
+        out["tpu_hbm_gb"] = round(hbm, 2) if hbm else None
+    return out
 
 
 # ---------------------------------------------------------------------------
 # 장치·메모리 계획
 # ---------------------------------------------------------------------------
 def _device() -> str:
+    """답변(추론)용 장치: CUDA > Apple MPS > CPU (예전 그대로). TPU는 쓰지 않는다(PRD 2장). 학습은 accel.pick."""
     import torch
 
     if torch.cuda.is_available():
@@ -323,8 +377,13 @@ _DTYPE_NAMES = {"float32": "float32", "fp32": "float32", "bfloat16": "bfloat16",
                 "float16": "float16", "fp16": "float16"}
 
 
-def _plan(device: str, dtype: str | None, est: dict, training: bool) -> tuple[str, bool, list[str]]:
-    """(dtype 이름, 활성값 체크포인팅 여부, 안내 문구들)"""
+def _plan(device: str, dtype: str | None, est: dict, training: bool,
+          tdev=None) -> tuple[str, bool, list[str]]:
+    """(dtype 이름, 활성값 체크포인팅 여부, 안내 문구들)
+
+    device는 정식 이름(cuda/tpu/xpu/mps/cpu). tdev(torch.device, 선택)는 TPU·Intel GPU 메모리를 읽을 때 쓴다.
+    이 dtype은 '예전 규칙'의 값이다. 학습의 최종 정밀도는 accel.lora_precision이 정한다(LEARNBOX_AMP=off면 이 값).
+    """
     import torch
 
     notes: list[str] = []
@@ -334,6 +393,10 @@ def _plan(device: str, dtype: str | None, est: dict, training: bool) -> tuple[st
             want = "bfloat16" if torch.cuda.is_bf16_supported() else ("float32" if training else "float16")
         elif device == "mps":
             want = "float32" if training else "float16"
+        elif device == "tpu":  # TPU는 bf16이 기본 (어댑터는 PEFT가 fp32로 둔다)
+            want = "bfloat16"
+        elif device == "xpu":  # Intel GPU: CUDA와 같은 규칙, bf16은 하드웨어 지원일 때만
+            want = "bfloat16" if accel.native_bf16("xpu") else ("float32" if training else "float16")
         else:
             want = "float32"
             avail = _mem_available_gb()
@@ -347,6 +410,9 @@ def _plan(device: str, dtype: str | None, est: dict, training: bool) -> tuple[st
         if device == "cuda":
             vram = _vram_gb()
             checkpointing = bool(vram and est["vram_gb_est"] > vram * 0.85)
+        elif device in ("tpu", "xpu"):  # 장치 메모리(TPU HBM 등) 기준, 모르면 끈다
+            mem = accel.mem_total_gb(tdev if tdev is not None else device)
+            checkpointing = bool(mem and est["vram_gb_est"] > mem * 0.85)
         elif device == "cpu":
             avail = _mem_available_gb()
             need = est["ram_gb_est_bf16"] if want == "bfloat16" else est["ram_gb_est"]
@@ -354,6 +420,41 @@ def _plan(device: str, dtype: str | None, est: dict, training: bool) -> tuple[st
         if checkpointing:
             notes.append("메모리를 아끼려고 활성값 체크포인팅을 켭니다(조금 느려짐).")
     return want, checkpointing, notes
+
+
+def _ckpt_moved(ck_meta: dict | None, dev: str) -> bool:
+    """재개하는 체크포인트를 저장한 장치가 지금 장치(정식 이름)와 다른가. 장치 기록이 없는 예전 체크포인트는 같다고 본다."""
+    if not ck_meta or not ck_meta.get("device"):
+        return False
+    return accel.name(str(ck_meta["device"])) != dev
+
+
+def _train_precision(dev: str, dtype: str | None, est: dict, amp_mode: str | None, *, tdev=None,
+                     ck_meta: dict | None = None) -> tuple[str, bool, bool, list[str]]:
+    """LoRA 학습의 (dtype 이름, fp16 혼합 정밀도 여부, 활성값 체크포인팅 자동 여부, 안내 문구들).
+
+    _plan(예전 규칙) → accel.lora_precision(정밀도 정책, amp_mode: auto/fp16/off/fp32).
+    dtype: 직접 준 dtype. 재개(ck_meta)면 호출자가 이미 체크포인트에 저장된 dtype으로 바꿔 넘긴다. 이 값이 우선한다.
+    예외 (재개일 때만):
+      - 저장했던 장치가 지금 장치와 다르면 저장된 dtype을 쓰지 않고 auto로 다시 고른다
+        (TPU bf16 → T4, T4 fp16 → CPU 같은 경우).
+      - 저장된 dtype이 float16(fp16 혼합 정밀도)인데 amp_mode가 off/fp32면 그 설정으로 다시 고른다
+        (nan으로 멈춘 fp16 학습을 LEARNBOX_AMP=off로 이어서 할 수 있게).
+    cpu/mps에서 저장 장치가 같으면 _plan 결과 그대로라 예전과 같다.
+    """
+    stored = _DTYPE_NAMES.get(str(dtype or "").lower())
+    moved = _ckpt_moved(ck_meta, dev)
+    amp_off = ck_meta is not None and not moved and stored == "float16" and amp_mode in ("off", "fp32")
+    replan = moved or amp_off
+    plan_dtype, auto_ckpt, notes = _plan(dev, "auto" if replan else dtype, est, training=True, tdev=tdev)
+    dtype_name, use_amp, note = accel.lora_precision(dev, amp_mode or "auto", requested_dtype=None if replan else stored,
+                                                     plan_dtype=plan_dtype)
+    if note:
+        notes.append(note)
+    if replan and stored and stored != dtype_name:
+        why = "장치가 바뀌어" if moved else f"정밀도 설정({amp_mode})에 따라"
+        notes.append(f"{why} 정밀도를 다시 골랐습니다({stored}→{dtype_name}).")
+    return dtype_name, use_amp, auto_ckpt, notes
 
 
 def _set_threads(threads: int | None) -> int:
@@ -563,9 +664,15 @@ def format_qa(tok, question: str, answer: str) -> tuple[list[int], list[int]]:
     return p_ids + a_ids, [-100] * len(p_ids) + a_ids
 
 
-def _collate(torch, examples: list[tuple], pad_id: int, device: str):
-    """examples: [(ids LongTensor, labels LongTensor|None)] → input_ids, attention_mask, labels (오른쪽 패딩)."""
+def _collate(torch, examples: list[tuple], pad_id: int, device, pad_to: int | None = None):
+    """examples: [(ids LongTensor, labels LongTensor|None)] → input_ids, attention_mask, labels (오른쪽 패딩).
+
+    pad_to: 길이를 적어도 이만큼으로 채운다(TPU 고정 모양용, 재컴파일 방지). 패딩 자리는 attention 0,
+    label -100이라 손실에 들어가지 않는다. None이면 예전처럼 배치 안 최대 길이까지만 (CPU/GPU).
+    """
     L = max(int(e[0].shape[0]) for e in examples)
+    if pad_to:
+        L = max(L, int(pad_to))
     B = len(examples)
     x = torch.full((B, L), pad_id, dtype=torch.long)
     att = torch.zeros((B, L), dtype=torch.long)
@@ -718,13 +825,38 @@ def _optimizer_to_params(torch, opt) -> None:
                 st[k] = v.to(p.device)
 
 
+def _save_adapter(model, path, dev) -> None:
+    """PEFT 어댑터 저장 (임베딩은 학습하지 않으므로 저장 안 함).
+
+    TPU에서는 학습되는 가중치(LoRA)의 CPU 사본을 state_dict로 넘긴다: XLA 텐서를 그대로 저장하면 TPU가 없는
+    곳에서 읽을 수 없거나 safetensors가 다루지 못할 수 있다. 다른 장치에서는 예전과 똑같이 호출한다.
+    """
+    kw = {}
+    if accel.is_tpu(dev):
+        kw["state_dict"] = accel.to_cpu(
+            {n: p.detach() for n, p in model.named_parameters() if p.requires_grad}, dev)
+    try:  # auto는 Hub에 접속해 확인하므로 오프라인에서 느려짐
+        model.save_pretrained(str(path), save_embedding_layers=False, **kw)
+    except TypeError:
+        model.save_pretrained(str(path), **kw)
+
+
 # ---------------------------------------------------------------------------
 # 학습
 # ---------------------------------------------------------------------------
+NAN_STREAK_LIMIT = 20  # fp16 혼합 정밀도에서 nan/inf로 건너뛴 단계가 이만큼 연속이면 멈춘다 (PRD 6.4)
+TPU_COMPILE_MSG = "TPU 컴파일 중(처음 한 번, 몇 분 걸릴 수 있음)"
+
+
+def _xla_debug() -> bool:
+    return os.environ.get("LEARNBOX_XLA_DEBUG", "").strip().lower() in ("1", "true", "on", "yes")
+
+
 def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-4, seq_len=512, batch_size=2,
                grad_accum=4, lora_r=8, lora_alpha=16, qa_path: str | None = None, resume_from: str | None = None,
                threads: int | None = None, progress=_noop_progress, check_cancel=_noop, *,
-               device: str | None = None, dtype: str | None = "auto", gradient_checkpointing: bool | None = None,
+               device: str | None = None, dtype: str | None = "auto", amp: str | None = None,
+               gradient_checkpointing: bool | None = None,
                max_train_tokens: int | None = None, seed: int = 0,
                checkpoint_dir: str | None = None, checkpoint_every_steps: int = 0,
                checkpoint_every_sec: float = 600.0, resume_checkpoint: str | None = None,
@@ -732,9 +864,16 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     """공개 소형 언어모델에 LoRA 추가 학습. out_dir에 어댑터 + 토크나이저 + info.json 저장.
 
     resume_from: 기존 어댑터 폴더에서 새 학습을 시작 (기반 모델이 같아야 함, r/alpha는 기존 어댑터 값 유지).
-    추가 키워드: device("cuda"/"mps"/"cpu"), dtype("auto"/"float32"/"bfloat16"/"float16"),
-    gradient_checkpointing(None=메모리 보고 자동), max_train_tokens(토큰화 상한), seed.
+    추가 키워드:
+      device: "auto"/None · "cuda" · "tpu" · "xpu"(Intel GPU) · "mps" · "cpu". None/"auto"면 환경변수
+        LEARNBOX_DEVICE → 자동(cuda → tpu → xpu → mps → cpu). 고른 장치를 쓸 수 없으면 CPU로 학습하고 notes에 남긴다.
+      dtype: "auto"/"float32"/"bfloat16"/"float16" (직접 주면 정밀도 정책보다 우선, float16이면 GPU에서 혼합 정밀도).
+      amp: LoRA 정밀도 모드 "auto"(기본) · "fp16" · "off"(예전 방식) · "fp32". None이면 환경변수 LEARNBOX_AMP → auto
+        (설정 lora_training.amp는 호출자가 넘긴다). bf16을 하드웨어로 지원하지 않는 GPU는 auto에서 fp16 혼합 정밀도,
+        TPU는 bf16(fp16 무시). cpu/mps에서는 영향 없음. 자세한 규칙은 accel.lora_precision.
+      gradient_checkpointing(None=메모리 보고 자동), max_train_tokens(토큰화 상한), seed.
     알 수 없는 키워드(use_qa 등)는 무시하고 info["ignored_params"]에 기록한다.
+    fp16 혼합 정밀도에서 nan/inf로 건너뛴 단계가 NAN_STREAK_LIMIT번 연속이면 체크포인트를 저장하고 ValueError로 멈춘다.
 
     중간 저장·일시정지(docs/SPEC-pause-resume.md §1):
       checkpoint_dir: 체크포인트 root (None이면 저장 안 함). checkpoint_every_steps / checkpoint_every_sec: 저장 간격.
@@ -823,19 +962,23 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     n_threads = _set_threads(threads)
     torch.manual_seed(seed)
     rnd = random.Random(seed)
-    dev = device or _device()
+    # 장치: 요청 → LEARNBOX_DEVICE → auto (accel). dev는 정식 이름(비교·meta·info·문구), tdev는 .to()용 torch.device.
+    # 고른 장치를 쓸 수 없으면 CPU + 안내 문구(dev_note).
+    dev, tdev, dev_note = accel.pick(accel.requested_device(device))
+    accel.manual_seed(tdev, seed)  # TPU만 (dropout이 장치 난수를 쓴다). 다른 장치는 아무것도 하지 않는다
     est = estimate_lora(base_model, lora_r, seq_len, batch_size)
-    dtype_name, auto_ckpt, notes = _plan(dev, dtype, est, training=True)
+    # 정밀도: _plan(예전 규칙) → accel.lora_precision. bf16을 하드웨어로 지원하지 않는 GPU는 fp16 혼합 정밀도가 기본
+    # (amp/LEARNBOX_AMP=off면 예전 방식). TPU는 bf16. cpu/mps는 예전 그대로.
+    dtype_name, use_amp, auto_ckpt, notes = _train_precision(dev, dtype, est, accel.requested_amp(amp), tdev=tdev,
+                                                             ck_meta=ck_meta)
+    if dev_note:
+        notes.insert(0, dev_note)
     use_ckpt = auto_ckpt if gradient_checkpointing is None else bool(gradient_checkpointing)
-    # 혼합 정밀도: LEARNBOX_AMP=fp16 이면 기반 모델을 fp16으로 올리고 자동 혼합 정밀도로 학습 (T4 등 bf16 없는 GPU용)
-    amp = dev == "cuda" and os.environ.get("LEARNBOX_AMP", "").strip().lower() in ("fp16", "float16", "1", "on")
-    if amp:
-        dtype_name = "float16"
-        notes.append("혼합 정밀도(fp16)로 학습합니다 (LEARNBOX_AMP).")
     torch_dtype = getattr(torch, dtype_name)
+    amp_dtype = torch.float16 if use_amp else None  # 자동 혼합 정밀도 dtype (None이면 쓰지 않음)
     if ck_meta is not None:  # 처음 실행의 안내 문구를 이어받는다 (중복 제거)
         notes = list(dict.fromkeys([str(n) for n in (ck_meta.get("notes") or [])] + notes + pre_notes))
-        if ck_meta.get("device") and ck_meta["device"] != dev:
+        if _ckpt_moved(ck_meta, dev):
             notes.append(f"저장했던 장치({ck_meta['device']})와 다른 장치({dev})에서 이어서 학습합니다.")
 
     # --- 모델 불러오기 ---
@@ -860,11 +1003,13 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     if max_pos and seq_len > max_pos:
         notes.append(f"seq_len을 모델 최대 길이 {max_pos}로 줄였습니다.")
         seq_len = max_pos
+    # TPU: 입력 모양을 [batch, seq_len]으로 고정(패딩, 손실에서는 제외)해 재컴파일을 막는다. 다른 장치는 패딩 없음.
+    pad_to = seq_len if accel.fixed_shapes(dev) else None
     try:
         model.config.use_cache = False
     except AttributeError:
         pass
-    model.to(dev)
+    model.to(tdev)
     if use_ckpt:
         _enable_checkpointing(model)
     check_cancel()
@@ -878,7 +1023,7 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     else:
         model = get_peft_model(model, LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=0.05,
                                                  target_modules="all-linear", task_type="CAUSAL_LM"))
-    model.to(dev)
+    model.to(tdev)
     pcfg = model.peft_config.get("default") if hasattr(model, "peft_config") else None
     if pcfg is not None:
         lora_r, lora_alpha = int(pcfg.r), int(pcfg.lora_alpha)
@@ -895,7 +1040,7 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     rnd.shuffle(order)  # 상한에 걸려도 매번 다른 부분이 학습되도록
     train_ids, texts_used = _tokenize_texts(tok, order, cap, check_cancel,
                                             lambda f: progress(0.04 + 0.05 * f, "학습 자료를 토큰으로 바꾸는 중"))
-    n_eval = 16 if dev == "cuda" else 8
+    n_eval = 16 if dev in ("cuda", "tpu", "xpu") else 8
     if ck_meta is not None and ck_meta.get("n_eval"):
         n_eval = int(ck_meta["n_eval"])  # 장치가 바뀌어도 학습 전·후 평가 구간을 같게
     eval_ids, _ = _tokenize_texts(tok, eval_texts, n_eval * seq_len, check_cancel)
@@ -938,21 +1083,26 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
         tot, cnt = 0.0, 0
         for t, s, e in eval_spans:
             check_cancel()
-            x, att, y = _collate(torch, [block_example(t, s, e)], pad_id, dev)
-            with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+            x, att, y = _collate(torch, [block_example(t, s, e)], pad_id, tdev, pad_to)
+            with accel.autocast(dev, amp_dtype):
                 loss = model(input_ids=x, attention_mask=att, labels=y).loss
             if torch.isfinite(loss):
-                n = int(x.shape[1]) - 1
+                n = (e - s) - 1  # 실제 토큰 수 기준 (TPU 패딩은 세지 않음; 패딩이 없으면 x.shape[1] - 1과 같다)
                 tot += float(loss.item()) * n
                 cnt += n
         model.train()
         return tot / cnt if cnt else None
 
+    compile_msg = accel.is_tpu(dev)  # TPU: 첫 컴파일 안내를 한 번 보여 준다
     if ck_meta is not None:
         eval_before = ck_meta.get("eval_before")  # 학습 전 평가는 처음 실행 때 값
         eval_before = float(eval_before) if isinstance(eval_before, (int, float)) else None
     else:
-        progress(0.1, "학습 전 평가 중")
+        if compile_msg and eval_spans:
+            progress(0.1, f"학습 전 평가 중 · {TPU_COMPILE_MSG}")
+            compile_msg = False
+        else:
+            progress(0.1, "학습 전 평가 중")
         eval_before = evaluate()
 
     # --- 학습 루프 ---
@@ -970,6 +1120,7 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     history: list[float] = []
     qa_used = 0
     start = 1
+    ck_scaler = None  # 저장된 기울기 스케일러 상태 (fp16 혼합 정밀도였을 때만)
     if ck_tr is not None:
         try:
             opt.load_state_dict(ck_tr["opt"])
@@ -982,13 +1133,16 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
         _set_py_rng(rnd, ck_tr["py_rng"])   # 토큰화(셔플) 뒤에 덮어써야 배치 순서가 이어진다
         _restore_torch_rng(torch, ck_tr, dev)
         notes.append(f"{start - 1}/{max_steps}단계 체크포인트에서 이어서 학습했습니다.")
+        ck_scaler = ck_tr.get("scaler")  # ck_tr를 비우기 전에 꺼내 둔다
         ck_tr = None  # 메모리 정리 (옵티마이저 상태 사본)
     model.train()
-    # 혼합 정밀도일 때만 기울기 스케일러 사용 (꺼져 있으면 아무 일도 하지 않음)
-    try:
-        scaler = torch.amp.GradScaler("cuda", enabled=amp)
-    except (AttributeError, TypeError):  # 아주 오래된 torch
-        scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    # 혼합 정밀도일 때만 기울기 스케일러 사용 (꺼져 있으면 아무 일도 하지 않음, TPU는 항상 꺼짐)
+    scaler = accel.make_scaler(dev, use_amp)
+    if ck_scaler and scaler.is_enabled():  # fp16 재개: 줄여 둔 스케일에서 이어서 (처음 값 65536부터 다시 줄이지 않게)
+        try:
+            scaler.load_state_dict(ck_scaler)
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            pass
 
     ck_root = Path(checkpoint_dir).expanduser() if checkpoint_dir else None
     every_steps = max(0, int(checkpoint_every_steps or 0))
@@ -1004,20 +1158,19 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     def save_checkpoint() -> dict | None:
         """지금 상태로 체크포인트 저장 → 요약. 이번 단계에 이미 저장했으면 그 요약. 저장 안 함/실패면 None."""
         nonlocal last_saved_step, last_summary, last_save_t, ckpt_errors, ckpt_last_err
+        accel.step_end(tdev)  # TPU: 모아 둔 연산을 실행한 뒤 저장 (다른 장치는 아무것도 하지 않음)
         if ck_root is None:
             return None
         if last_saved_step == step:
             return last_summary
         try:
             tmp = ckpt.begin(ck_root)
-            try:  # 임베딩은 학습하지 않으므로 저장 안 함
-                model.save_pretrained(str(tmp / _CKPT_ADAPTER), save_embedding_layers=False)
-            except TypeError:
-                model.save_pretrained(str(tmp / _CKPT_ADAPTER))
-            torch.save({
-                "opt": opt.state_dict(), "py_rng": rnd.getstate(), "torch_rng": torch.get_rng_state(),
-                "cuda_rng": torch.cuda.get_rng_state_all() if dev == "cuda" else None,
+            _save_adapter(model, tmp / _CKPT_ADAPTER, dev)  # 임베딩 저장 안 함, TPU는 CPU 사본
+            torch.save({  # TPU 텐서는 CPU로 옮겨 저장 (TPU가 없는 곳에서도 읽히게). 다른 장치는 예전 그대로
+                "opt": accel.to_cpu(opt.state_dict(), dev), "py_rng": rnd.getstate(),
+                "torch_rng": torch.get_rng_state(), "cuda_rng": accel.rng_state(dev),
                 "history": list(history), "qa_used": int(qa_used), "param_names": list(param_names),
+                "scaler": scaler.state_dict() if scaler.is_enabled() else None,
             }, tmp / _CKPT_TRAINER)
             meta = {
                 "kind": CKPT_KIND, "step": int(step), "steps": max_steps, "base_model": base_model, "lr": lr,
@@ -1029,8 +1182,9 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
                 "parent_total": parent_total, "eval_before": eval_before,
                 "elapsed": round(elapsed_before + time.time() - t0 - paused, 3), "resumes": resumes,
                 "notes": list(notes),
-                # 덧붙인 정보: 장치, 평가 구간 수, 자료 크기(재개 때 바뀌었는지 확인용)
-                "device": dev, "n_eval": n_eval, "train_tokens": len(train_ids), "qa_examples": len(qa_examples),
+                # 덧붙인 정보: 장치(정식 이름), fp16 혼합 정밀도 여부, 평가 구간 수, 자료 크기(재개 때 바뀌었는지 확인용)
+                "device": dev, "amp": bool(use_amp), "n_eval": n_eval, "train_tokens": len(train_ids),
+                "qa_examples": len(qa_examples),
             }
             summary = dict(ckpt.commit(ck_root, tmp, meta))
         except Exception as e:  # 저장장치 문제 등: 학습은 계속하고 다음 기회에 다시 저장
@@ -1043,6 +1197,12 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
             on_checkpoint(summary)
         return summary
 
+    if compile_msg:  # TPU 재개(또는 평가 자료 없음): 첫 단계에서 컴파일한다
+        progress(0.12 + 0.83 * (start - 1) / max_steps, TPU_COMPILE_MSG)
+    dev_label = f" · {accel.label(dev)}" if dev in ("tpu", "xpu") else ""  # cuda/cpu 문구는 예전 그대로
+    xla_debug = accel.is_tpu(dev) and _xla_debug()
+    compiles_base: int | None = None  # LEARNBOX_XLA_DEBUG: 3단계 뒤 XLA 컴파일 횟수 (재컴파일 경고용)
+    bad_steps = 0  # fp16 혼합 정밀도: nan/inf로 건너뛴 단계 연속 횟수
     t_loop = time.time()  # paused는 루프 안(pause_point)에서만 늘어난다
     stopped_at: int | None = None
     for step in range(start, max_steps + 1):
@@ -1061,26 +1221,42 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
                 qa_used += len(batch)
             else:
                 batch = [block_example(train_t, *rnd.choice(train_blocks)) for _ in range(batch_size)]
-            x, att, y = _collate(torch, batch, pad_id, dev)
-            with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+            x, att, y = _collate(torch, batch, pad_id, tdev, pad_to)
+            with accel.autocast(dev, amp_dtype):
                 loss = model(input_ids=x, attention_mask=att, labels=y).loss
             if not torch.isfinite(loss):
                 continue
             scaler.scale(loss / grad_accum).backward()
             acc += float(loss.item())
             n_ok += 1
-        scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(params, 1.0)
-        scaler.step(opt)  # 기울기에 nan/inf가 있으면 이 단계는 건너뛰고 스케일만 줄임
-        scaler.update()
-        opt.zero_grad(set_to_none=True)
+        if use_amp and n_ok == 0:
+            # fp16: 마이크로배치가 전부 nan/inf → 기울기가 없어 스케일러가 단계를 처리할 수 없다(AssertionError).
+            # 이 단계는 건너뛴다.
+            opt.zero_grad(set_to_none=True)
+            bad_steps += 1
+        else:
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            scale_before = scaler.get_scale() if use_amp else None
+            accel.optimizer_step(opt, scaler, tdev)  # 기울기에 nan/inf가 있으면 이 단계는 건너뛰고 스케일만 줄임
+            scaler.update()
+            opt.zero_grad(set_to_none=True)
+            if use_amp:  # 스케일이 줄었으면 스케일러가 이 단계를 건너뛴 것
+                bad_steps = bad_steps + 1 if scaler.get_scale() < scale_before else 0
+        accel.step_end(tdev)  # TPU: 이 단계의 연산을 실행(sync). 다른 장치는 아무것도 하지 않음
+        if xla_debug and step == start + 2:
+            compiles_base = accel.compile_count()
         if n_ok:
             history.append(acc / n_ok)
         el = max(0.0, time.time() - t_loop - paused)  # 일시정지 시간 제외
         eta = el / max(1, step - start + 1) * (max_steps - step)
         last = f"{history[-1]:.3f}" if history else "-"
         progress(0.12 + 0.83 * step / max_steps,
-                 f"LoRA 학습 {step}/{max_steps} · loss {last} · 남은 시간 약 {_fmt_eta(eta)}")
+                 f"LoRA 학습 {step}/{max_steps}{dev_label} · loss {last} · 남은 시간 약 {_fmt_eta(eta)}")
+        if bad_steps >= NAN_STREAK_LIMIT:  # 저장하고 멈춘다 (작업 실패, 체크포인트에서 이어서 할 수 있음)
+            save_checkpoint()
+            raise ValueError(f"fp16 학습에서 손실이 {NAN_STREAK_LIMIT}단계 연속 nan/inf입니다. "
+                             "LEARNBOX_AMP=off 로 끄거나 학습률을 낮추세요.")
         # (a) 정해진 간격이면 중간 저장
         if ck_root is not None and ((every_steps and step % every_steps == 0)
                                     or (every_sec and time.monotonic() - last_save_t >= every_sec)):
@@ -1100,6 +1276,11 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
             break
     if ckpt_errors:
         notes.append(f"중간 저장에 {ckpt_errors}번 실패했습니다(마지막 오류: {ckpt_last_err}).")
+    if compiles_base is not None:  # 학습 후 평가 전에 비교 (재개 때는 평가 그래프를 처음 컴파일하므로)
+        compiles_end = accel.compile_count()
+        if compiles_end is not None and compiles_end > compiles_base:
+            notes.append(f"TPU 재컴파일이 3단계 이후 {compiles_end - compiles_base}번 일어났습니다 "
+                         "(입력 모양이 바뀌면 학습이 느려집니다).")
     done = stopped_at if stopped_at is not None else max_steps
 
     progress(0.95, "학습 후 평가 중")
@@ -1109,10 +1290,8 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     progress(0.98, "어댑터 저장 중")
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    try:  # 임베딩은 학습하지 않으므로 저장 안 함 (auto는 Hub에 접속해 확인하므로 오프라인에서 느려짐)
-        model.save_pretrained(str(out), save_embedding_layers=False)
-    except TypeError:
-        model.save_pretrained(str(out))
+    accel.step_end(tdev)
+    _save_adapter(model, out, dev)  # 임베딩 저장 안 함, TPU는 CPU 사본
     tok.save_pretrained(str(out))
     files = {f.relative_to(out).as_posix(): f.stat().st_size for f in sorted(out.rglob("*"))
              if f.is_file() and f.name != "info.json"}
@@ -1123,7 +1302,7 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
         return None if v is None or not math.isfinite(v) else round(float(v), 4)
 
     info = {
-        "kind": "lora", "base_model": base_model, "device": dev, "dtype": dtype_name,
+        "kind": "lora", "base_model": base_model, "device": dev, "dtype": dtype_name, "amp": bool(use_amp),
         "steps": done, "total_steps": parent_total + done,
         "parent": parent_name, "parent_path": parent_path,
         "lora_r": lora_r, "lora_alpha": lora_alpha,
@@ -1150,8 +1329,7 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
 
     del model, opt, params, named
     gc.collect()
-    if dev == "cuda":
-        torch.cuda.empty_cache()
+    accel.empty_cache(dev)  # cuda는 예전처럼 캐시 비우기, TPU는 아무것도 안 함
     progress(1.0, f"LoRA 학습 완료 · eval loss {info['eval_loss_before']} → {info['eval_loss_after']}")
     return info
 
@@ -1170,10 +1348,7 @@ def unload() -> None:
     if had:
         gc.collect()
         try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            accel.empty_cache()  # 장치를 주지 않으면 CUDA가 있을 때만 (예전과 같음, torch_xla를 불러오지 않음)
         except Exception:
             pass
 

@@ -21,6 +21,8 @@ from collections import Counter, OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import accel
+
 # ---------------------------------------------------------------------------------------------------------------
 # 크기 프리셋과 제한
 # ---------------------------------------------------------------------------------------------------------------
@@ -356,29 +358,31 @@ def _encode_corpus(texts, stoi: dict):
     return torch.frombuffer(buf, dtype=torch.int32).clone(), unk
 
 
-def _pick_device(device: str | None):
-    import torch
+_TPU_COMPILE_MSG = "TPU 컴파일 중(처음 한 번, 몇 분 걸릴 수 있음)"
 
-    want = (device or "auto").lower()
-    note = None
-    if want in ("auto", "none", ""):
-        if torch.cuda.is_available():
-            return torch.device("cuda"), None
-        mps = getattr(torch.backends, "mps", None)
-        if mps is not None and mps.is_available():
-            return torch.device("mps"), None
-        return torch.device("cpu"), None
-    if want.startswith("cuda") and not torch.cuda.is_available():
-        note = "CUDA GPU를 찾지 못해 CPU로 학습했습니다."
-        return torch.device("cpu"), note
-    if want == "mps":
-        mps = getattr(torch.backends, "mps", None)
-        if mps is None or not mps.is_available():
-            return torch.device("cpu"), "Apple GPU(MPS)를 찾지 못해 CPU로 학습했습니다."
-    try:
-        return torch.device(want), None
-    except Exception:
-        return torch.device("cpu"), f"알 수 없는 장치 '{device}' 대신 CPU로 학습했습니다."
+
+def _pick_device(device: str | None):
+    """학습 장치 -> (정식 이름, torch.device, 안내 문구 또는 None).
+
+    device가 None/'auto'면 LEARNBOX_DEVICE 환경변수를 보고, 그것도 없으면 자동(cuda → tpu → xpu → mps → cpu).
+    고르기는 accel.pick이 한다(cuda/mps/cpu 결과와 안내 문구는 예전과 같다). 직접 준 값은 그대로 넘겨
+    '알 수 없는 장치' 안내에 사용자가 쓴 값이 그대로 보이게 한다.
+    """
+    req = device if accel.normalize(device) != "auto" else accel.requested_device(None)
+    return accel.pick(req)
+
+
+def _retie_head(model) -> bool:
+    """출력층과 임베딩의 가중치 공유(head.weight = tok.weight)가 풀렸으면 다시 묶는다. 묶었으면 True.
+
+    torch_xla(TPU) 장치로 옮기거나 거기서 CPU로 되돌리면 매개변수가 새로 만들어져 공유가 풀린다.
+    cuda/mps/cpu에서는 공유가 유지되므로 아무것도 하지 않는다.
+    """
+    head, tok = getattr(model, "head", None), getattr(model, "tok", None)
+    if head is None or tok is None or head.weight is tok.weight:
+        return False
+    head.weight = tok.weight
+    return True
 
 
 def _default_threads() -> int:
@@ -572,6 +576,8 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
 
     resume_from: 이어 학습할 기존 모델 폴더(구조가 같아야 함; arch=None이면 그 구조를 그대로 사용).
     max_seconds: 지정하면 그 시간이 지나면 학습을 멈추고(지금까지의 결과로) 저장한다.
+    device: 학습 장치 auto|cuda|tpu|xpu|mps|cpu (None/'auto'면 LEARNBOX_DEVICE → 자동). 쓸 수 없으면 CPU로 학습하고
+    notes에 이유를 남긴다. 장치별 차이(정밀도·TPU 실행 신호·CPU 저장)는 learnbox.accel이 맡는다.
 
     중간 저장(체크포인트, docs/SPEC-pause-resume.md §1):
     checkpoint_dir: 체크포인트 root (None이면 저장하지 않음). checkpoint_every_steps / checkpoint_every_sec:
@@ -703,10 +709,14 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
         if rmeta.get("train_chars") is not None and int(rmeta["train_chars"]) != n_tok:
             notes.append("체크포인트를 저장한 뒤 학습 자료가 바뀌어, 끊기기 전과 똑같이 이어지지는 않습니다.")
 
-    # 장치와 스레드
-    dev, dev_note = _pick_device(device)
+    # 장치와 스레드 (장치: 요청 → LEARNBOX_DEVICE → 자동. 쓸 수 없으면 CPU와 안내)
+    dev_name, dev, dev_note = _pick_device(device)
     if dev_note and dev_note not in notes:
         notes.append(dev_note)
+    on_tpu = dev_name == "tpu"
+    # 진행 문구의 장치 표시는 tpu/xpu일 때만 (cuda/mps/cpu 문구는 예전 그대로)
+    dev_label = f" · {accel.LABELS[dev_name]}" if dev_name in ("tpu", "xpu") else ""
+    xla_debug = on_tpu and os.environ.get("LEARNBOX_XLA_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
     n_threads = max(1, int(threads)) if threads else _default_threads()
     old_threads = torch.get_num_threads()
     torch.set_num_threads(n_threads)
@@ -723,6 +733,7 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
         elif parent_state is not None:
             model.load_state_dict(parent_state)
         model.to(dev)
+        _retie_head(model)  # TPU로 옮기면 가중치 공유가 풀린다 (다른 장치에서는 아무것도 안 함)
         model.fast = True
         n_params = sum(p.numel() for p in model.parameters())
 
@@ -736,15 +747,10 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
                 for k, v in st.items():
                     if k != "step" and torch.is_tensor(v) and v.device != dev:
                         st[k] = v.to(dev)
-        use_amp = dev.type == "cuda"
-        amp_dtype = torch.float32
-        if use_amp:
-            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        scale_on = use_amp and amp_dtype == torch.float16
-        try:
-            scaler = torch.amp.GradScaler("cuda", enabled=scale_on)
-        except (AttributeError, TypeError):  # torch < 2.3
-            scaler = torch.cuda.amp.GradScaler(enabled=scale_on)
+        # 자동 혼합 정밀도: cuda는 예전 그대로(bf16 가능하면 bf16, 아니면 fp16+스케일러), tpu bf16(스케일러 없음),
+        # xpu bf16/fp16, mps/cpu는 쓰지 않음(None).
+        amp_dtype = accel.tiny_amp_dtype(dev)
+        scaler = accel.make_scaler(dev, amp_dtype == torch.float16)
         if rs is not None and rs["state"].get("scaler") and scaler.is_enabled():
             scaler.load_state_dict(rs["state"]["scaler"])
 
@@ -758,9 +764,7 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
             return chunk[:, :-1].to(dev), chunk[:, 1:].to(dev)
 
         def loss_of(x, y):
-            amp = (torch.autocast(device_type="cuda", dtype=amp_dtype) if use_amp
-                   else contextlib.nullcontext())
-            with amp:
+            with accel.autocast(dev, amp_dtype):  # 혼합 정밀도를 안 쓰면 nullcontext (예전 cpu/mps와 같음)
                 logits = model(x)
             return F.cross_entropy(logits.float().reshape(-1, V), y.reshape(-1))
 
@@ -780,8 +784,11 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
             return sum(losses) / len(losses)
 
         if rs is None:
-            progress(0.02, "학습 전 평가 중")
+            # TPU: 학습 전 평가가 첫 컴파일 시점이다
+            progress(0.02, "학습 전 평가 중" + (f" · {_TPU_COMPILE_MSG}" if on_tpu else ""))
             eval_before = evaluate()
+            if on_tpu:  # 학습 단계 그래프도 처음 한 번 컴파일한다
+                progress(0.03, f"소형 AI 모델 학습 시작{dev_label} · {_TPU_COMPILE_MSG}")
             recent: list[float] = []
             step = 0
         else:  # 학습 전 평가는 다시 하지 않는다 (처음 실행의 값)
@@ -795,7 +802,9 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
                 with contextlib.suppress(Exception):
                     for i in range(min(len(cuda_rng), torch.cuda.device_count())):
                         torch.cuda.set_rng_state(cuda_rng[i], i)
-            progress(0.03 + 0.85 * step / steps, f"체크포인트에서 이어서 학습합니다 ({step}/{steps}단계부터)")
+            # TPU: 재개하면 첫 단계가 첫 컴파일 시점이다
+            progress(0.03 + 0.85 * step / steps, f"체크포인트에서 이어서 학습합니다 ({step}/{steps}단계부터)"
+                     + (f" · {_TPU_COMPILE_MSG}" if on_tpu else ""))
         model.train()
         start_step = step
         t0 = time.time()
@@ -804,6 +813,7 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
         warmup = min(100, max(1, steps // 10))
         min_lr = lr * 0.1
         report_every = max(1, steps // 200)
+        cc_base = None  # LEARNBOX_XLA_DEBUG=1일 때 3단계 뒤의 XLA 컴파일 횟수
 
         ck_steps = max(0, int(checkpoint_every_steps or 0))
         ck_sec = max(0.0, float(checkpoint_every_sec or 0.0))
@@ -821,11 +831,13 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
                 return None
             if last_ck["step"] == step and last_ck["summary"] is not None:
                 return last_ck["summary"]
+            accel.step_end(dev)  # TPU: 모아 둔 연산을 실행한 뒤 저장 (다른 장치는 아무것도 안 함)
             el, tr = clock()
-            state = {"model": model.state_dict(), "opt": opt.state_dict(),
+            # TPU 텐서는 CPU 사본으로 저장한다 (TPU가 없는 곳에서도 읽히게). 다른 장치는 예전처럼 그대로.
+            state = {"model": accel.to_cpu(model.state_dict(), dev), "opt": accel.to_cpu(opt.state_dict(), dev),
                      "scaler": scaler.state_dict() if scaler.is_enabled() else None,
                      "gen": gen.get_state(), "torch_rng": torch.get_rng_state(),
-                     "cuda_rng": torch.cuda.get_rng_state_all() if dev.type == "cuda" else None,
+                     "cuda_rng": accel.rng_state(dev),
                      "recent": list(recent), "B": int(B), "T": int(T)}
             meta = {"kind": "tiny", "step": int(step), "steps": int(steps), "arch": dict(arch),
                     "batch_size": int(batch_req), "lr": lr, "seed": int(seed),
@@ -835,7 +847,7 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
                     "eval_before": float(eval_before) if math.isfinite(eval_before) else None,
                     "elapsed": round(prev_elapsed + el, 3), "train_seconds": round(prev_train + tr, 3),
                     "resumes": int(resumes), "notes": list(notes), "onnx_int8": bool(onnx_int8),
-                    "max_seconds": max_seconds, "train_chars": n_tok, "device": dev.type}
+                    "max_seconds": max_seconds, "train_chars": n_tok, "device": dev_name}
             try:
                 res = _write_tiny_checkpoint(checkpoint_dir, state, itos, meta)
             except (OSError, RuntimeError) as e:  # 저장장치 가득 참/빠짐 등: 학습은 계속하고 다음 기회에 다시 시도
@@ -868,16 +880,16 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(opt)
+                accel.optimizer_step(opt, scaler, dev)
                 scaler.update()
+                accel.step_end(dev)  # TPU: 이 단계의 연산을 실행 (실행·컴파일 오류도 여기서 잡힌다)
                 lv = loss.item()
-            except RuntimeError as e:  # GPU 메모리 부족 -> 배치를 절반으로 줄여 같은 단계를 다시
-                if "out of memory" not in str(e).lower() or B <= 1:
+            except RuntimeError as e:  # 장치 메모리 부족 -> 배치를 절반으로 줄여 같은 단계를 다시
+                if not accel.is_oom(e) or B <= 1:
                     raise
                 x = y = loss = None
                 opt.zero_grad(set_to_none=True)
-                if dev.type == "cuda":
-                    torch.cuda.empty_cache()
+                accel.empty_cache(dev)
                 B = max(1, B // 2)
                 notes.append(f"메모리가 부족해 배치 크기를 {B}(으)로 줄였습니다.")
                 step -= 1
@@ -887,11 +899,13 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
                 if len(recent) > 50:
                     recent.pop(0)
             done = step
+            if xla_debug and step - start_step == 3:
+                cc_base = accel.compile_count()
             if step % report_every == 0 or step == steps:
                 el = max(1e-6, time.time() - t0 - paused)
                 avg = sum(recent) / len(recent) if recent else float("nan")
                 ran = max(1, step - start_step)
-                msg = (f"소형 AI 모델 학습 {step}/{steps} · loss {avg:.3f} · "
+                msg = (f"소형 AI 모델 학습 {step}/{steps}{dev_label} · loss {avg:.3f} · "
                        f"{(step - start_step) * B * T / el:,.0f} 토큰/초")
                 if step < steps:
                     msg += f" · 남은 시간 약 {_fmt_eta(el / ran * (steps - step))}"
@@ -910,7 +924,8 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
                     paused += waited
                     pause_at = None
                 if waited >= 1.0:
-                    progress(0.03 + 0.85 * step / steps, f"소형 AI 모델 학습 {step}/{steps} · 다시 시작했습니다")
+                    progress(0.03 + 0.85 * step / steps,
+                             f"소형 AI 모델 학습 {step}/{steps}{dev_label} · 다시 시작했습니다")
             # (c) 지금까지 저장하고 끝내기
             if stop_requested is not None and step < steps and stop_requested():
                 save()
@@ -921,13 +936,20 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
                 stopped_early = True
                 notes.append(f"시간 제한({max_seconds:.0f}초)으로 {step}/{steps}단계에서 멈췄습니다.")
                 break
+        if xla_debug and cc_base is not None:  # LEARNBOX_XLA_DEBUG=1 (TPU만): 3단계 뒤에도 다시 컴파일했는지
+            cc_end = accel.compile_count()
+            if cc_end is not None and cc_end > cc_base:
+                notes.append(f"TPU에서 3단계 이후 다시 컴파일한 횟수: {cc_end - cc_base}번 "
+                             "(입력 모양이 바뀌면 느려집니다).")
         train_seconds = prev_train + (time.time() - t0 - paused)
         progress(0.88, "학습 후 평가 중")
         eval_after = evaluate()
         train_loss = sum(recent) / len(recent) if recent else float("nan")
 
         # 저장 (CPU, fp32)
+        accel.step_end(dev)  # TPU: 남은 연산을 실행한 뒤 CPU로 옮긴다 (다른 장치는 아무것도 안 함)
         model.to("cpu")
+        _retie_head(model)  # TPU에서 CPU로 옮기면 가중치 공유가 다시 풀린다
         model.eval()
         model.fast = False
         out.mkdir(parents=True, exist_ok=True)
@@ -976,7 +998,8 @@ def train(train_path, eval_path, out_dir, arch: dict | None, steps: int = 1500, 
         "perplexity_after": _num(math.exp(min(eval_after, 50.0)), 3) if math.isfinite(eval_after) else None,
         "seconds": round(prev_elapsed + time.time() - t_start - paused, 1),
         "train_seconds": round(train_seconds, 1),
-        "device": dev.type,
+        "device": dev_name,
+        "dtype": str(amp_dtype).replace("torch.", "") if amp_dtype is not None else "float32",
         "threads": n_threads,
         "batch_size": B,
         "lr": lr,
