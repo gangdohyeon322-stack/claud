@@ -263,6 +263,10 @@ class TorchPathsTest(unittest.TestCase):
         self.assertEqual(out._metadata, sd._metadata)
         self.assertTrue(torch.equal(out["a"], sd["a"]))
         self.assertEqual(out["b"][1][1], 3)
+        # 묶인 가중치(같은 텐서)는 CPU에서도 같은 텐서를 공유한다
+        w = torch.nn.Parameter(torch.ones(2))
+        tied = accel.to_cpu({"tok": w, "head": w}, "tpu")
+        self.assertIs(tied["tok"], tied["head"])
 
     def test_rng_and_cache_noops(self):
         self.assertIsNone(accel.rng_state("cpu"))

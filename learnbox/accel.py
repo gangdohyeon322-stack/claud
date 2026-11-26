@@ -530,9 +530,16 @@ def to_cpu(obj, dev=None):
         return obj
     import torch
 
+    seen: dict = {}  # 같은 텐서(묶인 가중치 등)는 한 번만 옮겨 같은 CPU 텐서를 공유하게 한다
+
     def conv(x):
         if torch.is_tensor(x):
-            return x.detach().cpu() if (dev is not None or x.device.type == "xla") else x
+            if not (dev is not None or x.device.type in ("xla", "tpu")):
+                return x
+            key = id(x)
+            if key not in seen:
+                seen[key] = (x, x.detach().cpu())  # 원본도 잡아 두어 id 재사용을 막는다
+            return seen[key][1]
         if isinstance(x, dict):
             out = type(x)((k, conv(v)) for k, v in x.items())
             if hasattr(x, "_metadata"):  # state_dict(OrderedDict)의 버전 정보 유지
@@ -591,7 +598,7 @@ def tpu_memory_info(dev=None) -> dict:
     try:
         import torch_xla.core.xla_model as xm
 
-        d = dev if dev is not None else _probe_tpu()[0]
+        d = dev if (dev is not None and not isinstance(dev, str)) else _probe_tpu()[0]
         if d is None:
             return {}
         m = xm.get_memory_info(d)
