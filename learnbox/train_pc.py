@@ -827,6 +827,11 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     est = estimate_lora(base_model, lora_r, seq_len, batch_size)
     dtype_name, auto_ckpt, notes = _plan(dev, dtype, est, training=True)
     use_ckpt = auto_ckpt if gradient_checkpointing is None else bool(gradient_checkpointing)
+    # 혼합 정밀도: LEARNBOX_AMP=fp16 이면 기반 모델을 fp16으로 올리고 자동 혼합 정밀도로 학습 (T4 등 bf16 없는 GPU용)
+    amp = dev == "cuda" and os.environ.get("LEARNBOX_AMP", "").strip().lower() in ("fp16", "float16", "1", "on")
+    if amp:
+        dtype_name = "float16"
+        notes.append("혼합 정밀도(fp16)로 학습합니다 (LEARNBOX_AMP).")
     torch_dtype = getattr(torch, dtype_name)
     if ck_meta is not None:  # 처음 실행의 안내 문구를 이어받는다 (중복 제거)
         notes = list(dict.fromkeys([str(n) for n in (ck_meta.get("notes") or [])] + notes + pre_notes))
@@ -934,7 +939,8 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
         for t, s, e in eval_spans:
             check_cancel()
             x, att, y = _collate(torch, [block_example(t, s, e)], pad_id, dev)
-            loss = model(input_ids=x, attention_mask=att, labels=y).loss
+            with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+                loss = model(input_ids=x, attention_mask=att, labels=y).loss
             if torch.isfinite(loss):
                 n = int(x.shape[1]) - 1
                 tot += float(loss.item()) * n
@@ -978,6 +984,11 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
         notes.append(f"{start - 1}/{max_steps}단계 체크포인트에서 이어서 학습했습니다.")
         ck_tr = None  # 메모리 정리 (옵티마이저 상태 사본)
     model.train()
+    # 혼합 정밀도일 때만 기울기 스케일러 사용 (꺼져 있으면 아무 일도 하지 않음)
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=amp)
+    except (AttributeError, TypeError):  # 아주 오래된 torch
+        scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
     ck_root = Path(checkpoint_dir).expanduser() if checkpoint_dir else None
     every_steps = max(0, int(checkpoint_every_steps or 0))
@@ -1051,14 +1062,17 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
             else:
                 batch = [block_example(train_t, *rnd.choice(train_blocks)) for _ in range(batch_size)]
             x, att, y = _collate(torch, batch, pad_id, dev)
-            loss = model(input_ids=x, attention_mask=att, labels=y).loss
+            with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+                loss = model(input_ids=x, attention_mask=att, labels=y).loss
             if not torch.isfinite(loss):
                 continue
-            (loss / grad_accum).backward()
+            scaler.scale(loss / grad_accum).backward()
             acc += float(loss.item())
             n_ok += 1
+        scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(params, 1.0)
-        opt.step()
+        scaler.step(opt)  # 기울기에 nan/inf가 있으면 이 단계는 건너뛰고 스케일만 줄임
+        scaler.update()
         opt.zero_grad(set_to_none=True)
         if n_ok:
             history.append(acc / n_ok)
