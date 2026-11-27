@@ -29,6 +29,7 @@ Python ≥ 3.10, stdlib-first. Optional heavy deps (torch, transformers, peft, o
 | F — browser on-device engine | `web/onboard.js` (new), `web/sw.js` |
 | G — web UI | `web/index.html`, `web/app.js`, `web/style.css` |
 | H — integration (runs after A–G) | `learnbox/app.py`, `learnbox/server.py`, `learnbox/jobs.py`, `learnbox/__main__.py`, delete `learnbox/train_mobile.py`, `tests/test_learnbox.py`, `README.md`, `requirements*.txt` |
+| T — accelerators (docs/PRD-tpu-training.md) | `learnbox/accel.py` (device layer: cuda/tpu/xpu/mps/cpu, precision policy), `learnbox/setup_accel.py` (TPU-runtime-only installer), `requirements-tpu.txt`, `requirements-tpu-xla.txt`, `tests/test_accel.py`, `tests/test_tpu_tinylm.py`, `tests/test_tpu_lora.py`, `tests/test_device_plumbing.py`, `tests/test_setup_accel.py` |
 
 Already done (do not rewrite; you may read): `learnbox/config.py` (DEFAULTS incl. `tiny_training`, `lora_training`, `online`, `embeddings`, `ingest`, `autolearn`), `learnbox/db.py` (schema + methods listed in §2), `learnbox/timegate.py`, `learnbox/fetcher.py`, `learnbox/extract.py`, `learnbox/collector.py`, `learnbox/search_providers.py`, `learnbox/export.py`, `learnbox/dataset.py`.
 
@@ -72,7 +73,9 @@ def train(train_path, eval_path, out_dir, arch: dict, steps: int = 1500, batch_s
     # Builds char vocab (top vocab_size-4 chars + specials ["<pad>","<unk>","<bos>","<eos>"]).
     # resume_from = existing tiny model dir: load its weights + vocab and continue training (must have same arch,
     #   else ValueError). New unseen chars map to <unk>. total_steps = parent total_steps + steps.
-    # device: None -> cuda > mps > cpu. threads: torch.set_num_threads (None -> max(1, cpu_count-1)).
+    # device: None/"auto" -> accel.pick(accel.requested_device(device)): LEARNBOX_DEVICE, then cuda > tpu > xpu > mps > cpu
+    #   (unusable device -> cpu + note). Mixed precision via accel.tiny_amp_dtype (cuda as before, tpu bf16); no amp param.
+    # threads: torch.set_num_threads (None -> max(1, cpu_count-1)).
     # Cosine LR with warmup, AdamW, grad clip 1.0. Batch auto-reduced if seq/batch too big for data.
     # Writes out_dir/: model.pt ({"config","state_dict"}), vocab.json ({"itos":[...]}), model.onnx (fp32, input
     #   "input_ids" int64 [1, seq] dynamic seq axis, output "logits" [1, seq, vocab], opset 17),
@@ -80,7 +83,7 @@ def train(train_path, eval_path, out_dir, arch: dict, steps: int = 1500, batch_s
     #   info.json. Must verify the ONNX file loads in onnxruntime and matches PyTorch logits (max abs diff < 1e-3)
     #   when onnxruntime is installed; record "onnx_verified".
     # Returns info: {"kind":"tiny","preset","arch":{...},"params","steps","total_steps","parent": str|None,
-    #   "train_loss","eval_loss_before","eval_loss_after","perplexity_after","seconds","device","threads",
+    #   "train_loss","eval_loss_before","eval_loss_after","perplexity_after","seconds","device","dtype","threads",
     #   "onnx": bool,"onnx_int8": bool,"onnx_verified": bool,"onnx_error": str|None,
     #   "files": {"model.onnx": bytes, "model.int8.onnx": bytes, "model.pt": bytes},
     #   "vocab_size","seq_len","train_chars","sample": str (60-char generation from a corpus prefix)}
@@ -95,14 +98,16 @@ Architecture: token emb + learned pos emb, pre-LN blocks (fused qkv Linear, caus
 def pc_profile() -> dict
     # {"os": str, "cpu_count": int, "ram_gb": float|None, "gpu": {"type": "cuda"|"mps"|None, "name": str|None,
     #  "vram_gb": float|None}, "torch": bool, "transformers": bool, "peft": bool, "onnxruntime": bool,
-    #  "anthropic": bool, "pypdf": bool, "tier": "pc-cpu"|"pc-gpu"|"pc-gpu-high"}
+    #  "anthropic": bool, "pypdf": bool, "torch_xla": bool, "torch_tpu": bool, "tier": "pc-cpu"|"pc-gpu"|"pc-gpu-high",
+    #  "accel": accel.info(probe_tpu=False)}   # gpu.type may also be "xpu"; ROCm adds gpu.vendor/rocm. TPU is never opened here.
     # RAM without psutil: Linux /proc/meminfo, macOS `sysctl -n hw.memsize`, Windows ctypes GlobalMemoryStatusEx.
     # GPU: torch.cuda (name, total memory) if torch importable; mps flag. Cache result for 60 s.
 def recommend(profile: dict | None = None) -> dict
     # {"tiny_preset": "small"|"base"|..., "tiny_steps_per_cycle": int, "tiny_batch_size": int, "threads": int,
     #  "lora_base_model": str|None, "lora_max_steps": int, "notes": [Korean strings]}
     # pc-cpu -> small (or mini if RAM < 6 GB), lora 0.5B only if RAM >= 8 GB; pc-gpu (VRAM>=6) -> base, lora 1.5B;
-    # pc-gpu-high (VRAM>=16) -> large, lora 7B. threads = max(1, cpu_count-1).
+    # pc-gpu-high (VRAM>=16) -> large, lora 7B. tier "tpu" (no GPU, TPU usable per accel info) -> by HBM, lora 1.5B.
+    # threads = max(1, cpu_count-1).
 ```
 
 ### B. `learnbox/train_pc.py` — LoRA
@@ -119,14 +124,18 @@ def estimate_lora(base_model: str, lora_r: int, seq_len: int, batch_size: int) -
     #  "adapter_mb_est": float}
 def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-4, seq_len=512, batch_size=2,
                grad_accum=4, lora_r=8, lora_alpha=16, qa_path: str | None = None, resume_from: str | None = None,
-               threads: int | None = None, progress=..., check_cancel=...) -> dict
+               threads: int | None = None, progress=..., check_cancel=..., *, device=None, amp=None,
+               dtype="auto", ...) -> dict
+    # device as tinylm.train (TPU only for training; answer() keeps cuda > mps > cpu). amp: auto|fp16|off|fp32
+    # (None -> LEARNBOX_AMP -> auto) resolved by accel.lora_precision: cuda/xpu without native bf16 -> fp16 autocast +
+    # GradScaler (default), with bf16 -> bfloat16, off -> previous behaviour, fp32 -> float32; tpu -> bfloat16.
     # Plain-text corpus packed into seq_len blocks (continued pretraining). If qa_path (JSONL
     # {"question","answer","source_url"}) exists, mix in chat-formatted examples via tokenizer.apply_chat_template
     # (loss on all tokens is fine). resume_from = existing adapter dir: PeftModel.from_pretrained(..., is_trainable=True).
     # Saves adapter + tokenizer to out_dir, info.json.
     # Returns {"kind":"lora","base_model","device","steps","total_steps","parent","lora_r","lora_alpha",
     #   "trainable_params","total_params","train_loss","eval_loss_before","eval_loss_after","seconds",
-    #   "train_blocks","qa_examples","seq_len","files": {name: bytes}}
+    #   "train_blocks","qa_examples","seq_len","dtype","amp","files": {name: bytes}}
 def answer(question: str, contexts: list[dict], base_model: str, adapter_dir: str | None = None,
            max_new_tokens: int = 256) -> dict
     # contexts rows have title, content, url. Returns {"answer": str, "citations": [{"index": n, "title","url"}]}
@@ -337,8 +346,8 @@ Downloads that need auth: fetch with the Bearer header → `blob` → object URL
 | ingest_path | light | path | ingest.ingest_path |
 | index_embeddings | light | — | search.index_embeddings |
 | build_qa | light | limit_chunks?, per_chunk? | online.build_qa_dataset → `data/datasets/qa.jsonl` |
-| train_tiny | heavy | preset, d_model…, steps, batch_size, lr, resume_from_model_id? | build_corpus + tinylm.train + add_model("tiny") |
-| train_lora | heavy | base_model, max_steps, …, use_qa, resume_from_model_id? | build_corpus + train_pc.train_lora + add_model("lora") |
+| train_tiny | heavy | preset, d_model…, steps, batch_size, lr, resume_from_model_id?, device? | build_corpus + tinylm.train + add_model("tiny") |
+| train_lora | heavy | base_model, max_steps, …, use_qa, resume_from_model_id?, device?, amp? | build_corpus + train_pc.train_lora + add_model("lora") |
 | autolearn_train | heavy | session_id | autolearn.run_autolearn_train |
 | finalize_learning | heavy | session_id | autolearn.run_finalize |
 | export | heavy | target, include, actor | export.export |
@@ -351,8 +360,8 @@ Existing v1 routes stay (`/api/info`, `/api/login`, `/api/logout`, `/api/status`
 | Method & path | Role | Body / query | Response |
 |---|---|---|---|
 | GET /api/status | user | | v1 fields + `online` (online.status), `autolearn` (AutoLearner.status() compact), `unread` |
-| GET /api/device | user | | `{"pc": pc_profile, "recommend": recommend, "presets": {name: {...preset, "estimate": estimate}}, "base_models": BASE_MODELS, "limits": LIMITS}` |
-| POST /api/estimate | user | `{"kind":"tiny", preset, d_model…, batch_size}` or `{"kind":"lora", base_model, lora_r, seq_len, batch_size}` | tiny: `{"arch", "estimate"}`; lora: estimate_lora; 400 with Korean error on invalid |
+| GET /api/device | user | | `{"pc": pc_profile, "recommend": recommend, "presets": {name: {...preset, "estimate": estimate}}, "base_models": BASE_MODELS, "limits": LIMITS, "accel": {auto, devices: {id: {available, label, name}}, cuda_bf16, rocm, torch_version, torch_xla_version, torch_tpu_version, tpu}, "defaults": {training_device, amp}}` (defaults: env → config → auto) |
+| POST /api/estimate | user | `{"kind":"tiny", preset, d_model…, batch_size}` or `{"kind":"lora", base_model, lora_r, seq_len, batch_size}`; optional `device` | tiny: `{"arch", "estimate"}`; lora: estimate_lora; 400 with Korean error on invalid |
 | GET /api/search | user | `q, limit, offset, sources (comma list), mode, doc_id` | search.search(...) |
 | GET /api/documents/<id> | user | `q` | doc_view |
 | POST /api/ask | user | `{"q", "engine": "search"|"tiny"|"lora"|"online", "model_id"?, "sources"?: [...]}` | `{"engine","answer": str|null,"citations": [...],"sources": [rows like search results],"extract": [...],"model": str|null,"note": str|null}` |

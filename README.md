@@ -27,7 +27,7 @@ PC와 휴대폰이 **같은 화면, 같은 기능, 같은 데이터**를 씁니�
 | **모델 크기 설정** | 나노~라지 5단계 + 직접 설정. 입력하는 즉시 파일 크기·메모리·실행 가능 기기를 예상해 보여 줌 |
 | **자율 학습** | 허용 시간대에 스스로 조금씩 수집하고(주제도 스스로 찾음), 새 자료가 모이면 이어서 학습 |
 | **학습 종료 → 결과 파일 + 알림** | 마지막 학습 후 JSONL · CSV · Markdown · TXT · 검색 색인 · 모델(ONNX 포함) · 보고서 · ZIP으로 내보내고 앱 알림으로 알려 줌 |
-| **휴대폰/PC 성능 대응** | PC의 CPU·메모리·GPU로 모델 크기와 학습량을 추천하고, 휴대폰은 메모리·코어로 모델 형식(int8/fp32), 자료 사본 크기, 생성 길이를 자동 조절 |
+| **휴대폰/PC 성능 대응** | PC의 CPU·메모리·GPU·TPU로 모델 크기와 학습량을 추천하고 학습 장치를 자동으로 고르며(코랩 TPU v5e-1 학습 지원), 휴대폰은 메모리·코어로 모델 형식(int8/fp32), 자료 사본 크기, 생성 길이를 자동 조절 |
 | 수집 시간 제한 | 설정한 요일·시간대에만 인터넷 접속. **요청 하나하나마다** 시각을 확인해 시간이 끝나면 즉시 멈춤 |
 | 수집 예절·안전 | robots.txt 준수, 사이트별 요청 간격, 허용/차단 도메인, 내부망 주소 차단, 페이지 크기 제한 |
 | 외장 저장 내보내기 | **관리자만**. 자료·인덱스·모델·말뭉치를 복사하고 파일별 SHA-256(manifest.json) 기록, 감사 기록 남김 |
@@ -43,6 +43,8 @@ Python 3.10 이상이 필요합니다.
 **간단 실행**
 - Windows: `start-windows.bat` 더블클릭
 - Mac/Linux: `./start.sh`
+- Windows에서 GPU로 학습하려면: 먼저 `setup-gpu-windows.bat`을 한 번 실행한 뒤 `start-windows.bat`을 실행합니다. NVIDIA GPU가 있으면 CUDA용 PyTorch를, NVIDIA가 없고 Intel Arc GPU가 있으면 Intel GPU(XPU)용 PyTorch를 설치합니다(Intel Arc는 아직 실기기로 확인하지 못함). `start-windows.bat`만 쓰면 CPU용 PyTorch가 설치됩니다.
+- TPU 런타임(코랩 TPU 등): `./start.sh`는 학습 패키지를 설치한 뒤 `python -m learnbox.setup_accel`을 자동으로 실행합니다(TPU가 아니면 건너뜀). 이미 `.venv`가 있으면 직접 실행하세요. 코랩은 [코랩 매뉴얼](docs/COLAB_MANUAL.md)을 보세요.
 
 처음 실행할 때 설치를 하고 PIN 두 개를 정합니다.
 - **사용자 PIN** (4자 이상): 검색, 질문, 파일 가져오기, 수집, 진행 상황 보기, 알림
@@ -53,14 +55,23 @@ Python 3.10 이상이 필요합니다.
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt            # Windows: .venv\Scripts\pip   (PDF 가져오기용 pypdf 포함, 작음)
 .venv/bin/pip install -r requirements-train.txt      # 학습 · 의미 검색 · 온라인 모델 (선택, 수 GB)
+.venv/bin/python -m learnbox.setup_accel             # TPU 런타임이면 TPU 패키지 설치, 아니면 건너뜀
 .venv/bin/python -m learnbox init                    # PIN 설정
 .venv/bin/python -m learnbox serve --lan             # 서버 실행
 ```
 
+GPU용 PyTorch는 `requirements-train.txt`보다 **먼저** 설치합니다. 어떤 명령을 쓸지 모르겠으면 `python -m learnbox.setup_accel --torch-build`가 이 PC의 GPU에 맞는 설치 명령을 알려 줍니다(NVIDIA: CUDA 12.6, Intel Arc: XPU, AMD: ROCm(Linux만), Mac: 기본 torch 그대로).
+
 | 패키지 파일 | 들어 있는 것 | 없으면 |
 |---|---|---|
 | `requirements.txt` | tzdata(Windows), pypdf | 수집·검색·웹 화면은 그대로 쓰고, PDF만 못 가져옴 |
-| `requirements-train.txt` | torch, transformers, peft, onnx, onnxscript, **onnxruntime**, **anthropic** | 소형 AI/LoRA 학습, 의미 검색, 온라인 모델을 쓸 수 없음 (나머지는 정상) |
+| `requirements-train.txt` | torch, transformers, peft, onnx, onnxscript, **onnxruntime**, **anthropic** (TPU 패키지는 들어 있지 않음) | 소형 AI/LoRA 학습, 의미 검색, 온라인 모델을 쓸 수 없음 (나머지는 정상) |
+| `requirements-tpu.txt` | `torch_tpu`(0.2.0 이상) + CPU용 torch. TPU 런타임 전용, Linux x86_64, Python 3.11 이상 | TPU 대신 CPU로 학습 (안내 문구 표시) |
+| `requirements-tpu-xla.txt` | torch 2.9.0 + `torch_xla[tpu]` 2.9.0 (지원 종료). Python 3.10~3.12에서 `torch_tpu`를 쓸 수 없을 때만 | 위와 같음 |
+
+- 두 TPU 파일은 직접 설치하지 말고 `python -m learnbox.setup_accel`을 쓰세요. pip의 조건 표시로는 TPU가 있는지 알 수 없어서, 이 도우미가 TPU 런타임(PCI의 구글 TPU 칩, 환경변수)을 확인했을 때만 설치합니다.
+- `torch_tpu`가 이미 있으면(코랩 TPU v5e 기본) "TPU 준비됨"만 출력하고 아무것도 설치하지 않습니다. `torch_tpu`가 있으면 `torch_xla`는 절대 설치하지 않습니다(torch가 2.9로 내려가 `torch_tpu`가 깨짐).
+- 옵션: `--check`(설치하지 않고 상태만 JSON으로, 종료 코드 0 준비됨 · 2 설치 필요 또는 불가 · 1 TPU 아님), `--dry-run`(실행할 명령만), `--force`(TPU 신호가 없어도 시도), `--backend auto|torch_tpu|torch_xla`, `--torch-build`(위).
 
 실행하면 접속 주소가 나옵니다.
 ```
@@ -74,7 +85,7 @@ LearnBox 실행 중: http://127.0.0.1:8750
 |---|---|
 | 검색 | 검색창 · 답변 방식(검색만/소형 AI/LoRA/온보드/온라인) · 자료 종류 · 검색 방식 · 핵심 문장 · 답변과 인용 · 문서 보기 · 이 기기에 저장(오프라인 사본) |
 | 자료 | 파일 가져오기 · 링크 수집 · 실시간 검색 수집 · 예약 목록 · 문서 목록 |
-| 학습 | 기기 성능과 추천 · **자율 학습** · 소형 AI 모델 학습(크기 설정) · LoRA 학습 · 의미 검색 색인 · Q&A 학습 데이터 · 학습 결과 파일 |
+| 학습 | 기기 성능과 추천 · **자율 학습** · 소형 AI 모델 학습(크기 설정, 장치) · LoRA 학습(장치, 정밀도) · 의미 검색 색인 · Q&A 학습 데이터 · 학습 결과 파일 |
 | 모델 | 모델 카드(크기·손실·단계·파일) · 이 기기로 받기 · 이 기기에서 실행(온보드) · PC에서 생성 |
 | 작업 | 진행 중/끝난 작업 · 학습 일시정지/재개/지금까지 저장하고 끝내기 · 마지막 중간 저장 · 끊긴 학습 이어서 재개 |
 | 관리 (관리자) | 외장 저장 내보내기 · 설정(온라인 모델, 의미 검색, 자율 학습 기본값, 학습 중간 저장 …) · 감사 기록 |
@@ -158,6 +169,55 @@ LearnBox 실행 중: http://127.0.0.1:8750
 
 다른 Hugging Face 모델 id를 직접 입력할 수도 있습니다. **모델마다 라이선스가 다르니** 배포 전에 확인하세요. 처음 실행 시 기반 모델을 내려받습니다(0.5B 모델 약 1GB). 한 번 받은 뒤에는 인터넷 없이도 학습·답변이 됩니다.
 
+**정밀도 (LoRA)** — 기본값은 `auto`입니다. 따로 정하지 않아도 bf16을 지원하지 않는 GPU(T4 등)는 fp16으로 학습해 메모리를 아낍니다.
+
+| 값 | 동작 |
+|---|---|
+| `auto` (기본) | bf16을 하드웨어로 지원하는 GPU(A100·L4 등)는 bf16, 지원하지 않는 GPU(T4 등)는 **fp16 혼합 정밀도 + 기울기 스케일러**. T4에서 3B도 `LEARNBOX_AMP=fp16` 없이 fp16으로 학습됩니다 |
+| `fp16` | fp16 혼합 정밀도. 예전에 쓰던 `LEARNBOX_AMP=fp16`은 지금은 `auto`와 같은 결과 |
+| `off` | 예전 동작 그대로 (최신 torch에서 T4는 bf16 에뮬레이션, 아주 오래된 torch에서는 float32) |
+| `fp32` | float32로 학습 |
+
+- 정하는 순서: 학습 요청([학습] 탭 LoRA 폼의 **정밀도** 선택, `train-lora --amp`) → 환경변수 `LEARNBOX_AMP` → 설정 `lora_training.amp` → `auto`. 폼에서 '자동'을 고르면 환경변수와 설정을 따릅니다.
+- 웹에서 시작하는 학습은 서버가 정밀도를 정하므로, 환경변수는 `serve`를 실행할 때 붙여야 합니다(예: `LEARNBOX_AMP=off python -m learnbox serve`).
+- TPU는 항상 bf16입니다(fp16 없음). Mac(mps)·CPU는 정밀도 설정을 쓰지 않습니다. 소형 AI 모델은 정밀도 설정을 받지 않고 GPU에서 예전처럼 자동 혼합 정밀도를 씁니다.
+- fp16에서 손실이 nan/inf여서 건너뛴 단계가 **20번 연속**이면 체크포인트를 저장하고 "fp16 학습에서 손실이 20단계 연속 nan/inf입니다. LEARNBOX_AMP=off 로 끄거나 학습률을 낮추세요."라고 멈춥니다. 이어서 재개할 수 있고, 재개할 때 정밀도를 `off`나 `fp32`로 바꿔 두면(환경변수 또는 설정) 그 값으로 다시 고릅니다.
+- 작업 카드와 모델 카드에 학습한 장치와 정밀도가 표시됩니다.
+
+## 학습 장치 고르기
+
+소형 AI·LoRA·자율 학습은 학습할 장치를 고를 수 있습니다. 기본은 `auto`(자동)입니다.
+
+| 값 | 장치 | 준비 | 비고 |
+|---|---|---|---|
+| `auto` | 아래에서 쓸 수 있는 첫 장치 | | 순서: cuda → tpu → xpu → mps → cpu. TPU는 TPU 런타임 신호가 있을 때만 시도 |
+| `cuda` | NVIDIA GPU, AMD GPU(ROCm) | CUDA용 PyTorch (Windows: `setup-gpu-windows.bat`). AMD는 Linux에서 ROCm용 PyTorch | AMD는 기기 카드에 "AMD ROCm"으로 표시, 미검증 |
+| `tpu` | Google TPU (코랩 v5e-1) | 코랩은 기본 설치. 그 밖에는 `python -m learnbox.setup_accel` | 학습에만 사용, bf16 ([TPU로 학습](#tpu로-학습-코랩-tpu-v5e-1)) |
+| `xpu` | Intel Arc GPU | XPU용 PyTorch (`setup-gpu-windows.bat`이 Arc를 찾으면 설치) | **미검증** |
+| `mps` | Mac (Apple Silicon) | 기본 PyTorch | |
+| `cpu` | CPU | | |
+
+- **정하는 순서**: 학습 요청의 장치([학습] 탭 폼의 **장치** 선택, 명령줄 `--device`) → 환경변수 `LEARNBOX_DEVICE` → 설정 `training_device` → `auto`. 환경변수는 정밀도처럼 `serve`를 실행할 때 붙입니다.
+- 웹 폼의 장치 선택(자동/GPU/TPU/Intel Arc/Mac/CPU)은 쓸 수 없는 장치를 고를 수 없게 하고, '자동' 옆에 실제로 쓸 장치를 보여 줍니다.
+- 고른 장치를 쓸 수 없으면 CPU로 학습하고 이유를 모델 카드 안내에 남깁니다(예: "CUDA GPU를 찾지 못해 CPU로 학습했습니다.").
+- 끊긴 학습을 **이어서 재개**하면 원래 장치를 이어받지 않고 **지금** 장치(위 순서)에서 이어 갑니다. 장치를 바꾸려면 `resume-job <작업 번호> --device tpu`.
+- 자율 학습은 `autolearn start --device …`로 정한 값 → 환경변수 → 설정 → `auto` 순서입니다.
+- `python -m learnbox device`의 '가속:' 줄에서 torch · torch_tpu · torch_xla · ROCm · xpu · TPU · 자동 선택 결과를 확인합니다.
+
+### TPU로 학습 (코랩 TPU v5e-1)
+
+- 코랩의 **v5e-1 TPU** 런타임(칩 1개, 메모리 16GB)에는 TPU 패키지 `torch_tpu`(TorchTPU)가 기본으로 설치되어 있습니다. **따로 설치하지 않아도** 서버를 켜면 TPU로 학습합니다. 순서는 [코랩 매뉴얼](docs/COLAB_MANUAL.md)을 보세요.
+- LearnBox는 TPU를 `torch_tpu`로 먼저 열고, 안 되면 `torch_xla`(PyTorch/XLA)로 엽니다. `torch_xla`는 지원이 끝났습니다(2.9.0이 마지막). Python 3.10~3.12 TPU 런타임에서 `torch_tpu`를 쓸 수 없을 때만 씁니다.
+- **torch를 따로 다시 설치하지 마세요.** `torch_tpu`는 지금 깔린 torch에 맞춰져 있습니다. 패키지가 없다는 안내가 나오면 `python -m learnbox.setup_accel`을 실행합니다.
+- 정밀도는 항상 **bf16**입니다(fp16·기울기 스케일러 없음).
+- **첫 학습은 컴파일 때문에 첫 단계가 몇 분** 걸릴 수 있습니다("TPU 컴파일 중(처음 한 번, 몇 분 걸릴 수 있음)"). 그 뒤로는 빠릅니다.
+- **TPU는 한 프로세스만** 쓸 수 있습니다. 서버가 켜져 있을 때 다른 창이나 노트북 셀에서 학습 명령(`train-lora` 등)을 따로 실행하거나 `import torch`로 TPU를 쓰지 마세요. "다른 프로세스가 TPU를 쓰고 있습니다" 안내와 함께 CPU로 학습하거나 오류가 납니다. (`torch_tpu` 0.2.0은 `torch.manual_seed`만 불러도 칩을 잡습니다.)
+- **답변은 TPU에서 하지 않습니다.** LoRA 답변과 소형 AI 이어 쓰기는 지금처럼 GPU/CPU에서 합니다.
+- LoRA를 TPU(`torch_tpu`)에서 활성값 체크포인팅(메모리 절약)과 함께 학습하면 dropout을 끄고 안내합니다. TorchTPU의 알려진 문제로, 둘을 함께 쓰면 기울기가 틀리기 때문입니다.
+- LoRA는 TPU에서만 배치를 문맥 길이(`seq_len`)까지 채워 모양을 고정합니다(다시 컴파일하지 않도록). GPU·CPU에서는 예전 그대로입니다.
+- 소형 AI가 TPU 메모리를 넘으면 배치를 줄여 다시 시도하지 않고 "TPU 메모리가 부족해 학습을 멈췄습니다. 배치 크기·문맥 길이·모델 크기를 줄이세요."로 멈춥니다. 체크포인트에서 이어서 할 수 있습니다.
+- `torch_xla`로 학습할 때 재컴파일 경고를 보려면 `LEARNBOX_XLA_DEBUG=1`을 붙입니다.
+
 ## 학습 일시정지 · 중간 저장 · 이어서 재개
 
 몇 시간짜리 PC 학습(소형 AI · LoRA)이 저장장치 연결 끊김, 정전, 컴퓨터 재시작으로 처음부터 다시 하게 되지 않도록, 학습 중에 **중간 저장(체크포인트)** 을 남기고 끊긴 곳부터 **이어서 재개**합니다. 원할 때 **일시정지**했다가 다시 시작할 수도 있습니다.
@@ -213,12 +273,12 @@ LearnBox 실행 중: http://127.0.0.1:8750
 - **자율 학습이 돌리는 학습**(`autolearn_train` 작업)은 일시정지·중간 저장·이어서 재개가 없습니다. 끊기면 그 회차의 학습은 잃고, 자율 학습이 계속 켜져 있으면 다음 학습 때 지난번에 완성된 모델에서 다시 이어 학습합니다. 오래 걸리는 학습은 [학습] 탭의 소형 AI / LoRA 학습으로 돌리세요.
 - 휴대폰(브라우저) 학습은 이 기능과 별개로 자체 체크포인트를 씁니다([휴대폰에서 직접 학습](#휴대폰에서-직접-학습-온디바이스) 참고).
 - 체크포인트에는 학습 자료의 전체 경로가 들어 있으므로 데이터 폴더를 다른 곳으로 옮기거나 다른 PC로 가져가서 이어서 할 수는 없습니다.
-- GPU에서 저장하고 CPU에서 이어서 하는 것처럼 장치가 바뀌면 이어서는 되지만, 결과가 끊기지 않은 학습과 비트 단위로 같지는 않습니다.
+- GPU에서 저장하고 CPU에서 이어서 하는 것처럼 장치가 바뀌면 이어서는 되지만, 결과가 끊기지 않은 학습과 비트 단위로 같지는 않습니다. TPU에서도 체크포인트를 CPU 텐서로 저장하므로 TPU ↔ GPU ↔ CPU 사이에서 서로 이어서 할 수 있습니다. 장치가 바뀌면 LoRA 정밀도는 새 장치 기준으로 다시 고르고 안내합니다.
 - 여러 번 끊겼다 이어서 할 수 있지만, 같은 체크포인트로 동시에 두 작업을 돌릴 수는 없습니다(이미 이어받은 작업이 있으면 그 작업에서 이어서 하세요).
 
 ## 휴대폰/PC 성능 차이 대응
 
-**PC 쪽** (`python -m learnbox device`, [학습] 탭의 기기 카드): CPU 코어·메모리·GPU(CUDA/Apple MPS)를 확인해 등급(PC CPU / PC GPU / 고성능 GPU)을 정하고 추천을 보여 줍니다.
+**PC 쪽** (`python -m learnbox device`, [학습] 탭의 기기 카드): CPU 코어·메모리·GPU(NVIDIA CUDA · AMD ROCm · Intel Arc · Apple MPS)·TPU를 확인해 등급(PC CPU / PC GPU / 고성능 GPU / TPU)을 정하고 추천을 보여 줍니다. 기기 카드에는 TPU 줄(종류·메모리)과 `torch_tpu`/`torch_xla` 표시가 있고, TPU 런타임인데 패키지가 없으면 `setup_accel` 안내가 나옵니다.
 
 | 등급 | 소형 AI 모델 | 주기당 단계 | LoRA 기반 모델 |
 |---|---|---|---|
@@ -226,8 +286,12 @@ LearnBox 실행 중: http://127.0.0.1:8750
 | PC CPU | 스몰 | 200 | 메모리 8GB 이상이면 0.5B (적은 단계로) |
 | PC GPU (VRAM 6GB 이상) | 베이스 | 500 | 1.5B |
 | 고성능 GPU (VRAM 16GB 이상) | 라지 | 1000 | 7B |
+| TPU (GPU가 없고 TPU를 쓸 수 있을 때, 코랩 v5e-1 메모리 16GB) | 라지 | 1000 | 1.5B (측정 전까지, 3B는 메모리가 빠듯할 수 있음) |
 
-배치 크기는 메모리에 맞춰 줄어들고, 학습 스레드는 코어 수 − 1개를 씁니다(화면 응답용으로 1개 남김). GPU 메모리가 부족하면 배치를 절반으로 줄여 다시 시도합니다.
+- GPU 등급은 장치 종류와 관계없이 VRAM으로 정합니다. Intel Arc(`xpu`)와 AMD(ROCm)도 같은 표를 쓰지만 아직 실기기로 확인하지 못했습니다(미검증).
+- LoRA 메모리 예상은 TPU에서 TPU 메모리(HBM) 기준입니다. `estimate --device tpu`는 "TPU 학습 가능: 예/아니오/측정 필요"를 보여 줍니다.
+
+배치 크기는 메모리에 맞춰 줄어들고, 학습 스레드는 코어 수 − 1개를 씁니다(화면 응답용으로 1개 남김). GPU 메모리가 부족하면 배치를 절반으로 줄여 다시 시도합니다(TPU는 줄이지 않고 멈춤).
 
 **휴대폰/브라우저 쪽** (이 기기의 메모리·코어·WebGPU로 자동 판단, [학습] 탭에서 확인):
 
@@ -371,24 +435,31 @@ python -m learnbox websearch "검색어"
 python -m learnbox ingest <파일 또는 폴더>
 python -m learnbox search "검색어" [--sources file,link] [--mode hybrid|keyword|semantic] [--limit N] [--offset N]
 python -m learnbox ask "질문" [--engine search|tiny|lora|online] [--model-id N]
-python -m learnbox estimate [--preset nano|mini|small|base|large|custom] [--d-model N --n-layer N --n-head N --seq-len N --vocab-size N] [--batch-size N]
-python -m learnbox estimate --kind lora [--base-model ID] [--lora-r N] [--seq-len N] [--batch-size N]
+python -m learnbox estimate [--preset nano|mini|small|base|large|custom] [--d-model N --n-layer N --n-head N --seq-len N --vocab-size N] [--batch-size N] [--device 장치]
+python -m learnbox estimate --kind lora [--base-model ID] [--lora-r N] [--seq-len N] [--batch-size N] [--device 장치]
 python -m learnbox device [--json]
-python -m learnbox train-tiny [--preset ...] [--d-model ...] [--steps N] [--batch-size N] [--lr X] [--resume 모델번호] [--checkpoint-minutes N]
-python -m learnbox train-lora [--base-model ID] [--lora-r N] [--max-steps N] [--seq-len N] [--resume 모델번호] [--no-qa] [--checkpoint-minutes N]
-python -m learnbox jobs [--limit N] | resume-job <작업 번호>
+python -m learnbox train-tiny [--preset ...] [--d-model ...] [--steps N] [--batch-size N] [--lr X] [--resume 모델번호] [--checkpoint-minutes N] [--device 장치]
+python -m learnbox train-lora [--base-model ID] [--lora-r N] [--max-steps N] [--seq-len N] [--resume 모델번호] [--no-qa] [--checkpoint-minutes N] [--device 장치] [--amp auto|fp16|off|fp32]
+python -m learnbox jobs [--limit N] | resume-job <작업 번호> [--device 장치]
 python -m learnbox index-embeddings
 python -m learnbox build-qa [--limit-chunks N] [--per-chunk N]
-python -m learnbox autolearn start [--targets tiny,lora,embeddings,qa] [--tiny-preset ...] [--steps-per-cycle N] ...
-python -m learnbox autolearn status | stop | run [--start] [--until-end] [--stop-after 초] [--interval 초]
+python -m learnbox autolearn start [--targets tiny,lora,embeddings,qa] [--tiny-preset ...] [--steps-per-cycle N] [--device 장치] ...
+python -m learnbox autolearn status | stop | run [--start] [--until-end] [--stop-after 초] [--interval 초] [--device 장치]
 python -m learnbox results | models
 python -m learnbox drives | export <경로> | verify <폴더> | import <폴더>
+python -m learnbox.setup_accel [--check] [--dry-run] [--force] [--backend auto|torch_tpu|torch_xla] [--torch-build]
 ```
+
+- `--device`는 `auto`(기본) · `cuda` · `tpu` · `xpu` · `mps` · `cpu`입니다([학습 장치 고르기](#학습-장치-고르기)). `gpu`·`rocm`→`cuda`, `arc`→`xpu`, `mac`→`mps` 같은 별칭도 받습니다. `resume-job`은 주지 않으면 지금 장치에서 이어 갑니다.
+- `--amp`는 LoRA 정밀도입니다([정밀도 (LoRA)](#lora-학습-공개-모델--내-자료)).
+- `device`는 '가속:' 줄에 torch · torch_tpu · torch_xla · ROCm · xpu · TPU · 자동 선택 결과를 보여 줍니다.
+- `setup_accel`은 TPU 런타임일 때만 TPU 패키지를 설치하고, `--torch-build`는 이 PC의 GPU에 맞는 PyTorch 설치 명령을 알려 줍니다([설치와 실행](#설치와-실행-pc)).
 
 - 학습 명령은 Ctrl+C를 누르면 지금 단계를 마치고 중간 저장한 뒤 멈추며, `resume-job <작업 번호>`로 이어서 합니다([학습 일시정지 · 중간 저장 · 이어서 재개](#학습-일시정지--중간-저장--이어서-재개)).
 - `train-mobile`, `train-pc`는 `train-tiny`, `train-lora`의 이전 이름으로 그대로 동작합니다.
 - `autolearn run`은 서버 없이 이 창에서 자율 학습을 직접 돌립니다(Ctrl+C로 멈춤, 세션은 남음). **서버(`serve`)와 같은 데이터 폴더에 동시에 쓰지 마세요.** `autolearn stop`은 마지막 학습과 결과 내보내기가 끝날 때까지 기다립니다.
 - 데이터 폴더는 기본 `./data`이며 `--data` 또는 `LEARNBOX_DATA` 환경변수로 바꿉니다.
+- 환경변수 `LEARNBOX_DEVICE`(학습 장치)와 `LEARNBOX_AMP`(LoRA 정밀도)는 학습 요청에 값이 없을 때 설정보다 먼저 쓰입니다. 웹에서 시작하는 학습에 적용하려면 `serve`를 실행할 때 붙이세요.
 
 ## 주요 설정 (`data/config.json`, [관리] 탭에서 수정)
 
@@ -403,7 +474,8 @@ python -m learnbox drives | export <경로> | verify <폴더> | import <폴더>
 | `search.provider` | wikipedia | wikipedia / searxng / brave / none |
 | `auto_collect` | 꺼짐, 60분 | 예약 목록 자동 수집 |
 | `tiny_training` | preset auto, 1500단계, 배치 32 | 소형 AI 모델 학습 기본값 (크기, 직접 지정 숫자) |
-| `lora_training` | Qwen2.5-0.5B, 200단계 | LoRA 학습 기본값 |
+| `lora_training` | Qwen2.5-0.5B, 200단계, `amp` auto | LoRA 학습 기본값. `amp`는 정밀도: auto · fp16 · off(예전 방식) · fp32 |
+| `training_device` | auto | 학습 장치: auto · cuda · tpu · xpu · mps · cpu. 요청의 장치 → `LEARNBOX_DEVICE` → 이 값 순서. 잘못된 값은 저장되지 않음 |
 | `training_checkpoint` | 켜짐, 10분마다, 단계 간격 0, 위치 비어 있음 | PC 학습 중간 저장. 위치를 비우면 `data/checkpoints`. 외장 HDD에서 학습하면 내장 드라이브 경로 권장 |
 | `online` | 켜짐, claude-opus-5-5 | 온라인 모델 (위 표 참고) |
 | `embeddings` | 켜짐, multilingual-e5-small | 의미 검색 |

@@ -9,7 +9,7 @@
 
 1. [먼저 알아둘 것](#1-먼저-알아둘-것)
 2. [드라이브 준비 (PC에서, 한 번만)](#2-드라이브-준비-pc에서-한-번만)
-3. [런타임 고르기 (GPU / CPU)](#3-런타임-고르기-gpu--cpu)
+3. [런타임 고르기 (GPU / TPU / CPU)](#3-런타임-고르기-gpu--tpu--cpu)
 4. [처음 시작하기](#4-처음-시작하기)
 5. [다음날 이어서 시작하기](#5-다음날-이어서-시작하기)
 6. [웹 화면 접속과 사용](#6-웹-화면-접속과-사용)
@@ -68,14 +68,18 @@
 
 ---
 
-## 3. 런타임 고르기 (GPU / CPU)
+## 3. 런타임 고르기 (GPU / TPU / CPU)
 
 메뉴 **런타임 → 런타임 유형 변경**에서 고릅니다.
 
 | 목적 | 런타임 | 이유 |
 |---|---|---|
 | 학습(소형 AI, LoRA), 의미 검색 색인을 빨리 | **T4 GPU** | 빠르지만 요금(컴퓨팅 단위)이 더 듦 |
+| 학습(소형 AI, LoRA)을 TPU로 | **v5e-1 TPU** | TPU 칩 1개(메모리 16GB), bf16으로 학습. TPU 패키지(`torch_tpu`)가 이미 깔려 있음. 첫 학습은 컴파일 때문에 첫 단계가 몇 분 걸림 |
 | 서버·검색·자료 수집만 | **CPU** | 요금이 적음, 학습은 느림 |
+
+- TPU는 **학습에만** 씁니다. TPU 런타임에서 답변(LoRA·소형 AI)과 의미 검색 색인은 TPU를 쓰지 않고 CPU로 합니다.
+- TPU에서 끊긴 학습을 T4에서, T4에서 끊긴 학습을 TPU에서 이어서 할 수 있습니다([8-4](#8-4-다른-런타임에서-이어서-재개-tpu--t4)).
 
 > **런타임을 바꾸면 `/content`가 모두 지워집니다.** 바꾸기 전에 반드시 [10. 백업](#10-백업)을 하세요.
 
@@ -89,6 +93,7 @@
 !nvidia-smi
 ```
 **확인:** `Tesla T4` 같은 GPU 이름이 보이면 성공. CPU 런타임이면 건너뜁니다.
+TPU 런타임이면 이 셀 대신 4-4의 **TPU 확인** 셀을 실행합니다(프로그램을 받은 뒤에 확인할 수 있음).
 
 ### 4-2. 드라이브 연결
 
@@ -115,10 +120,27 @@ drive.mount('/content/drive')
 - 셀 아이콘이 돌고 있으면 **끝날 때까지 기다립니다.**
 - CPU로 서버·검색만 할 때는 `requirements.txt`만 설치해도 됩니다.
 
+TPU 패키지 확인과 설치 (모든 런타임에서 실행해도 됨):
+```
+!cd /content/claud && python -m learnbox.setup_accel
+```
+- TPU 런타임: 코랩에 기본으로 깔린 `torch_tpu`가 있으면 `TPU 준비됨: torch_tpu … · torch …`만 출력하고 아무것도 설치하지 않습니다. 없으면 TPU 패키지를 설치합니다.
+- GPU·CPU 런타임: `TPU 런타임이 아니라 건너뜁니다.`가 나오고 아무것도 하지 않습니다.
+- 위의 `pip install`은 `torch>=2.2`라서 코랩 TPU 런타임에 깔린 torch를 바꾸지 않습니다(그래야 `torch_tpu`가 유지됨). **torch를 따로 다시 설치하지 마세요.**
+
 설치 확인:
 ```
 !cd /content/claud && python -c "import learnbox; print('learnbox OK')"
 ```
+
+TPU 확인 (TPU 런타임일 때만, 서버를 켜기 전에):
+```
+!cd /content/claud && python -m learnbox device
+```
+**확인:** `가속:` 줄에 `TPU v5e` 같은 TPU 이름과 `자동 선택 tpu`가 보이면 성공.
+`TPU … 감지 (TPU 패키지 필요: python -m learnbox.setup_accel)`가 나오면 위의 `setup_accel` 셀을 다시 실행합니다. 자세한 상태는 `!cd /content/claud && python -m learnbox.setup_accel --check`로 봅니다(설치하지 않고 JSON으로 보여 줌).
+
+> **TPU는 한 프로세스만 쓸 수 있습니다.** 서버(4-8)가 TPU로 학습하므로, 노트북 셀에서 `import torch`로 TPU를 쓰지 마세요.
 
 ### 4-5. 데이터 풀기
 
@@ -158,6 +180,18 @@ drive.mount('/content/drive')
 !cd /content/claud && setsid nohup python -m learnbox --data /content/data serve --port 8750 > /content/server.log 2>&1 < /dev/null &
 ```
 > `setsid … < /dev/null`이 꼭 있어야 셀이 끝나도 서버가 꺼지지 않습니다.
+
+**정밀도와 장치 (환경변수, 선택)**
+- 이제 fp16이 기본이라 예전처럼 `LEARNBOX_AMP=fp16`을 붙이지 않아도 T4에서 LoRA가 fp16으로 학습됩니다(붙여도 같은 동작).
+- 예전 방식으로 되돌리려면 `LEARNBOX_AMP=off`, 장치를 정해 두려면 `LEARNBOX_DEVICE=tpu`(또는 `cuda`, `cpu`)를 씁니다.
+- 웹에서 시작하는 학습은 **서버가** 정밀도와 장치를 정하므로, 환경변수는 다른 셀이 아니라 **서버 명령 앞에** 붙여야 합니다:
+```
+!cd /content/claud && LEARNBOX_AMP=off setsid nohup python -m learnbox --data /content/data serve --port 8750 > /content/server.log 2>&1 < /dev/null &
+```
+- 환경변수 대신 웹 [학습] 탭 폼의 **장치**·**정밀도** 선택을 써도 됩니다. 폼에서 고른 값이 가장 먼저 쓰이고, '자동'이면 환경변수 → 설정(`training_device`, `lora_training.amp`) 순서로 정합니다. 설정은 4-7처럼 서버를 켜기 전에 바꿀 수 있습니다:
+```
+!cd /content/claud && python -c "from learnbox.config import Config; c=Config('/content/data'); c.update({'lora_training': {'amp': 'off'}}); print('설정 변경 완료')"
+```
 
 ### 4-9. 서버 확인 (다음 셀에서)
 
@@ -263,6 +297,8 @@ drive.mount('/content/drive')
 
 ### 7-3. 셀 명령으로 학습
 
+> **TPU 런타임에서는 웹 화면(7-2)으로 학습하세요.** TPU는 한 프로세스만 쓸 수 있어서, 서버가 켜져 있을 때 셀 명령(`train-tiny`, `train-lora`, `resume-job`)을 따로 실행하면 "다른 프로세스가 TPU를 쓰고 있습니다" 안내와 함께 CPU로 학습하거나 오류가 납니다. 셀 명령을 쓰려면 먼저 서버를 끕니다(`!pkill -f "[l]earnbox --data"`).
+
 소형 AI (베이스, 1000단계 예):
 ```
 !cd /content/claud && setsid nohup python -m learnbox --data /content/data train-tiny --preset base --steps 1000 --batch-size 16 --lr 0.0005 --checkpoint-minutes 5 > /content/train.log 2>&1 < /dev/null &
@@ -273,10 +309,26 @@ drive.mount('/content/drive')
 !cd /content/claud && setsid nohup python -m learnbox --data /content/data train-tiny --preset custom --d-model 640 --n-layer 10 --n-head 10 --seq-len 512 --vocab-size 8000 --steps 1000 --batch-size 16 --lr 0.0005 --checkpoint-minutes 5 > /content/train.log 2>&1 < /dev/null &
 ```
 
-LoRA (지시형 모델, T4 권장):
+LoRA (지시형 모델, T4 또는 TPU 권장):
 ```
 !cd /content/claud && setsid nohup python -m learnbox --data /content/data train-lora --base-model Qwen/Qwen2.5-0.5B-Instruct --max-steps 300 --checkpoint-minutes 5 > /content/lora.log 2>&1 < /dev/null &
 ```
+
+T4에서 3B LoRA (환경변수 없이 fp16으로 학습):
+```
+!cd /content/claud && setsid nohup python -m learnbox --data /content/data train-lora --base-model Qwen/Qwen2.5-3B-Instruct --max-steps 300 --checkpoint-minutes 5 > /content/lora.log 2>&1 < /dev/null &
+```
+- T4는 bf16을 하드웨어로 지원하지 않아서 정밀도 `auto`(기본)가 fp16 혼합 정밀도를 고릅니다. 예전처럼 `LEARNBOX_AMP=fp16`을 붙일 필요가 없습니다.
+- 끄려면 `--amp off`(예전 방식) 또는 `--amp fp32`를 붙입니다.
+- Qwen2.5-3B는 비상업 라이선스입니다.
+
+TPU(v5e-1)에서 LoRA (서버를 먼저 끈 뒤):
+```
+!cd /content/claud && setsid nohup python -m learnbox --data /content/data train-lora --base-model Qwen/Qwen2.5-1.5B-Instruct --max-steps 300 --device tpu --checkpoint-minutes 5 > /content/lora.log 2>&1 < /dev/null &
+```
+- TPU는 bf16으로 학습합니다(`--amp`는 쓰지 않음). 첫 단계는 컴파일 때문에 몇 분 걸릴 수 있습니다.
+- 측정 전까지는 1.5B를 권장합니다. 3B는 메모리(16GB)가 빠듯할 수 있습니다.
+- `--device`를 빼도 TPU 런타임에서는 자동으로 TPU를 고릅니다.
 
 CPU에서 학습할 때는 작게:
 ```
@@ -289,6 +341,7 @@ CPU에서 학습할 때는 작게:
 !nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv
 ```
 - GPU 사용률이 높고 메모리가 올라가 있으면 정상입니다. 메모리를 다 쓰지 않아도(예: 16GB 중 5GB) 사용률이 100%면 GPU를 꽉 쓰고 있는 것입니다.
+- TPU 런타임에는 `nvidia-smi`가 없습니다. 로그(`tail`)나 [작업] 탭으로 확인하고, `tpu-info`가 있으면 `!tpu-info`로 TPU 사용량을 봅니다.
 - 셀 명령으로 시작한 학습에는 **일시정지 버튼이 없습니다.** 대신 5분마다 드라이브에 중간 저장됩니다. 일시정지가 필요하면 웹 화면(7-2)으로 시작하세요.
 
 ### 7-4. 학습 결과 보관
@@ -320,11 +373,25 @@ CPU에서 학습할 때는 작게:
 !cd /content/claud && python -m learnbox --data /content/data jobs --limit 5
 !cd /content/claud && setsid nohup python -m learnbox --data /content/data resume-job 작업번호 > /content/resume.log 2>&1 < /dev/null &
 ```
+TPU 런타임에서 셀 명령으로 이어서 할 때는 서버를 먼저 끕니다(7-3의 주의). 웹 화면의 **이어서 재개**를 쓰면 그럴 필요가 없습니다.
 
 ### 8-3. 꼭 지킬 것
 
 - 체크포인트 저장 위치가 **드라이브**(`/content/drive/MyDrive/LearnBox/ckpt`)여야 다음날 남아 있습니다(4-7).
 - 데이터 폴더 경로(`/content/data`)를 바꾸지 마세요. 체크포인트는 학습 자료 경로를 기억합니다.
+
+### 8-4. 다른 런타임에서 이어서 재개 (TPU ↔ T4)
+
+TPU 세션 시간이 끝나 끊긴 학습을 다음날 T4에서, T4에서 끊긴 학습을 TPU에서 이어서 할 수 있습니다. CPU로도 됩니다.
+
+1. 학습을 시작한 뒤 [10. 백업](#10-백업)을 해 둡니다(작업 기록이 든 `learnbox.db`가 있어야 [작업] 탭에 이어서 재개가 나옴). 체크포인트는 드라이브에 있어야 합니다(4-7).
+2. 새 런타임(T4 또는 v5e-1 TPU)을 고르고 [5장](#5-다음날-이어서-시작하기) 순서로 준비합니다.
+3. [작업] 탭에서 **이어서 재개**를 누릅니다.
+
+- 체크포인트는 TPU에서도 CPU 텐서로 저장되므로 어느 장치에서나 읽을 수 있습니다.
+- 이어서 재개는 원래 장치를 이어받지 않고 **지금 런타임의 장치**(자동 선택)에서 합니다. 셀 명령으로 장치를 정하려면 `resume-job 작업번호 --device tpu`(또는 `cuda`, `cpu`)를 씁니다.
+- 장치가 바뀌면 LoRA 정밀도는 새 장치 기준으로 다시 고릅니다(TPU는 bf16, T4는 fp16). 안내 문구로 알려 줍니다.
+- 결과는 끊기지 않은 학습과 비트 단위로 같지는 않습니다(장치가 바뀐 재개라서).
 
 ---
 
@@ -423,7 +490,7 @@ CPU에서 학습할 때는 작게:
 ### 11-2. 요금 줄이기
 
 - 학습이 끝나면 바로 **CPU로 바꾸거나 세션을 종료**합니다(바꾸기 전 백업).
-- 서버·검색·수집은 CPU로 충분합니다.
+- 서버·검색·수집은 CPU로 충분합니다. TPU도 학습에만 쓰이므로 학습이 없을 때는 CPU 런타임을 씁니다.
 - 큰 모델은 자료가 충분할 때만 돌립니다.
 - 자리를 오래 비우면 연결이 끊깁니다. 끊김을 억지로 막는 자동 클릭 스크립트는 이용 약관 위반이 될 수 있어 권하지 않습니다. 대신 중간 저장(8장)을 믿고 이어서 하세요.
 
@@ -448,8 +515,13 @@ CPU에서 학습할 때는 작게:
 | `cp: … backup/: Not a directory` | `backup`이 파일로 생김 | `!mv …/LearnBox/backup …/LearnBox/backup_old.db` 후 `mkdir -p …/backup` |
 | `find`에 `data.zip`이 두 개 | 다른 폴더에도 올림 | `LearnBox/data.zip` 쪽을 사용 |
 | 모델 목록이 비어 있음 | 모델 복원 누락 | 5장 복원의 models 복사 → 서버 재시작 |
-| 학습 중인데 GPU 메모리 0, RAM도 안 씀 | 학습이 실제로 안 돎 / CPU 런타임 | `!ps aux \| grep "[t]rain"`, 로그 확인, 런타임이 T4인지 확인 |
+| 학습 중인데 GPU 메모리 0, RAM도 안 씀 | 학습이 실제로 안 돎 / CPU 런타임 | `!ps aux \| grep "[t]rain"`, 로그 확인, 런타임이 T4/TPU인지 확인 (TPU는 `nvidia-smi` 대신 [작업] 탭이나 `!tpu-info`) |
 | 학습 패키지가 없다는 메시지 | `requirements-train.txt` 미설치 | 4-4 설치 |
+| `TPU 패키지(torch_tpu 또는 torch_xla)가 없어 CPU로 학습했습니다` | TPU 런타임인데 TPU 패키지가 없음 | `!cd /content/claud && python -m learnbox.setup_accel` 실행 → 서버 끄고(`!pkill -f "[l]earnbox --data"`) 4-8로 다시 켜기 |
+| TPU 학습이 첫 단계에서 몇 분째 그대로 | 처음 한 번 컴파일 중 (`TPU 컴파일 중(처음 한 번, 몇 분 걸릴 수 있음)`) | 기다리기. 그 뒤로는 빠름 |
+| `다른 프로세스가 TPU를 쓰고 있습니다` | 노트북 셀이나 다른 학습 명령이 TPU를 먼저 잡음 (TPU는 한 프로세스만 씀) | 셀 명령 학습 끄기(`!ps aux \| grep "[t]rain"`로 확인), 노트북에서 `import torch`를 했다면 **런타임 → 세션 다시 시작**(파일은 남음). 그다음 서버를 다시 켜고(4-8) 웹 화면에서 학습 |
+| `torch …와 torch_xla …의 버전이 맞지 않습니다` / `torch_tpu …는 torch 2.11 이상이 필요한데…` | torch를 따로 다시 설치했거나 `torch_xla`를 직접 설치해 짝이 깨짐 | torch·torch_xla를 따로 설치하지 않기. 새 세션에서 4장 순서대로(코랩 기본 `torch_tpu` 사용), 필요하면 `setup_accel` |
+| `fp16 학습에서 손실이 20단계 연속 nan/inf입니다` | T4의 fp16(기본)에서 수치가 넘침 | 서버를 `LEARNBOX_AMP=off`로 다시 켜고(4-8) [작업] 탭에서 **이어서 재개**, 또는 학습률 낮추기. 셀 명령이면 `resume-job` 앞에 `LEARNBOX_AMP=off`를 붙임 |
 | `ONNX 결과가 PyTorch와 다릅니다 (최대 오차 1.39e-03)` | 큰 모델의 계산 오차가 검사 기준(0.001)을 조금 넘음 | 모델은 정상, 그대로 사용 가능 (온보드 결과가 PC와 약간 다를 수 있음) |
 | 생성 문장이 뒤섞이고 엉뚱함 | 평가 손실이 높음 / 자료에 영어·표·수식 섞임 | 자료 정리, 주제 집중, 미니·스몰부터 |
 | 평가 손실이 7 근처에서 안 내려감 | 학습률이 높거나 자료 부족 | `--lr 0.0005`, 크기 낮추기 |
@@ -485,6 +557,7 @@ drive.mount('/content/drive')
 ```
 !git clone -b claude/vibe-scraping-ai-engine-din8fn https://github.com/gangdohyeon322-stack/claud.git /content/claud
 !pip install -q -r /content/claud/requirements.txt -r /content/claud/requirements-train.txt
+!cd /content/claud && python -m learnbox.setup_accel
 ```
 ```
 !mkdir -p /content/data/models
