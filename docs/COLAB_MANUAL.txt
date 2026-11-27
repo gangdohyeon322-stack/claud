@@ -120,6 +120,18 @@ drive.mount('/content/drive')
 - 셀 아이콘이 돌고 있으면 **끝날 때까지 기다립니다.**
 - CPU로 서버·검색만 할 때는 `requirements.txt`만 설치해도 됩니다.
 
+**torchao 충돌 해결 (`Found an incompatible version of torchao` 오류가 날 때)**
+코랩에 미리 깔린 `torchao`가 `transformers`·`peft`와 맞지 않으면 학습 시작 때 위 오류가 납니다. `torchao`는 LearnBox가 쓰지 않으므로 지우면 됩니다.
+```
+!pip uninstall -y torchao
+```
+```
+!pip install -q -r /content/claud/requirements.txt -r /content/claud/requirements-train.txt
+```
+- 지운 뒤에는 **런타임 → 세션 다시 시작**을 누르고, 4-4 설치 셀을 다시 실행하세요.
+- 또는 최신 `torchao`로 맞출 수도 있습니다: `!pip install -U torchao` (다시 충돌하면 위의 `uninstall` 방법을 쓰세요).
+- 설치 뒤 확인: `!cd /content/claud && python -c "import torch, transformers, peft; print('OK', transformers.__version__, peft.__version__)"`
+
 TPU 패키지 확인과 설치 (모든 런타임에서 실행해도 됨):
 ```
 !cd /content/claud && python -m learnbox.setup_accel
