@@ -84,8 +84,9 @@ LearnBox 실행 중: http://127.0.0.1:8750
 | 탭 | 내용 |
 |---|---|
 | 검색 | 검색창 · 답변 방식(검색만/소형 AI/LoRA/온보드/온라인) · 자료 종류 · 검색 방식 · 핵심 문장 · 답변과 인용 · 문서 보기 · 이 기기에 저장(오프라인 사본) |
+| 대화 | **챗봇과 여러 번 주고받는 대화**(LoRA 모델) · 학습 자료 참고 켜기/끄기 · 새 대화 · 챗봇 이름·말투 설정(관리자) |
 | 자료 | 파일 가져오기 · 링크 수집 · 실시간 검색 수집 · 예약 목록 · 문서 목록 |
-| 학습 | 기기 성능과 추천 · **자율 학습** · 소형 AI 모델 학습(크기 설정, 장치) · LoRA 학습(장치, 정밀도) · 의미 검색 색인 · Q&A 학습 데이터 · 학습 결과 파일 |
+| 학습 | 기기 성능과 추천 · **자율 학습** · 소형 AI 모델 학습(크기 설정, 장치) · LoRA 학습(장치, 정밀도, 대화 데이터) · 의미 검색 색인 · Q&A 학습 데이터 · 대화 학습 데이터 · 학습 결과 파일 |
 | 모델 | 모델 카드(크기·손실·단계·파일) · 이 기기로 받기 · 이 기기에서 실행(온보드) · PC에서 생성 |
 | 작업 | 진행 중/끝난 작업 · 학습 일시정지/재개/지금까지 저장하고 끝내기 · 마지막 중간 저장 · 끊긴 학습 이어서 재개 |
 | 관리 (관리자) | 외장 저장 내보내기 · 설정(온라인 모델, 의미 검색, 자율 학습 기본값, 학습 중간 저장 …) · 감사 기록 |
@@ -134,6 +135,21 @@ LearnBox 실행 중: http://127.0.0.1:8750
 | **LoRA 모델** | PC | `requirements-train.txt`, 학습한 LoRA 어댑터 | 공개 모델(Qwen2.5) + 내 자료 추가 학습. 검색된 자료를 근거로 질문에 답하고 인용 번호를 붙임. CPU에서는 느림 |
 | **온보드 모델** | **휴대폰/PC 브라우저 안** | 모델과 자료 사본을 기기에 저장 | **인터넷 없이** 동작. 기기 안 검색 + 소형 AI 모델 이어 쓰기. 처음 한 번 실행 엔진(onnxruntime-web)을 인터넷에서 받음 |
 | **온라인 모델** | Anthropic 서버 | API 키 | 검색된 자료만 근거로 답하고 **문장별 인용**을 붙임. 가장 똑똑하지만 **자료 일부가 외부로 전송되고 비용이 듦** ([온라인 모델 설정](#온라인-모델-설정-claude-api) 참고) |
+
+## 대화형 챗봇 (Qwen Instruct + LoRA)
+
+[대화] 탭에서 LoRA 모델과 여러 번 주고받으며 대화합니다. "안녕 넌 누구야"라고 물으면 설정한 이름으로 "저는 ○○입니다"라고 답합니다 ([PRD](docs/PRD-chatbot.md)).
+
+- **이름·말투**: [대화] 탭의 '챗봇 이름·말투'(관리자) 또는 설정 `chatbot`(`name`, `intro`, `style`, `extra`). 대화 모드에서만 쓰고, [검색] 탭의 질문하기는 그대로입니다.
+- **이름이 바로 적용되는 원리**: 대화할 때마다 이름·말투를 시스템 지시문으로 넣습니다. 그래서 학습 전에도 이름으로 답합니다. 지시문이 없으면 Qwen은 "저는 Alibaba Cloud가 만든 Qwen입니다"라고 답합니다.
+- **이름을 모델에 학습시키기**: [학습] 탭의 **대화 학습 데이터 만들기**(외부 전송 없음, `python -m learnbox build-chat`)로 `data/datasets/chat.jsonl`을 만듭니다. 그다음 LoRA를 학습하면 '대화 학습 데이터도 사용'(기본 켬)으로 함께 학습합니다.
+  - 정체성 질문·인사·여러 턴 대화를 규칙으로 만들고, 있으면 Q&A 데이터도 대화로 바꿔 넣습니다. 답변 부분에만 손실을 매깁니다.
+  - 학습이 끝나면 **정체성 시험**을 자동으로 봅니다. 시스템 지시문 없이도 이름을 말하는 비율이 작업 카드에 '정체성 시험 N%'로 나옵니다.
+  - 이름을 바꿨으면 대화 학습 데이터를 다시 만들고 다시 학습하세요.
+- **이전 대화**: 최근 12개 메시지(`chatbot.max_history`)를 함께 보냅니다. 대화는 화면에만 남고 서버에 저장하지 않습니다.
+- **학습 자료 참고**(기본 켬, `chatbot.use_context`): 질문과 관련된 자료 3개를 찾아 넣고, 근거로 쓴 문장에는 `[n]`을 붙입니다. 관련 없으면 자료 없이 대화합니다.
+- **명령줄**: `python -m learnbox chat` (대화창, `--no-context`, `--model-id N`, `-m "메시지"`).
+- **한계**: 작은 모델(0.5B)은 한국어 대화가 서툴고 사실을 지어낼 수 있습니다. 1.5B 이상을 권장합니다(3B는 비상업 라이선스). CPU에서는 답변이 느립니다. 대화 모드는 지금 LoRA 모델만 지원합니다.
 
 ## 모델 크기 설정
 
@@ -434,6 +450,8 @@ python -m learnbox collect <URL...> [--depth 1]
 python -m learnbox websearch "검색어"
 python -m learnbox ingest <파일 또는 폴더>
 python -m learnbox search "검색어" [--sources file,link] [--mode hybrid|keyword|semantic] [--limit N] [--offset N]
+python -m learnbox chat [--model-id N] [--no-context] [-m "메시지" ...]
+python -m learnbox build-chat [--no-qa]
 python -m learnbox ask "질문" [--engine search|tiny|lora|online] [--model-id N]
 python -m learnbox estimate [--preset nano|mini|small|base|large|custom] [--d-model N --n-layer N --n-head N --seq-len N --vocab-size N] [--batch-size N] [--device 장치]
 python -m learnbox estimate --kind lora [--base-model ID] [--lora-r N] [--seq-len N] [--batch-size N] [--device 장치]
@@ -467,6 +485,7 @@ python -m learnbox.setup_accel [--check] [--dry-run] [--force] [--backend auto|t
 |---|---|---|
 | `allowed_windows` | 매일 00:00~24:00 | 수집 허용 시간대. 시작이 끝보다 늦으면 자정을 넘기는 구간 (예: 22:00~06:00) |
 | `timezone` | Asia/Seoul | |
+| `chatbot` | 이름 LearnBox, 존댓말 | 대화 모드의 챗봇 이름(`name`)·소개(`intro`)·말투(`style`)·추가 지시(`extra`), 자료 참고(`use_context`), 이전 대화 수(`max_history`) |
 | `allowed_domains` | 비어 있음(전체) | 넣으면 그 도메인만 수집 |
 | `user_agent` | `LearnBox/0.1 (…)` | 사이트가 요청자를 확인할 때 보내는 이름. 위키백과 등은 연락처를 넣으라고 요구함 |
 | `request_interval_sec` | 3 | 같은 사이트에 보내는 요청 사이 최소 간격 |

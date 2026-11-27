@@ -139,6 +139,7 @@ class App:
             "ingest_path": self._ingest_path,
             "index_embeddings": self._index_embeddings,
             "build_qa": self._build_qa,
+            "build_chat": self._build_chat,
             "train_tiny": self._train_tiny,
             "train_lora": self._train_lora,
             "autolearn_train": self._autolearn_train,
@@ -363,6 +364,64 @@ class App:
 
     def _index_embeddings(self, ctx, p):
         return _mod("search").index_embeddings(self.cfg, self.db, progress=ctx.progress, check_cancel=ctx.check_cancel)
+
+    def _build_chat(self, ctx, p):
+        """대화 학습 데이터(chat.jsonl): 챗봇 이름·말투의 정체성 대화 + (있으면) Q&A를 한 턴 대화로."""
+        chat = _mod("chat")
+        ctx.progress(0.1, "대화 학습 데이터 만드는 중")
+        include_qa = _bool(p["include_qa"]) if "include_qa" in p else True
+        qa_rows = _mod("train_pc").load_qa(self.cfg.datasets_dir / "qa.jsonl") if include_qa else []
+        r = chat.build_dataset(self.cfg["chatbot"], self.cfg.datasets_dir / "chat.jsonl", qa_rows)
+        ctx.progress(1.0, f"대화 {r['dialogs']}개 (정체성 {r['identity']}, Q&A {r['qa']}) · 이름 {r['name']}")
+        return r
+
+    def chat_info(self) -> dict:
+        """대화 화면용: 페르소나, 대화 데이터 유무, 쓸 수 있는 LoRA 모델."""
+        chat = _mod("chat")
+        path = self.cfg.datasets_dir / "chat.jsonl"
+        models = [{"id": m["id"], "name": m["name"], "kind": m["kind"]} for m in self.db.list_models()
+                  if m["kind"] in LORA_KINDS and Path(m["path"]).is_dir()]
+        c = self.cfg["chatbot"] or {}
+        return {"persona": chat.persona(c), "use_context": bool(c.get("use_context", True)),
+                "max_history": int(c.get("max_history") or chat.MAX_HISTORY),
+                "dataset": {"exists": path.is_file(), "dialogs": len(chat.load_dialogs(path)) if path.is_file() else 0},
+                "models": models}
+
+    def chat(self, messages, engine: str = "lora", model_id=None, use_context=None) -> dict:
+        """대화 모드 답변 (docs/PRD-chatbot.md). 페르소나 시스템 메시지 + 이전 대화 + (선택) 학습 자료.
+
+        반환 {"engine","answer","citations","sources","model","persona","note"}. 근거 번호 [n]은 sources의 n번째."""
+        chat = _mod("chat")
+        c = self.cfg["chatbot"] or {}
+        msgs = chat.clean_messages(messages, int(c.get("max_history") or chat.MAX_HISTORY))
+        engine = str(engine or "lora").strip().lower()
+        if engine != "lora":
+            raise ValueError("대화 모드는 지금 LoRA 모델만 지원합니다 (engine: lora).")
+        persona = chat.persona(c)
+        use_ctx = _bool(use_context) if use_context is not None else bool(c.get("use_context", True))
+        contexts = []
+        if use_ctx:
+            contexts = _mod("search").retrieve(self.cfg, self.db, msgs[-1]["content"], k=3)
+        m = self._pick_model(model_id, LORA_KINDS, "lora")
+        r = _mod("train_pc").chat(msgs, (m.get("info") or {}).get("base_model") or None, m["path"],
+                                  system=chat.system_prompt(persona, with_context=bool(contexts)),
+                                  contexts=contexts,
+                                  max_new_tokens=_int(c.get("max_new_tokens"), 256, "max_new_tokens", 16, 2048))
+        return {"engine": "lora", "answer": r["answer"], "citations": r["citations"],
+                "sources": self._source_rows(msgs[-1]["content"], contexts) if contexts else [],
+                "model": m["name"], "persona": persona["name"], "note": None}
+
+    def _identity_test(self, base_model: str | None, adapter_dir: str) -> dict:
+        """학습 뒤 정체성 시험: 시스템 메시지 없이(모델 기본 지시문) 이름을 말하는 비율. 실패해도 학습은 성공."""
+        chat = _mod("chat")
+        train_pc = _mod("train_pc")
+        name = chat.persona(self.cfg["chatbot"])["name"]
+        answers = []
+        for q in chat.EVAL_QUESTIONS:
+            r = train_pc.chat([{"role": "user", "content": q}], base_model, adapter_dir, system=None, max_new_tokens=48)
+            answers.append(r["answer"])
+        return {"name": name, "score": round(chat.identity_score(answers, name), 3),
+                "questions": list(chat.EVAL_QUESTIONS), "answers": answers}
 
     def _build_qa(self, ctx, p):
         return _mod("online").build_qa_dataset(
@@ -662,7 +721,9 @@ class App:
         if not base and not resume:
             raise ValueError("기반 모델을 지정하세요.")
         use_qa = _bool(p["use_qa"]) if "use_qa" in p else _bool(lt.get("use_qa", True))
+        use_chat = _bool(p["use_chat"]) if "use_chat" in p else _bool(lt.get("use_chat", True))
         qa = self.cfg.datasets_dir / "qa.jsonl"
+        chat_file = self.cfg.datasets_dir / "chat.jsonl"
         return {
             "resume": resume, "base_model": base,
             "max_steps": _int(p.get("max_steps"), lt.get("max_steps", 200), "max_steps", 1, 10_000_000),
@@ -673,6 +734,7 @@ class App:
             "lora_r": _int(p.get("lora_r"), lt.get("lora_r", 8), "lora_r", 1, 512),
             "lora_alpha": _int(p.get("lora_alpha"), lt.get("lora_alpha", 16), "lora_alpha", 1, 4096),
             "qa_path": str(qa) if use_qa and qa.is_file() else None, "threads": self._threads(p),
+            "chat_path": str(chat_file) if use_chat and chat_file.is_file() else None,
             "device": self._train_device(p), "amp": self._train_amp(p),
         }
 
@@ -702,9 +764,16 @@ class App:
                     max_steps=plan["max_steps"], lr=plan["lr"], seq_len=plan["seq_len"], batch_size=plan["batch_size"],
                     grad_accum=plan["grad_accum"], lora_r=plan["lora_r"], lora_alpha=plan["lora_alpha"],
                     qa_path=plan["qa_path"], resume_from=plan["resume"]["path"] if plan["resume"] else None,
-                    threads=plan["threads"], device=plan["device"], amp=plan["amp"], **common)
+                    threads=plan["threads"], device=plan["device"], amp=plan["amp"],
+                    **({"chat_path": plan["chat_path"]} if plan["chat_path"] else {}), **common)
         name, out, info = self._run_training(ctx, "lora", root, call)
         info["corpus"] = corpus
+        if info.get("chat_examples"):   # 대화 데이터로 학습했으면 정체성 시험 (PRD-chatbot 5.5)
+            ctx.progress(0.99, "정체성 시험 중 (챗봇이 이름을 말하는지)")
+            try:
+                info["identity_test"] = self._identity_test(info.get("base_model"), str(out))
+            except Exception as e:  # 시험 실패는 학습 실패가 아니다
+                info["identity_test"] = {"error": f"{type(e).__name__}: {e}"[:200]}
         if p.get("resumed_from_job") not in (None, ""):
             info["resumed_from_job"] = p.get("resumed_from_job")
         info["model_id"] = self.db.add_model("lora", name, str(out), info)

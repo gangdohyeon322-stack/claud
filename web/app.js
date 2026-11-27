@@ -14,7 +14,7 @@ const ENGINE_LABEL = { search: "검색만", tiny: "소형 AI", lora: "LoRA", onb
 const MODE_LABEL = { hybrid: "통합", keyword: "키워드", semantic: "의미" };
 const KIND = {
   collect_links: "링크 수집", collect_search: "검색 수집", ingest_path: "파일 가져오기",
-  index_embeddings: "의미 검색 색인", build_qa: "Q&A 데이터 생성", train_tiny: "소형 AI 학습", train_lora: "LoRA 학습",
+  index_embeddings: "의미 검색 색인", build_qa: "Q&A 데이터 생성", build_chat: "대화 데이터 생성", train_tiny: "소형 AI 학습", train_lora: "LoRA 학습",
   autolearn_train: "자율 학습(학습)", finalize_learning: "학습 종료·결과 내보내기", export: "외장 저장 내보내기",
   train_mobile: "소형 AI 학습", train_pc: "LoRA 학습",
 };
@@ -357,7 +357,7 @@ function switchTab(name) {
   $$(".tab").forEach((t) => (t.hidden = t.id !== "tab-" + name));
   Poll.clear("tab");
   if (S.offline) { if (name === "models") loadModels(); return; }
-  const loaders = { search: loadSearchTab, data: loadData, train: () => loadTrain(false), models: loadModels, jobs: loadJobs, admin: loadAdmin };
+  const loaders = { search: loadSearchTab, chat: loadChat, data: loadData, train: () => loadTrain(false), models: loadModels, jobs: loadJobs, admin: loadAdmin };
   (loaders[name] || (() => {}))();
   const polls = { jobs: [loadJobs, 3000], data: [loadGate, 10000], train: [() => loadTrain(true), 4000] };
   if (polls[name]) Poll.set("tab", polls[name][0], polls[name][1]);
@@ -1182,7 +1182,15 @@ async function loadTrain(quiet) {
   loadDevice();
   loadModelsList().then(fillResumeSelects);
   refreshStatus().then(renderIndexInfo);
-  if (S.role === "admin") { loadTrainDefaults(); loadResults(); }
+  if (S.role === "admin") { loadTrainDefaults(); loadResults(); loadChatDsInfo(); }
+}
+async function loadChatDsInfo() {   // [학습] 탭의 대화 학습 데이터 안내
+  try {
+    const i = await api("/api/chat");
+    CHAT.info = i;
+    const ds = i.dataset || {};
+    $("#chat-ds-info").textContent = ds.exists ? `대화 학습 데이터: ${fmtNum(ds.dialogs)}개 (이름 ${chatName()})` : "대화 학습 데이터가 아직 없습니다.";
+  } catch (e) { /* 조용히 넘어간다 */ }
 }
 function presetsOf() { return (S.device && S.device.presets) || FALLBACK_PRESETS; }
 function limitsOf() { return (S.device && S.device.limits) || FALLBACK_LIMITS; }
@@ -1475,6 +1483,7 @@ function applySettingsDefaults(s) {
   setVal("#lora-steps", lt.max_steps); setVal("#lora-seq", lt.seq_len); setVal("#lora-batch", lt.batch_size);
   if (lt.lora_r && $(`#lora-r option[value="${CSS.escape(String(lt.lora_r))}"]`)) $("#lora-r").value = String(lt.lora_r);
   if (lt.use_qa != null) $("#lora-qa").checked = !!lt.use_qa;
+  if (lt.use_chat != null) $("#lora-chat").checked = !!lt.use_chat;
   if (lt.base_model) {
     if ($(`#lora-base option[value="${CSS.escape(lt.base_model)}"]`)) $("#lora-base").value = lt.base_model;
     else { $("#lora-base").value = LORA_CUSTOM; $("#lora-custom").value = lt.base_model; }
@@ -1714,6 +1723,7 @@ $("#lora-form").addEventListener("submit", async (e) => {
   const base = loraBase();
   if (!base) return toast("기반 모델을 고르거나 입력하세요.");
   const body = { base_model: base, lora_r: Number($("#lora-r").value), use_qa: $("#lora-qa").checked };
+  if (!$("#lora-chat").checked) body.use_chat = false;   // 켜져 있으면 보내지 않는다(서버 기본: 대화 데이터가 있으면 사용)
   const steps = intVal("#lora-steps"), seq = intVal("#lora-seq"), batch = intVal("#lora-batch");
   if (steps) body.max_steps = steps;
   if (seq) body.seq_len = seq;
@@ -1737,11 +1747,101 @@ function renderIndexInfo(st) {
 $("#emb-btn").addEventListener("click", async () => {
   try { const r = await post("/api/index/embeddings"); jobToast(`의미 검색 색인 작업 #${r.job_id} 시작.`); } catch (e) { toast(e.message, 6000); }
 });
+$("#chat-build-btn").addEventListener("click", async () => {
+  try { const r = await post("/api/chat/build", {}); jobToast(`대화 데이터 생성 작업 #${r.job_id} 시작.`); } catch (e) { toast(e.message, 6000); }
+});
 $("#qa-btn").addEventListener("click", async () => {
   try {
     const r = await post("/api/qa/build", { limit_chunks: intVal("#qa-chunks") || 50, per_chunk: intVal("#qa-per") || 2 });
     jobToast(`Q&A 데이터 생성 작업 #${r.job_id} 시작.`);
   } catch (e) { toast(e.message, 6000); }
+});
+
+// ---------------- 대화 (docs/PRD-chatbot.md) ----------------
+// 대화 기록은 이 화면 메모리에만 둔다(서버에 저장하지 않음). 보낼 때마다 지금까지의 대화를 함께 보낸다.
+const CHAT = { msgs: [], info: null, busy: false, ctxTouched: false };
+function chatName() { return ((CHAT.info || {}).persona || {}).name || "LearnBox"; }
+// 조사: 마지막 한글 글자에 받침이 있으면 a, 없으면 b ('하늘과', 'LearnBox와'). learnbox/chat.py josa와 같은 규칙
+function josa(w, a, b) {
+  const s = String(w || ""), c = s.charCodeAt(s.length - 1);
+  return s + (c >= 0xac00 && c <= 0xd7a3 && (c - 0xac00) % 28 !== 0 ? a : b);
+}
+async function loadChat() {
+  try { CHAT.info = await api("/api/chat"); } catch (e) { $("#chat-note").textContent = e.message; renderChat(); return; }
+  const i = CHAT.info, p = i.persona || {}, models = i.models || [];
+  $("#chat-title").textContent = `${josa(chatName(), "과", "와")} 대화`;
+  if (!CHAT.ctxTouched) $("#chat-context").checked = !!i.use_context;
+  const sel = $("#chat-model"), cur = sel.value;
+  sel.innerHTML = '<option value="">가장 최근 LoRA 모델</option>' +
+    models.map((m) => `<option value="${esc(m.id)}">#${esc(m.id)} ${esc(m.name)}</option>`).join("");
+  if (cur && [...sel.options].some((o) => o.value === cur)) sel.value = cur;
+  const ds = i.dataset || {};
+  $("#chat-note").textContent = !models.length
+    ? "LoRA 모델이 없습니다. [학습] 탭에서 LoRA 모델을 먼저 학습하세요."
+    : ds.exists ? "" : "이름·말투를 모델에 학습시키려면 [학습] 탭에서 '대화 학습 데이터 만들기' 후 LoRA를 학습하세요.";
+  setVal("#cp-name", p.name); setVal("#cp-intro", p.intro); setVal("#cp-style", p.style); setVal("#cp-extra", p.extra || "");
+  const di = $("#chat-ds-info");
+  if (di) di.textContent = ds.exists ? `대화 학습 데이터: ${fmtNum(ds.dialogs)}개 (이름 ${chatName()})` : "대화 학습 데이터가 아직 없습니다.";
+  renderChat();
+}
+function chatText(text, n) {
+  return esc(text).replace(/\[(\d{1,3})\]/g, (m, d) => (Number(d) >= 1 && Number(d) <= n ? `<sup class="cite">[${d}]</sup>` : m))
+    .replace(/\n/g, "<br>");
+}
+function renderChat() {
+  const log = $("#chat-log");
+  if (!log) return;
+  const name = chatName();
+  const rows = CHAT.msgs.map((m) => {
+    const srcs = m.sources || [];
+    const cited = new Set((m.citations || []).map((c) => num(c.index)));
+    const used = srcs.map((s, i) => [s, i + 1]).filter(([, n]) => cited.has(n));
+    const srcHtml = used.length ? `<ol class="srcs small">${used.map(([s, n]) => `<li><span class="n">[${n}]</span>${docButton(s)}</li>`).join("")}</ol>` : "";
+    return `<div class="bubble ${m.role === "user" ? "user" : "assistant"}"><div class="who">${m.role === "user" ? "나" : esc(name)}</div>
+      <div class="text">${m.role === "user" ? esc(m.content).replace(/\n/g, "<br>") : chatText(m.content, srcs.length)}</div>${srcHtml}</div>`;
+  });
+  if (!rows.length) rows.push(`<p class="muted">${esc(name)}에게 말을 걸어 보세요. 예: "안녕 넌 누구야"</p>`);   // '에게'는 받침과 무관
+  if (CHAT.busy) rows.push(`<div class="bubble assistant pending"><span class="spinner" aria-hidden="true"></span>답변을 만드는 중…</div>`);
+  log.innerHTML = rows.join("");
+  log.scrollTop = log.scrollHeight;
+  $("#chat-send").disabled = CHAT.busy;
+}
+async function sendChat(text) {
+  CHAT.msgs.push({ role: "user", content: text });
+  CHAT.busy = true;
+  renderChat();
+  const body = { messages: CHAT.msgs.map((m) => ({ role: m.role, content: m.content })), use_context: $("#chat-context").checked };
+  const mid = $("#chat-model").value;
+  if (mid) body.model_id = Number(mid);
+  try {
+    const r = await post("/api/chat", body);
+    CHAT.msgs.push({ role: "assistant", content: r.answer || "(답변을 만들지 못했습니다)", sources: r.sources || [], citations: r.citations || [] });
+  } catch (e) {
+    CHAT.msgs.pop();                      // 실패한 질문은 대화에서 빼고 입력창에 돌려준다
+    $("#chat-input").value = text;
+    toast(e.message, 6000);
+  } finally {
+    CHAT.busy = false;
+    renderChat();
+  }
+}
+$("#chat-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const t = $("#chat-input").value.trim();
+  if (!t || CHAT.busy) return;
+  $("#chat-input").value = "";
+  sendChat(t);
+});
+$("#chat-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("#chat-form").requestSubmit(); }
+});
+$("#chat-new").addEventListener("click", () => { if (CHAT.busy) return; CHAT.msgs = []; renderChat(); $("#chat-input").focus(); });
+$("#chat-context").addEventListener("change", () => { CHAT.ctxTouched = true; });
+$("#persona-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const chatbot = { name: $("#cp-name").value.trim(), intro: $("#cp-intro").value.trim(), style: $("#cp-style").value.trim(), extra: $("#cp-extra").value.trim() };
+  try { await post("/api/settings", { chatbot }); toast("챗봇 이름·말투를 저장했습니다. 대화 학습 데이터를 다시 만들어 학습하면 모델에 배어듭니다."); loadChat(); }
+  catch (err) { toast(err.message, 6000); }
 });
 
 // 학습 결과 파일
@@ -2536,6 +2636,7 @@ function jobSummary(j) {
   if (k.startsWith("collect")) return r.new != null ? `새 문서 ${r.new} · 갱신 ${r.updated} · 변화 없음 ${r.unchanged} · 짧아서 제외 ${r.skipped} · 오류 ${(r.errors || []).length}` : "";
   if (k === "ingest_path") return r.files != null ? `파일 ${r.files} · 문서 ${r.docs} · 중복 ${r.duplicates || 0} · 오류 ${(r.errors || []).length}` : "";
   if (k === "index_embeddings") return r.indexed != null ? `새로 색인 ${fmtNum(r.indexed)} · 전체 ${fmtNum(r.total)}${r.model ? " · " + r.model : ""}` : "";
+  if (k === "build_chat") return r.dialogs != null ? `대화 ${fmtNum(r.dialogs)}개 (정체성 ${fmtNum(r.identity)} · Q&A ${fmtNum(r.qa)}) · 이름 ${r.name || ""}` : "";
   if (k === "build_qa") return r.added != null ? `Q&A ${fmtNum(r.added)}개 추가 · 전체 ${fmtNum(r.total)}${r.errors ? ` · 오류 ${Array.isArray(r.errors) ? r.errors.length : r.errors}` : ""}` : "";
   if (k === "finalize_learning") return r.name ? `결과 ${r.name} · 파일 ${fmtNum(r.file_count != null ? r.file_count : (r.files || []).length)}개 · ${fmtBytes(r.total_bytes)}` : "";
   if (k === "autolearn_train") {
@@ -2549,6 +2650,10 @@ function jobSummary(j) {
     if (r.stopped_early) parts.push("사용자가 일찍 끝냄");
     if (r.resumed_from_step != null) parts.push(`${num(r.resumed_from_step)}단계부터 이어서 학습${num(r.resumes) > 1 ? ` (재개 ${num(r.resumes)}회)` : ""}`);
     if (r.device) parts.push(deviceText(r.device) + (typeof r.dtype === "string" && r.dtype ? ` · ${r.dtype}` : ""));
+    if (num(r.chat_examples) > 0) parts.push(`대화 예시 ${fmtNum(r.chat_examples)}개`);
+    const it = r.identity_test;
+    if (it && it.score != null) parts.push(`정체성 시험 ${Math.round(num(it.score) * 100)}% (${it.name || ""})`);
+    else if (it && it.error) parts.push("정체성 시험 실패");
     return parts.join(" · ");
   }
   if (k === "export") return r.path ? `${r.path} (${r.files}개 파일, ${fmtBytes(r.bytes)})` : "";

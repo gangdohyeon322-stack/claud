@@ -2,7 +2,7 @@
 // - 앱 화면(같은 출처)은 네트워크 우선, 실패하면 캐시 (오프라인에서도 열림).
 // - 온보드 실행 엔진(onnxruntime-web 1.18.0, jsDelivr)은 처음 쓸 때 받아 두고 그다음부터 캐시 우선.
 // - /api/ 요청은 절대 건드리지 않는다 (로그인 토큰, 자료, 모델 파일은 캐시하지 않음).
-const CACHE = "learnbox-shell-v4";
+const CACHE = "learnbox-shell-v5";
 const ORT_CACHE = "learnbox-ort-1.18.0"; // 버전이 주소에 고정돼 있으므로 앱 캐시를 올려도 다시 받지 않는다
 const ORT_PREFIX = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/";
 const SHELL = ["/", "/app.js", "/onboard.js", "/trainer.js", "/style.css", "/manifest.webmanifest", "/icon.svg"];

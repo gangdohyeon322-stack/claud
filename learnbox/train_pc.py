@@ -707,6 +707,69 @@ def format_qa(tok, question: str, answer: str) -> tuple[list[int], list[int]]:
     return p_ids + a_ids, [-100] * len(p_ids) + a_ids
 
 
+def _chat_mod():
+    from . import chat
+
+    return chat
+
+
+def format_chat(tok, messages: list[dict], system: str | None = None) -> tuple[list[int], list[int]]:
+    """여러 턴 대화 → (input_ids, labels). 답변(assistant) 부분에만 손실, 나머지(시스템·질문·템플릿)는 -100.
+
+    채팅 템플릿이 있으면 메시지를 하나씩 더해 가며 늘어난 부분을 잘라 붙인다(Qwen 등). system이 None이면 템플릿의
+    기본 시스템 지시문이 그대로 들어간다(정체성 학습: 기본 지시문 아래에서도 이름을 말하게). 템플릿이 없거나 앞부분이
+    맞지 않으면 "질문: …\n답변: …" 형식.
+    """
+    conv = ([{"role": "system", "content": system}] if system else []) + [
+        {"role": m["role"], "content": m["content"]} for m in messages]
+    first = 1 if system else 0
+    if getattr(tok, "chat_template", None):
+        try:
+            segs: list[tuple[str, bool]] = []
+            done = ""
+            for i in range(first, len(conv)):
+                is_asst = conv[i]["role"] == "assistant"
+                if is_asst:  # 답변 앞의 생성 프롬프트("<|im_start|>assistant\n")는 손실 없음
+                    gen = tok.apply_chat_template(conv[:i], tokenize=False, add_generation_prompt=True)
+                    if not (isinstance(gen, str) and gen.startswith(done)):
+                        raise ValueError("template prefix")
+                    segs.append((gen[len(done):], False))
+                    done = gen
+                cur = tok.apply_chat_template(conv[: i + 1], tokenize=False)
+                if not (isinstance(cur, str) and cur.startswith(done)):
+                    raise ValueError("template prefix")
+                segs.append((cur[len(done):], is_asst))
+                done = cur
+            ids: list[int] = []
+            labels: list[int] = []
+            for text, lab in segs:
+                if not text:
+                    continue
+                t = list(tok(text, add_special_tokens=False, verbose=False)["input_ids"])
+                ids += t
+                labels += t if lab else [-100] * len(t)
+            return ids, labels
+        except Exception:  # 템플릿이 메시지를 다시 쓰는 등 앞부분이 안 맞으면 기본 형식으로
+            pass
+    eos = tok.eos_token_id
+    ids, labels = [], []
+    if system:
+        t = list(tok(system + "\n", add_special_tokens=False, verbose=False)["input_ids"])
+        ids, labels = t, [-100] * len(t)
+    for m in messages:
+        if m["role"] == "user":
+            t = list(tok(f"질문: {m['content']}\n답변: ", add_special_tokens=False, verbose=False)["input_ids"])
+            ids += t
+            labels += [-100] * len(t)
+        else:
+            t = list(tok(m["content"], add_special_tokens=False, verbose=False)["input_ids"])
+            t += [int(eos)] if eos is not None else []
+            nl = list(tok("\n", add_special_tokens=False, verbose=False)["input_ids"])
+            ids += t + nl
+            labels += t + [-100] * len(nl)
+    return ids, labels
+
+
 def _collate(torch, examples: list[tuple], pad_id: int, device, pad_to: int | None = None):
     """examples: [(ids LongTensor, labels LongTensor|None)] → input_ids, attention_mask, labels (오른쪽 패딩).
 
@@ -748,7 +811,8 @@ _CKPT_TRAINER = "trainer.pt"
 _CKPT_OVERRIDES = (
     ("base_model", "base_model"), ("max_steps", "steps"), ("lr", "lr"), ("seq_len", "seq_len"),
     ("batch_size", "batch_size"), ("grad_accum", "grad_accum"), ("lora_r", "lora_r"), ("lora_alpha", "lora_alpha"),
-    ("qa_path", "qa_path"), ("train_path", "train_path"), ("eval_path", "eval_path"), ("seed", "seed"),
+    ("qa_path", "qa_path"), ("chat_path", "chat_path"), ("train_path", "train_path"), ("eval_path", "eval_path"),
+    ("seed", "seed"),
     ("dtype", "dtype"), ("max_train_tokens", "max_train_tokens"), ("gradient_checkpointing", "gradient_checkpointing"),
 )
 
@@ -762,7 +826,7 @@ def _abs_file(path) -> str | None:
 
 
 def _ckpt_same(arg: str, given, stored) -> bool:
-    if arg in ("qa_path", "train_path", "eval_path"):
+    if arg in ("qa_path", "chat_path", "train_path", "eval_path"):
         if not stored:
             return False
         try:
@@ -899,7 +963,7 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
                grad_accum=4, lora_r=8, lora_alpha=16, qa_path: str | None = None, resume_from: str | None = None,
                threads: int | None = None, progress=_noop_progress, check_cancel=_noop, *,
                device: str | None = None, dtype: str | None = "auto", amp: str | None = None,
-               gradient_checkpointing: bool | None = None,
+               chat_path: str | None = None, gradient_checkpointing: bool | None = None,
                max_train_tokens: int | None = None, seed: int = 0,
                checkpoint_dir: str | None = None, checkpoint_every_steps: int = 0,
                checkpoint_every_sec: float = 600.0, resume_checkpoint: str | None = None,
@@ -939,7 +1003,8 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
         ck_meta, ck_dir, ck_tr = _open_lora_checkpoint(resume_checkpoint)
         given = {"base_model": base_model, "max_steps": max_steps, "lr": lr, "seq_len": seq_len,
                  "batch_size": batch_size, "grad_accum": grad_accum, "lora_r": lora_r, "lora_alpha": lora_alpha,
-                 "qa_path": qa_path, "train_path": train_path, "eval_path": eval_path, "seed": seed, "dtype": dtype,
+                 "qa_path": qa_path, "chat_path": chat_path, "train_path": train_path, "eval_path": eval_path,
+                 "seed": seed, "dtype": dtype,
                  "max_train_tokens": max_train_tokens, "gradient_checkpointing": gradient_checkpointing}
         m = ck_meta
         try:
@@ -957,6 +1022,7 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
             raise ValueError(f"체크포인트 정보가 올바르지 않습니다({e}). 이어서 할 수 없습니다: "
                              f"{resume_checkpoint}") from e
         train_path, eval_path, qa_path = m.get("train_path"), m.get("eval_path"), m.get("qa_path")
+        chat_path = m.get("chat_path")
         for p in (train_path, eval_path):
             if p and not Path(p).is_file():
                 raise ValueError(f"체크포인트에 기록된 학습 자료가 없습니다: {p}. 이어서 할 수 없습니다.")
@@ -1106,14 +1172,26 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
         ids, labels = ids[:seq_len], labels[:seq_len]
         if sum(1 for v in labels[1:] if v != -100) >= 1:
             qa_examples.append((torch.tensor(ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)))
-    if not train_blocks and not qa_examples:
+    # 대화 데이터(chat.jsonl: 페르소나·정체성·여러 턴, docs/PRD-chatbot.md): Q&A와 같은 방식으로 섞는다(답변에만 손실)
+    if ck_meta is not None and chat_path and not Path(chat_path).is_file() and ck_meta.get("chat_examples"):
+        notes.append(f"체크포인트에 기록된 대화 데이터가 없어 대화 예시 없이 이어서 학습합니다: {chat_path}")
+    chat_examples = []
+    for d in _chat_mod().load_dialogs(chat_path):
+        ids, labels = format_chat(tok, d["messages"], d.get("system"))
+        if len(ids) > seq_len:  # 길면 끝(마지막 답변)을 남긴다: 앞의 긴 시스템 메시지 때문에 답변이 잘려 나가지 않게
+            ids, labels = ids[-seq_len:], labels[-seq_len:]
+        if sum(1 for v in labels[1:] if v != -100) >= 1:
+            chat_examples.append((torch.tensor(ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)))
+    sft_examples = qa_examples + chat_examples
+    if not train_blocks and not sft_examples:
         raise ValueError("학습할 자료가 없습니다. 먼저 자료를 수집하거나 파일을 가져오세요.")
-    if train_blocks and qa_examples:
-        p_qa = min(0.5, max(0.25, len(qa_examples) / (len(qa_examples) + len(train_blocks))))
+    if train_blocks and sft_examples:
+        p_qa = min(0.5, max(0.25, len(sft_examples) / (len(sft_examples) + len(train_blocks))))
     else:
-        p_qa = 1.0 if qa_examples else 0.0
+        p_qa = 1.0 if sft_examples else 0.0
     if ck_meta is not None:
-        changed = [k for k, v in (("train_tokens", len(train_ids)), ("qa_examples", len(qa_examples)))
+        changed = [k for k, v in (("train_tokens", len(train_ids)), ("qa_examples", len(qa_examples)),
+                                  ("chat_examples", len(chat_examples)))
                    if ck_meta.get(k) is not None and int(ck_meta[k]) != v]
         if changed:
             notes.append("학습 자료가 체크포인트를 저장할 때와 달라 학습 순서가 처음과 다를 수 있습니다.")
@@ -1194,7 +1272,8 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     every_steps = max(0, int(checkpoint_every_steps or 0))
     every_sec = max(0.0, float(checkpoint_every_sec or 0.0))
     rec = {"train_path": _abs_file(train_path), "eval_path": _abs_file(eval_path),
-           "qa_path": str(Path(qa_path).expanduser().resolve()) if qa_path else None}
+           "qa_path": str(Path(qa_path).expanduser().resolve()) if qa_path else None,
+           "chat_path": str(Path(chat_path).expanduser().resolve()) if chat_path else None}
     last_saved_step: int | None = None
     last_summary: dict | None = None
     last_save_t = time.monotonic()
@@ -1230,7 +1309,8 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
                 "notes": list(notes),
                 # 덧붙인 정보: 장치(정식 이름), fp16 혼합 정밀도 여부, 평가 구간 수, 자료 크기(재개 때 바뀌었는지 확인용)
                 "device": dev, "amp": bool(use_amp), "n_eval": n_eval, "train_tokens": len(train_ids),
-                "qa_examples": len(qa_examples),
+                "qa_examples": len(qa_examples), "chat_path": rec["chat_path"],
+                "chat_examples": len(chat_examples),
             }
             summary = dict(ckpt.commit(ck_root, tmp, meta))
         except Exception as e:  # 저장장치 문제 등: 학습은 계속하고 다음 기회에 다시 저장
@@ -1263,8 +1343,8 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
             g["lr"] = cur_lr
         acc, n_ok = 0.0, 0
         for _ in range(grad_accum):
-            if qa_examples and rnd.random() < p_qa:
-                batch = [rnd.choice(qa_examples) for _ in range(batch_size)]
+            if sft_examples and rnd.random() < p_qa:
+                batch = [rnd.choice(sft_examples) for _ in range(batch_size)]
                 qa_used += len(batch)
             else:
                 batch = [block_example(train_t, *rnd.choice(train_blocks)) for _ in range(batch_size)]
@@ -1363,7 +1443,7 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
         "seconds": round(elapsed_before + time.time() - t0 - paused, 1), "threads": n_threads,
         "train_blocks": len(train_blocks), "train_tokens": len(train_ids), "train_texts": len(train_texts),
         "train_texts_used": texts_used, "eval_blocks": len(eval_spans),
-        "qa_examples": len(qa_examples), "qa_samples_used": qa_used,
+        "qa_examples": len(qa_examples), "qa_samples_used": qa_used, "chat_examples": len(chat_examples),
         "seq_len": seq_len, "batch_size": batch_size, "grad_accum": grad_accum, "lr": lr,
         "gradient_checkpointing": use_ckpt, "stopped_early": stopped_at is not None, "notes": notes,
         "loss_history": [round(v, 4) for v in history[::stride]],
@@ -1556,3 +1636,72 @@ def answer(question: str, contexts: list[dict], base_model: str | None = None, a
         text = tok.decode(out[0][x.shape[1]:], skip_special_tokens=True)
     text = _clean_answer(text)
     return {"answer": text, "citations": extract_citations(text, contexts)}
+
+
+def _chat_prompt_ids(tok, messages: list[dict], system: str | None, contexts: list[dict], budget: int,
+                     max_context_chars: int) -> list[int]:
+    """대화 프롬프트 토큰. 길면 오래된 대화부터 버리고, 그래도 길면 자료를 줄이고, 마지막에는 앞을 자른다."""
+    chat_mod = _chat_mod()
+    templated = bool(getattr(tok, "chat_template", None))
+    per = max(100, int(max_context_chars))
+    hist = list(messages[:-1])
+    last = messages[-1]["content"]
+
+    def render(h, per_chars):
+        user = chat_mod.user_with_context(last, contexts, per_chars)
+        conv = ([{"role": "system", "content": system}] if system else []) + h + [{"role": "user", "content": user}]
+        if templated:
+            try:
+                text = tok.apply_chat_template(conv, tokenize=False, add_generation_prompt=True)
+                if isinstance(text, str):
+                    return text
+            except Exception:
+                pass
+        parts = [system + "\n"] if system else []
+        for m in h:
+            parts.append(f"질문: {m['content']}\n" if m["role"] == "user" else f"답변: {m['content']}\n")
+        parts.append(f"질문: {user}\n답변: ")
+        return "".join(parts)
+
+    while True:
+        ids = list(tok(render(hist, per), add_special_tokens=not templated, verbose=False)["input_ids"])
+        if len(ids) <= budget:
+            return ids
+        if len(hist) >= 2:
+            hist = hist[2:]  # 가장 오래된 질문·답변 한 쌍을 버린다
+        elif contexts and per > 100:
+            per = max(100, per // 2)
+        else:
+            return ids[-budget:]
+
+
+def chat(messages: list[dict], base_model: str | None = None, adapter_dir: str | None = None,
+         system: str | None = None, contexts: list[dict] | None = None, max_new_tokens: int = 256, *,
+         max_context_chars: int = 800) -> dict:
+    """여러 턴 대화 답변 (docs/PRD-chatbot.md). 자료(contexts)가 없어도 답한다(인사·정체성·잡담).
+
+    messages: [{"role": "user"|"assistant", "content"}] 마지막은 user. system: 페르소나 시스템 메시지(None이면 모델 기본).
+    Returns {"answer": str, "citations": [...]} — 인용은 답변에 [n]이 실제로 있을 때만.
+    """
+    import torch
+
+    msgs = _chat_mod().clean_messages(messages, max_history=10_000)
+    contexts = [c for c in (contexts or []) if isinstance(c, dict)]
+    if not base_model and adapter_dir:
+        base_model = adapter_base_model(adapter_dir)
+    if not base_model:
+        raise ValueError("기반 모델을 지정하세요.")
+    with _LOCK:
+        tok, model, dev = _load_for_inference(base_model, adapter_dir)
+        max_pos = _max_positions(model.config) or 4096
+        max_new = max(1, min(int(max_new_tokens or 256), max(16, max_pos // 2)))
+        budget = max(32, min(max_pos - max_new, 3000 if dev == "cpu" else 8000))
+        ids = _chat_prompt_ids(tok, msgs, system, contexts, budget, max_context_chars)
+        x = torch.tensor([ids], dtype=torch.long, device=dev)
+        att = torch.ones_like(x)
+        with torch.no_grad():
+            out = model.generate(input_ids=x, attention_mask=att, max_new_tokens=max_new)
+        text = tok.decode(out[0][x.shape[1]:], skip_special_tokens=True)
+    text = _clean_answer(text)
+    cites = extract_citations(text, contexts) if contexts and _CITE_RE.search(text or "") else []
+    return {"answer": text, "citations": cites}

@@ -190,6 +190,24 @@ def make_handler(app: App, sessions: Sessions):
         except OnlineError as e:
             raise HttpError(ONLINE_STATUS.get(e.kind, 502), str(e))
 
+    # ---------- 대화 (docs/PRD-chatbot.md) ----------
+    @route("GET", "/api/chat")
+    def chat_info(h, m, body, role):
+        return app.chat_info()
+
+    @route("POST", "/api/chat")
+    def chat(h, m, body, role):
+        need_pkgs("torch", "transformers", "peft")
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            raise HttpError(400, "messages는 목록이어야 합니다.")
+        return app.chat(messages, body.get("engine") or "lora", body.get("model_id"), body.get("use_context"))
+
+    @route("POST", "/api/chat/build", "admin")
+    def chat_build(h, m, body, role):
+        p = {"include_qa": body.get("include_qa")} if "include_qa" in body else {}
+        return {"job_id": app.jobs.submit("build_chat", p, role)}
+
     @route("POST", "/api/generate")
     def generate(h, m, body, role):
         prompt = str(body.get("prompt", ""))
@@ -618,6 +636,11 @@ def make_handler(app: App, sessions: Sessions):
         lt = body.get("lora_training")
         if isinstance(lt, dict) and "amp" in lt:
             lt["amp"] = amp_value(lt["amp"], "LoRA 정밀도(lora_training.amp)")
+        if isinstance(lt, dict) and "use_chat" in lt:
+            lt["use_chat"] = bool(lt["use_chat"])
+        if "chatbot" in body:   # 챗봇 이름·소개·말투 (길이 제한, 잘못된 값은 400)
+            from .chat import check_persona
+            body["chatbot"] = check_persona(body["chatbot"])
         app.cfg.update(body)
         app.db.audit(role, "settings", _scrub_settings(body))
         return app.cfg.public()

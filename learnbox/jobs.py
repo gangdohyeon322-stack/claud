@@ -18,6 +18,7 @@ LANES = {
     "ingest_path": "light",
     "index_embeddings": "light",
     "build_qa": "light",
+    "build_chat": "light",
     "train_tiny": "heavy",
     "train_lora": "heavy",
     "autolearn_train": "heavy",

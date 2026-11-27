@@ -53,6 +53,8 @@
 <nav id="tabs" class="tabs" hidden aria-label="화면 전환">
   <button type="button" data-tab="search" class="active">
     <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.3-4.3"/></svg><span>검색</span></button>
+  <button type="button" data-tab="chat">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5h16v10H9.5L5 19.5v-4H4z"/></svg><span>대화</span></button>
   <button type="button" data-tab="data">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v10.5h-17z"/></svg><span>자료</span></button>
   <button type="button" data-tab="train">
@@ -140,6 +142,36 @@
   </section>
 
   <!-- ================= 자료 ================= -->
+  <!-- ================= 대화 (docs/PRD-chatbot.md) ================= -->
+  <section id="tab-chat" class="tab" hidden aria-label="대화">
+    <div class="card">
+      <div class="row wrap gap chat-head">
+        <h3 id="chat-title">대화</h3>
+        <label class="inline"><input type="checkbox" id="chat-context" checked> 학습 자료 참고</label>
+        <select id="chat-model" aria-label="LoRA 모델"><option value="">가장 최근 LoRA 모델</option></select>
+        <button type="button" id="chat-new" class="secondary">새 대화</button>
+      </div>
+      <p id="chat-note" class="muted small"></p>
+      <div id="chat-log" class="chat-log" aria-live="polite"></div>
+      <form id="chat-form" class="chat-form">
+        <textarea id="chat-input" rows="2" maxlength="4000" placeholder="메시지를 입력하세요 (Enter 보내기, Shift+Enter 줄바꿈)" aria-label="메시지"></textarea>
+        <button type="submit" id="chat-send">보내기</button>
+      </form>
+      <p class="muted small">대화는 이 화면에만 남고 서버에 저장하지 않습니다. 답변은 로컬 LoRA 모델이 만듭니다 (CPU에서는 느릴 수 있습니다).</p>
+    </div>
+    <div class="card admin-only">
+      <h3>챗봇 이름·말투</h3>
+      <p class="muted small">대화 모드에서만 씁니다(검색 탭의 질문하기는 그대로). 바꾼 뒤 [학습] 탭에서 '대화 학습 데이터 만들기'와 LoRA 학습을 다시 하면 이름·말투가 모델에 배어듭니다. 학습 전에도 지시문으로 적용됩니다.</p>
+      <form id="persona-form">
+        <label>이름 <input id="cp-name" maxlength="40" required></label>
+        <label>소개 <input id="cp-intro" maxlength="200"></label>
+        <label>말투 <input id="cp-style" maxlength="300"></label>
+        <label>추가 지시 (선택) <textarea id="cp-extra" rows="2" maxlength="1000"></textarea></label>
+        <button type="submit">저장</button>
+      </form>
+    </div>
+  </section>
+
   <section id="tab-data" class="tab" hidden aria-label="자료">
     <div id="gate" class="banner" role="status"></div>
 
@@ -453,6 +485,7 @@
         </div>
         <p id="lora-amp-note" class="muted small" hidden></p>
         <label class="inline"><input type="checkbox" id="lora-qa" checked> Q&amp;A 학습 데이터도 사용 (있으면)</label>
+        <label class="inline"><input type="checkbox" id="lora-chat" checked> 대화 학습 데이터도 사용 (챗봇 이름·말투, 있으면)</label>
         <label>이어서 학습
           <select id="lora-resume"><option value="">새로 학습</option></select>
         </label>
@@ -472,6 +505,10 @@
         <label class="inline">조각 수 <input id="qa-chunks" type="number" min="1" max="1000" value="50" class="num"></label>
         <label class="inline">조각당 질문 <input id="qa-per" type="number" min="1" max="5" value="2" class="num"></label>
         <button type="button" id="qa-btn" class="secondary">Q&amp;A 학습 데이터 만들기 (온라인 모델)</button>
+      </div>
+      <p id="chat-ds-info" class="muted small"></p>
+      <div class="row wrap gap">
+        <button type="button" id="chat-build-btn" class="secondary">대화 학습 데이터 만들기 (챗봇 이름·말투, 외부 전송 없음)</button>
       </div>
     </div>
 

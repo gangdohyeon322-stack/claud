@@ -170,6 +170,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--model-id", type=int, help="소형 AI/LoRA 모델 번호 (생략하면 가장 최근 모델)")
     s.add_argument("--sources", help="자료 종류 (쉼표로)")
 
+    s = sub.add_parser("chat", help="챗봇과 대화하기 (LoRA 모델, 이름·말투는 설정 chatbot)")
+    s.add_argument("--model-id", type=int, help="LoRA 모델 번호 (생략하면 가장 최근 모델)")
+    s.add_argument("--no-context", action="store_true", help="학습한 자료를 참고하지 않기")
+    s.add_argument("--message", "-m", action="append",
+                   help="이 메시지만 차례로 보내고 끝내기 (여러 번 줄 수 있음, 생략하면 대화창)")
+
+    s = sub.add_parser("build-chat", help="대화 학습 데이터 만들기 (챗봇 이름·말투 정체성 대화, 외부 전송 없음)")
+    s.add_argument("--no-qa", action="store_true", help="Q&A 데이터(qa.jsonl)를 넣지 않기")
+
     s = sub.add_parser("train-tiny", aliases=["train-mobile"], help="소형 AI 모델 학습 (처음부터, 글자 단위 GPT)")
     _add_arch_flags(s)
     s.add_argument("--steps", type=int)
@@ -296,6 +305,45 @@ def cmd_ask(app, args) -> int:
     return 0
 
 
+def cmd_chat(app, args) -> int:
+    """터미널 대화. 대화 기록을 쌓아 보낸다. 빈 줄·q·quit·exit로 끝낸다."""
+    info = app.chat_info()
+    name = info["persona"]["name"]
+    use_ctx = not args.no_context
+    history: list[dict] = []
+
+    def say(text: str) -> None:
+        history.append({"role": "user", "content": text})
+        try:
+            r = app.chat(history, "lora", args.model_id, use_ctx)
+        except ValueError as e:
+            history.pop()
+            print(f"오류: {e}")
+            return
+        history.append({"role": "assistant", "content": r["answer"]})
+        print(f"{name}: {r['answer']}")
+        for c in r.get("citations") or []:
+            print(f"  [{c['index']}] {c.get('title') or ''} {c.get('url') or ''}")
+
+    if args.message:
+        for msg in args.message:
+            print(f"나: {msg}")
+            say(msg)
+        return 0
+    from .chat import josa
+
+    print(f"{josa(name, '과', '와')} 대화합니다 (끝내려면 q). 자료 참고: {'켬' if use_ctx else '끔'}")
+    while True:
+        try:
+            msg = input("나: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if msg.lower() in ("", "q", "quit", "exit"):
+            return 0
+        say(msg)
+
+
 def cmd_estimate(app, args) -> int:
     body = {"kind": args.kind, "batch_size": args.batch_size}
     if getattr(args, "device", None):
@@ -414,7 +462,7 @@ def cmd_models(app, args) -> int:
 
 
 KIND_LABELS = {"collect_links": "링크 수집", "collect_search": "검색 수집", "ingest_path": "파일 가져오기",
-               "index_embeddings": "의미 검색 색인", "build_qa": "Q&A 데이터 생성", "train_tiny": "소형 AI 학습",
+               "index_embeddings": "의미 검색 색인", "build_qa": "Q&A 데이터 생성", "build_chat": "대화 데이터 생성", "train_tiny": "소형 AI 학습",
                "train_lora": "LoRA 학습", "autolearn_train": "자율 학습(학습)", "finalize_learning": "학습 종료·결과 내보내기",
                "export": "외장 저장 내보내기", "train_mobile": "소형 AI 학습", "train_pc": "LoRA 학습"}
 STATUS_LABELS = {"queued": "대기", "running": "진행 중", "paused": "일시정지", "done": "완료", "failed": "실패",
@@ -685,6 +733,8 @@ def _dispatch(app, args) -> int:
         return cmd_search(app, args)
     if cmd == "ask":
         return cmd_ask(app, args)
+    if cmd == "chat":
+        return cmd_chat(app, args)
     if cmd == "estimate":
         return cmd_estimate(app, args)
     if cmd == "device":
@@ -727,6 +777,8 @@ def _dispatch(app, args) -> int:
         return _train_cli(app, args, "train_lora", params)
     if cmd == "index-embeddings":
         return _print_job(jobs.run_inline("index_embeddings", {}))
+    if cmd == "build-chat":
+        return _print_job(jobs.run_inline("build_chat", {"include_qa": False} if args.no_qa else {}))
     if cmd == "build-qa":
         params = {k: v for k, v in {"limit_chunks": args.limit_chunks, "per_chunk": args.per_chunk}.items() if v}
         return _print_job(jobs.run_inline("build_qa", params))

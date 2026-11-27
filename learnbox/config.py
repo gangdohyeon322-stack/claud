@@ -67,6 +67,18 @@ DEFAULTS: dict = {
         # 정밀도: auto(bf16 가능하면 bf16, 아니면 fp16 혼합 정밀도) | fp16 | off(예전 방식) | fp32.
         # 우선순위: 요청의 amp → 환경변수 LEARNBOX_AMP → 이 값 → auto
         "amp": "auto",
+        # 대화 데이터(data/datasets/chat.jsonl, 챗봇 이름·말투)가 있으면 함께 학습 (docs/PRD-chatbot.md)
+        "use_chat": True,
+    },
+    # 대화형 챗봇 (docs/PRD-chatbot.md): 대화 모드에서만 쓰는 이름·소개·말투. 기존 질문하기는 그대로.
+    "chatbot": {
+        "name": "LearnBox",
+        "intro": "학습한 자료를 바탕으로 답하는 한국어 도우미",
+        "style": "존댓말로 친절하고 간결하게 답합니다.",
+        "extra": "",
+        "use_context": True,     # 대화할 때 학습한 자료를 찾아 참고
+        "max_history": 12,       # 모델에 보내는 이전 대화 메시지 수
+        "max_new_tokens": 256,
     },
     # 온라인 모델 (Claude API). 검색된 자료 일부가 Anthropic API로 전송된다.
     "online": {

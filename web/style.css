@@ -393,3 +393,17 @@ body.noscroll { overflow: hidden; }
   #od-card .grid2 { grid-template-columns: 1fr 1fr; gap: 0 8px; }
   #od-card .grid-fields { grid-template-columns: 1fr 1fr; }
 }
+
+/* 대화 (docs/PRD-chatbot.md) */
+.chat-head { align-items: center; }
+.chat-head h3 { margin: 0; flex: 1 1 auto; }
+.chat-log { display: flex; flex-direction: column; gap: 10px; min-height: 220px; max-height: 60vh; overflow-y: auto; padding: 8px 2px; }
+.bubble { max-width: 85%; padding: 8px 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--card); overflow-wrap: anywhere; }
+.bubble.user { align-self: flex-end; background: var(--accent-soft); }
+.bubble.assistant { align-self: flex-start; }
+.bubble .who { font-size: 12px; color: var(--muted); margin-bottom: 2px; }
+.bubble .cite { color: var(--accent); }
+.bubble .srcs { margin: 6px 0 0; padding-left: 18px; }
+.chat-form { display: flex; gap: 8px; align-items: flex-end; margin-top: 10px; }
+.chat-form textarea { flex: 1 1 auto; min-width: 0; resize: vertical; }
+@media (max-width: 520px) { .bubble { max-width: 100%; } }
