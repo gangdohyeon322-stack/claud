@@ -384,7 +384,8 @@ def make_handler(app: App, sessions: Sessions):
             need_pkgs("torch", "transformers", "peft")
         # device(선택): 이어서 할 장치. 없으면 지금 장치에서 재개 (원래 작업의 device는 이어받지 않음, PRD 6.9)
         dev = body.get("device") if isinstance(body, dict) else None
-        return {"job_id": app.restart_job(job["id"], actor(h, role), device=dev)}
+        amp = body.get("amp") if isinstance(body, dict) else None   # (선택) LoRA 정밀도를 바꿔 이어서
+        return {"job_id": app.restart_job(job["id"], actor(h, role), device=dev, amp=amp)}
 
     @route("POST", r"/api/jobs/(\d+)/discard-checkpoint", "admin")
     def job_discard_checkpoint(h, m, body, role):

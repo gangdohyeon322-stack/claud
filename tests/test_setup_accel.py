@@ -64,6 +64,12 @@ class PlanTest(unittest.TestCase):
         p = setup_accel.plan(st(python="3.12"), backend="torch_xla")
         self.assertEqual(p["backend"], "torch_xla")
 
+    def test_xla_backend_refused_when_torch_tpu_present(self):
+        # torch_tpu가 있으면 --backend torch_xla여도 torch를 내리지 않는다
+        p = setup_accel.plan(st(torch_tpu="0.2.0", python="3.12", torch="2.12.0"), backend="torch_xla")
+        self.assertEqual(p["action"], "unsupported")
+        self.assertIn("torch_tpu가 설치돼 있어", p["message"])
+
     def test_unsupported_python(self):
         self.assertEqual(setup_accel.plan(st(python="3.9"))["action"], "unsupported")
 

@@ -42,7 +42,7 @@ rem GPU 종류 확인: NVIDIA가 없고 Intel Arc가 있으면 Intel GPU(XPU)용
 set "TORCH_BUILD=cuda"
 powershell -NoProfile -Command "(Get-CimInstance Win32_VideoController).Name" 2>nul | findstr /i "NVIDIA" >nul
 if errorlevel 1 (
-  powershell -NoProfile -Command "(Get-CimInstance Win32_VideoController).Name" 2>nul | findstr /i "Arc" >nul
+  powershell -NoProfile -Command "(Get-CimInstance Win32_VideoController).Name" 2>nul | findstr /i /r /c:"Intel.*Arc" >nul
   if not errorlevel 1 set "TORCH_BUILD=xpu"
 )
 if "%TORCH_BUILD%"=="xpu" (

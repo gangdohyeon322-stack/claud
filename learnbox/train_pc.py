@@ -1251,6 +1251,7 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
     bad_steps = 0  # fp16 혼합 정밀도: nan/inf로 건너뛴 단계 연속 횟수
     t_loop = time.time()  # paused는 루프 안(pause_point)에서만 늘어난다
     stopped_at: int | None = None
+    last_scale = None  # fp16 스케일러의 지난 단계 뒤 스케일 (건너뛴 단계 감지용)
     for step in range(start, max_steps + 1):
         check_cancel()
         if step <= warmup:
@@ -1283,12 +1284,15 @@ def train_lora(train_path, eval_path, out_dir, base_model, max_steps=200, lr=2e-
         else:
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(params, 1.0)
-            scale_before = scaler.get_scale() if use_amp else None
+            if use_amp and last_scale is None:
+                last_scale = scaler.get_scale()  # 첫 단계만 읽는다(이후에는 지난 단계 뒤의 값을 기억)
             accel.optimizer_step(opt, scaler, tdev)  # 기울기에 nan/inf가 있으면 이 단계는 건너뛰고 스케일만 줄임
             scaler.update()
             opt.zero_grad(set_to_none=True)
-            if use_amp:  # 스케일이 줄었으면 스케일러가 이 단계를 건너뛴 것
-                bad_steps = bad_steps + 1 if scaler.get_scale() < scale_before else 0
+            if use_amp:  # 스케일이 줄었으면 스케일러가 이 단계를 건너뛴 것 (GPU 동기화는 단계마다 한 번)
+                new_scale = scaler.get_scale()
+                bad_steps = bad_steps + 1 if new_scale < last_scale else 0
+                last_scale = new_scale
         accel.step_end(tdev)  # TPU: 이 단계의 연산을 실행(sync). 다른 장치는 아무것도 하지 않음
         if xla_debug and step == start + 2:
             compiles_base = accel.compile_count()

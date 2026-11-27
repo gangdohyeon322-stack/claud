@@ -218,6 +218,25 @@ class TorchPathsTest(unittest.TestCase):
             self.assertEqual(accel.pick("tpu"), ("tpu", dev, None))
             self.assertEqual(accel.tpu_backend(dev), "torch_xla")
 
+    def test_auto_explains_unusable_tpu_on_tpu_host(self):
+        """TPU 런타임 신호가 있는데 TPU를 못 열면 자동 선택도 이유를 남긴다(다른 호스트는 안내 없음)."""
+        import torch
+
+        if torch.cuda.is_available():
+            self.skipTest("CUDA가 있는 환경")
+        msg = "Failed to acquire a TPU device node '/dev/vfio/0' because it is already opened by another process"
+        hint = {"likely": True, "signals": ["pci:v5ex1"], "accelerator_type": "v5e", "chips": 1, "hbm_gb": 16.0}
+        with mock.patch.object(accel, "_has", side_effect=lambda m: m == "torch_tpu"), \
+                mock.patch.object(accel, "_open_torch_tpu", side_effect=RuntimeError(msg)), \
+                mock.patch.object(accel, "tpu_hint", return_value=hint):
+            n, _, note = accel.pick("auto")
+        self.assertEqual(n, "cpu")
+        self.assertIn("다른 프로세스가 TPU를 쓰고 있습니다", note)
+        accel._reset_tpu_probe()
+        with mock.patch.object(accel, "_has", side_effect=lambda m: m == "torch_tpu"), \
+                mock.patch.object(accel, "tpu_hint", return_value={**hint, "likely": False}):
+            self.assertEqual(accel.pick("auto")[2], None)
+
     def test_torch_tpu_busy_note(self):
         msg = "[TorchTPU] Failed to acquire a TPU device node '/dev/vfio/0' because it is already opened by another process"
         with mock.patch.object(accel, "_has", side_effect=lambda m: m == "torch_tpu"), \

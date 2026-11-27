@@ -239,6 +239,17 @@ class AppPlumbingTest(unittest.TestCase):
         new = self.app.restart_job(jid, "t", enqueue=False, device="auto")
         self.assertNotIn("device", self.app.db.get_job(new)["params"])
 
+    def test_restart_job_amp_override(self):
+        """fp16 nan으로 멈춘 작업을 정밀도를 바꿔 이어서 (원래 작업의 amp보다 우선)."""
+        jid = self.failed_job("train_lora", amp="fp16")
+        new = self.app.restart_job(jid, "t", enqueue=False, amp="OFF")
+        self.assertEqual(self.app.db.get_job(new)["params"]["amp"], "off")
+        jid = self.failed_job("train_lora", amp="fp16")
+        n_jobs = len(self.app.db.list_jobs(200))
+        with self.assertRaises(ValueError):
+            self.app.restart_job(jid, "t", enqueue=False, amp="bf8")
+        self.assertEqual(len(self.app.db.list_jobs(200)), n_jobs)
+
     def test_checkpoint_summary_has_device(self):
         jid = self.failed_job()
         s = checkpoint.summary(self.app.checkpoint_root(jid))
@@ -473,6 +484,8 @@ class CliTest(unittest.TestCase):
             self.assertEqual(p.parse_args(["train-lora", "--amp", amp]).amp, amp)
         self.assertEqual(p.parse_args(["resume-job", "3", "--device", "cpu"]).device, "cpu")
         self.assertIsNone(p.parse_args(["resume-job", "3"]).device)
+        self.assertEqual(p.parse_args(["resume-job", "3", "--amp", "off"]).amp, "off")
+        self.assertIsNone(p.parse_args(["resume-job", "3"]).amp)
         self.assertEqual(p.parse_args(["estimate", "--kind", "lora", "--device", "tpu"]).device, "tpu")
         a = p.parse_args(["autolearn", "start", "--device", "cuda"])
         self.assertEqual(_start_overrides(a)["device"], "cuda")

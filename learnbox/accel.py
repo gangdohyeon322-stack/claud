@@ -367,15 +367,17 @@ def pick(device=None, *, allow_tpu: bool = True):
         if torch.cuda.is_available():
             return "cuda", torch.device("cuda"), None
         # 자동 선택은 TPU 신호가 있을 때만 TPU 패키지를 불러온다(아니면 import 부작용 없이 넘어감).
+        tpu_note = None
         if allow_tpu and tpu_packages() and (_TPU["probed"] or tpu_hint()["likely"]):
-            d, _ = _probe_tpu()
+            d, reason = _probe_tpu()
             if d is not None:
                 return "tpu", d, None
+            tpu_note = _tpu_missing_note(reason)  # TPU 런타임인데 못 열었으면 이유를 남긴다(TPU 호스트에서만)
         if _xpu_ok():
-            return "xpu", torch.device("xpu"), None
+            return "xpu", torch.device("xpu"), tpu_note
         if _mps_ok():
-            return "mps", torch.device("mps"), None
-        return "cpu", torch.device("cpu"), None
+            return "mps", torch.device("mps"), tpu_note
+        return "cpu", torch.device("cpu"), tpu_note
     if want.startswith("cuda"):
         if not torch.cuda.is_available():
             return "cpu", torch.device("cpu"), "CUDA GPU를 찾지 못해 CPU로 학습했습니다."

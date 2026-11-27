@@ -778,14 +778,16 @@ class App:
                 return j
         return None
 
-    def restart_job(self, job_id, actor: str = "admin", enqueue: bool = True, device=None) -> int:
+    def restart_job(self, job_id, actor: str = "admin", enqueue: bool = True, device=None, amp=None) -> int:
         """중단/실패한 학습 작업을 체크포인트에서 이어서 하는 새 작업을 만든다 -> 새 작업 번호.
 
         새 작업 params = 원래 params + resume_checkpoint(원래 root 그대로) + resumed_from_job.
         장치(device)는 이어받지 않는다: 기본은 지금 장치(요청 → LEARNBOX_DEVICE → 설정)에서 재개하고,
-        device를 주면 그 장치로 (PRD 6.9). 정밀도(amp)는 이어받는다.
+        device를 주면 그 장치로 (PRD 6.9). 정밀도(amp)는 이어받고, amp를 주면 그 값으로 바꾼다
+        (예: fp16 nan으로 멈춘 작업을 amp="off"로 이어서).
         enqueue=False면 줄에 넣지 않는다 (명령줄이 현재 스레드에서 직접 실행)."""
         dev = device_value(device, "device")     # 잘못된 값이면 새 작업을 만들기 전에 ValueError
+        amp_new = amp_value(amp, "amp") if amp not in (None, "") else None
         with self._restart_lock:
             try:
                 job = self.db.get_job(int(job_id))
@@ -820,6 +822,8 @@ class App:
             params.pop("device", None)
             if dev != "auto":
                 params["device"] = dev
+            if amp_new is not None:
+                params["amp"] = amp_new
             # 작업 목록의 요청자는 다른 작업처럼 역할만 ('admin@127.0.0.1' -> 'admin'); 감사 기록에는 그대로 남긴다
             owner = str(actor).split("@", 1)[0] or str(actor)
             new_id = self.jobs.submit(kind, params, owner) if enqueue else self.db.create_job(kind, params, owner)
@@ -830,7 +834,8 @@ class App:
             self.db.update_job(job["id"], result=res, message=msg[:500])
         self.db.audit(actor, "job_restart", {"job_id": job["id"], "new_job_id": new_id, "step": got[0].get("step"),
                                              "steps": got[0].get("steps"),
-                                             **({"device": dev} if dev != "auto" else {})})
+                                             **({"device": dev} if dev != "auto" else {}),
+                                             **({"amp": amp_new} if amp_new is not None else {})})
         return new_id
 
     def discard_checkpoint(self, job_id, actor: str = "admin") -> dict:

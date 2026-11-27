@@ -1235,10 +1235,10 @@ function pcCardHtml(dev) {
   const A = accelSummary(dev), tpu = A.tpu;
   const showTpu = A.tpuAvail || A.tpuLikely;
   const pk = ["torch", "transformers", "peft", "onnxruntime", "anthropic", "pypdf"];
-  // TPU 백엔드 패키지: 설치된 것만, TPU가 보이는데 하나도 없으면 torch_xla 없음. TPU와 관계없는 PC에서는 예전 그대로
+  // TPU 백엔드 패키지: 설치된 것만, TPU가 보이는데 하나도 없으면 torch_tpu 없음. TPU와 관계없는 PC에서는 예전 그대로
   const hasXla = !!(pc.torch_xla || A.xlaVer);
-  if (A.torchTpu) pk.push("torch_tpu");
-  if (hasXla || (showTpu && !A.torchTpu)) pk.push("torch_xla");
+  if (A.torchTpu || (showTpu && !hasXla)) pk.push("torch_tpu");
+  if (hasXla) pk.push("torch_xla");
   const has = (k) => (k === "torch_xla" ? hasXla : k === "torch_tpu" ? A.torchTpu : !!pc[k]);
   const tier = rec.tier && String(rec.tier).startsWith("tpu") ? rec.tier : pc.tier;
   const gpuTag = gpu.type === "xpu" ? " · Intel Arc (미검증)" : gpu.type === "cuda" && A.rocm ? " · AMD (ROCm)" : "";
@@ -1247,9 +1247,11 @@ function pcCardHtml(dev) {
   const hbm = num(tpu.hbm_gb) > 0 ? num(tpu.hbm_gb) : num(tpu.total_gb) > 0 ? num(tpu.total_gb) : 0;
   const tpuText = [tpu.accelerator_type || (A.devs.tpu && A.devs.tpu.name) || "TPU", num(tpu.chips) > 0 ? `칩 ${num(tpu.chips)}개` : "",
     hbm ? `메모리 ${hbm}GB` : "", A.tpuAvail ? "" : A.tpuInstalled ? "사용 불가" : "TPU 패키지 없음"].filter(Boolean).join(" · ");
-  const mismatch = A.tpuInstalled && showTpu ? xlaMismatch(A.torchVer, A.xlaVer) : "";
+  // 버전 불일치는 서버 판단(accel.tpu.mismatch: torch_tpu가 있으면 해당 없음)을 우선, 없으면 torch_xla만 있을 때 직접 비교
+  const srvMismatch = tpu.mismatch ? String(tpu.mismatch) : "";
+  const mismatch = A.tpuInstalled && showTpu ? (srvMismatch || (A.torchTpu ? "" : xlaMismatch(A.torchVer, A.xlaVer))) : "";
   const tpuHint = pc.torch !== false && showTpu && (!A.tpuInstalled || mismatch)
-    ? `<p class="error small">${esc(mismatch || "TPU 런타임으로 보이지만 TPU 패키지(torch_xla)가 없습니다.")} TPU로 학습하려면 PC에서 <code>python -m learnbox.setup_accel</code>을 실행하세요.</p>` : "";
+    ? `<p class="error small">${esc(mismatch || "TPU 런타임으로 보이지만 TPU 패키지(torch_tpu)가 없습니다.")} TPU로 학습하려면 PC에서 <code>python -m learnbox.setup_accel</code>을 실행하세요.</p>` : "";
   return `<div><h4>이 PC <span class="badge">${esc(TIER_LABEL[tier] || (tier === pc.tier && pc.tier_label) || tier || "")}</span></h4>
     <dl class="kv">
       <dt>운영체제</dt><dd>${esc(pc.os || "-")}</dd>
@@ -1401,7 +1403,7 @@ function fillDeviceSelects() {
       o.disabled = !ok;
       const nm = ok && known && ["cuda", "tpu", "xpu"].includes(o.value) && typeof d.name === "string" && d.name ? ` · ${d.name}` : "";
       o.textContent = devLabel(o.value) + (ok ? nm : o.value === "tpu" && d.note
-        ? (obj(ax && ax.tpu).mismatch ? " (torch_xla 버전 불일치)" : " (torch_xla 설치 필요)") : " (없음)");
+        ? (obj(ax && ax.tpu).mismatch ? " (torch·torch_xla 버전 불일치)" : " (TPU 패키지 설치 필요)") : " (없음)");
     }
     const cur = sel.options[sel.selectedIndex];
     if (!cur || cur.disabled) sel.value = "auto";

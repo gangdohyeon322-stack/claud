@@ -54,7 +54,7 @@ def status() -> dict:
         "python": "%d.%d" % sys.version_info[:2],
         "hint": accel.tpu_hint(),
         "torch": accel._version("torch"),
-        "torch_tpu": accel._version("torch_tpu"),
+        "torch_tpu": accel._version("torch_tpu") or ("설치됨" if accel._has("torch_tpu") else None),
         "torch_xla": accel._version("torch_xla"),
     }
 
@@ -86,6 +86,9 @@ def plan(st: dict, force: bool = False, backend: str = "auto") -> dict:
     if backend in ("auto", "torch_tpu") and py >= (3, 11):
         return {"action": "install", "backend": "torch_tpu", "requirements": str(REQ_TPU),
                 "message": "TPU 백엔드 torch_tpu를 설치합니다 (torch 2.11 이상, CPU용 torch 빌드)."}
+    if st["torch_tpu"]:  # torch_xla 2.9는 torch를 2.9로 내려 torch_tpu와 import torch를 깨뜨린다
+        return {"action": "unsupported", "backend": "torch_xla",
+                "message": "torch_tpu가 설치돼 있어 torch_xla를 설치하지 않습니다(torch가 2.9로 내려가 torch_tpu가 깨집니다)."}
     if backend in ("auto", "torch_xla") and (3, 10) <= py < (3, 13):
         return {"action": "install", "backend": "torch_xla", "requirements": str(REQ_TPU_XLA),
                 "message": "torch_tpu를 쓸 수 없는 Python이라 지원 종료된 torch_xla 2.9를 설치합니다 "

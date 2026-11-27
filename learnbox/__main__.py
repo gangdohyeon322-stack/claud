@@ -198,6 +198,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("job_id", type=int, help="이어서 할 작업 번호 (`jobs`로 확인)")
     s.add_argument("--device", type=_device_arg, choices=DEVICE_CHOICES,
                    help="이어서 할 장치 (기본: 원래 작업의 장치가 아니라 지금 장치 = LEARNBOX_DEVICE → 설정 → auto)")
+    s.add_argument("--amp", type=_amp_arg, choices=AMP_CHOICES,
+                   help="LoRA 정밀도를 바꿔 이어서 하기 (기본: 원래 작업의 값). fp16 nan으로 멈췄으면 --amp off")
 
     sub.add_parser("index-embeddings", help="의미 검색 색인 만들기")
 
@@ -519,7 +521,8 @@ def _cli_stop(app, args, job_id: int, t) -> int:
 
 
 def cmd_resume_job(app, args) -> int:
-    new_id = app.restart_job(args.job_id, "cli", enqueue=False, device=getattr(args, "device", None))
+    new_id = app.restart_job(args.job_id, "cli", enqueue=False, device=getattr(args, "device", None),
+                             amp=getattr(args, "amp", None))
     ck = (app.db.get_job(new_id)["params"] or {}).get("resume_checkpoint")
     print(f"작업 #{args.job_id}의 체크포인트에서 이어서 학습합니다 (새 작업 #{new_id}, 체크포인트 {ck}).")
     print("멈추려면 Ctrl+C (지금 단계를 마치고 저장한 뒤 멈춥니다).", flush=True)
